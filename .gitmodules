@@ -1,0 +1,3 @@
+[submodule "RXMesh"]
+	path = RXMesh
+	url = https://github.com/owensgroup/RXMesh.git
