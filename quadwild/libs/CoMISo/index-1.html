@@ -1,0 +1,40 @@
+<html><head><meta http-equiv="Content-Type" content="text/html; charset=utf-8"/><title>Unknown </title></head><body>
+<p><img alt="CoMISo" src="Logo-1.png"/></p>
+<h1 id="comiso-constrained-mixed-integer-solver">CoMISo -- Constrained Mixed-Integer Solver</h1>
+<p>A handy solver for optimizing discrete quadratic energies subject to linear and integer constraints, performing proper elimination of the constraints, while relieving the user of cumbersome re-indexing. The solver has been successfully deployed in high-end geometry processing tasks such as the <em>Mixed-Integer Quadrangulation</em> project.</p>
+<h2 id="requirements">Requirements</h2>
+<p>Here is an example of what packages were needed to compile CoMISo on a freshly installed Ubuntu 9.04 system</p>
+<pre><code>sudo apt-get install g++
+sudo apt-get install cmake
+sudo apt-get install libgmm-dev
+sudo apt-get install libboost-dev
+sudo apt-get install libblas-dev
+sudo apt-get install libsuitesparse-dev
+</code></pre>
+<p>(some other needed libraries such as lapack, are installed as dependencies of the above)</p>
+<p>For Windows and Macintosh systems the corresponding packages need to be downloaded and installed.</p>
+<p>The cmake build system should enable building the CoMISo library under Windows and Macintosh systems, please let me know if this is (not) the case!</p>
+<h2 id="openflipper-requirements">OpenFlipper requirements</h2>
+<p>To build OpenFlipper you additionally need to install all the Qt4 packages libqt4-{dev-dbg, dev, network, gui, opengl, opengl-dev, script, scripttools, ...} and also</p>
+<pre><code>sudo apt-get install libglew1.5-dev
+sudo apt-get install glutg3-dev
+</code></pre>
+<h2 id="building-standalone">Building (standalone)</h2>
+<p>Assuming CoMISo was unpacked to the directory <code>SOME_DIRECTORY/CoMISo</code> (where <code>SOME_DIRECTORY</code> should be <code>/PATH_TO_OPENFLIPPER/libs/CoMISo</code> for integration with the OpenFlipper framework) the package is built by creating a build directory, using cmake to create the Makefiles and using make to actually build:</p>
+<pre><code>cd /SOME_DIRECTORY/CoMISo/
+mkdir build
+cd build
+cmake ..
+</code></pre>
+<p>(assuming all needed packages are installed and cmake threw no errors...)</p>
+<pre><code>make
+</code></pre>
+<p>The binaries (examples) and the shared library are found under <code>/SOME_DIRECTORY/CoMISO/build/Build/bin/</code> and <code>/SOME_DIRECTORY/CoMISO/build/Build/lib/CoMISo/</code>.</p>
+<h2 id="building-for-use-with-openflipper">Building (for use with OpenFlipper)</h2>
+<p>Simply extract / checkout the CoMISo directory to the <code>/PATH_TO_OPENFLIPPER/libs/</code> directory. The library will be automatically built and you will find the shared library <code>libCoMISo.so</code> under the OpenFlipper build directory.
+To use the solver in your plugin, add CoMISo to the <code>CMakeLists.txt</code> of the plugin and you are set, see <em>Plugin-HarmonicExample</em> for an example.</p>
+<h2 id="using">Using</h2>
+<p>To use the solver library in your applications have a look at the <code>/SOME_DIRECTORY/CoMISo/Examples/</code> and the sample OpenFlipper plugin (<em>Plugin-HarmonicExample</em>) downloadable from the CoMISo project homepage.</p>
+<h2 id="feedback">Feedback</h2>
+<p>We appreciate your feedback! Bugs, comments, questions or patches send them to <a href="mailto:zimmer@informatik.rwth-aachen.de">zimmer@informatik.rwth-aachen.de</a> or <a href="mailto:bommes@informatik.rwth-aachen.de">bommes@informatik.rwth-aachen.de</a>!</p>
+</body></html>

@@ -1,0 +1,9 @@
+Config/config.hh
+*.orig
+*.rej
+.project
+*.swp
+.DS_Store
+/build*/
+CMakeLists.txt.user*
+.cache/

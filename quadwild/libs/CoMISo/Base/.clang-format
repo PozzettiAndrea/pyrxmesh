@@ -1,0 +1,9 @@
+---
+BasedOnStyle: LLVM
+BreakBeforeBraces: Allman
+SortIncludes: 'false'
+PointerAlignment: 'Left'
+AlignAfterOpenBracket: 'DontAlign'
+AlignEscapedNewlines: 'DontAlign'
+SpacesInContainerLiterals: 'false'
+...

@@ -1,0 +1,6 @@
+[submodule "Base"]
+	path = Base
+	url = ../Base.git
+[submodule "cmake-library"]
+	path = cmake-library
+	url = ../../cmake/cmake-library
