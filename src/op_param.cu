@@ -2,6 +2,7 @@
 
 #include "pipeline.h"
 #include <filesystem>
+#include <chrono>
 #include <cstdio>
 
 #include "rxmesh/rxmesh_static.h"
@@ -114,8 +115,10 @@ static void run_parameterize(RXMeshStatic& rx, ProblemT& problem, SolverT& solve
 AttributeResult pipeline_param(
     const double* vertices, int num_vertices,
     const int* faces, int num_faces,
-    int newton_iterations)
+    int newton_iterations,
+    bool verbose)
 {
+    auto t0 = std::chrono::high_resolution_clock::now();
     // Write temp OBJ
     auto tmp = std::filesystem::temp_directory_path() / "pyrxmesh_param_in.obj";
     FILE* fp = fopen(tmp.string().c_str(), "w");
@@ -158,5 +161,11 @@ AttributeResult pipeline_param(
         result.data[v_id * 2 + 1] = static_cast<double>((*problem.objective)(vh, 1));
     });
 
+    if (verbose) {
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        fprintf(stderr, "[pyrxmesh] param: %d verts, %d newton_iters, %.1f ms\n",
+                num_vertices, newton_iterations, ms);
+    }
     return result;
 }

@@ -4,6 +4,7 @@
 
 #include "pipeline.h"
 #include <filesystem>
+#include <chrono>
 #include <cstdio>
 #include <queue>
 #include <limits>
@@ -86,8 +87,10 @@ static void compute_toplesets_from_fv(
 AttributeResult pipeline_geodesic(
     const double* vertices, int num_vertices,
     const int* faces, int num_faces,
-    const int* seed_vertices, int num_seeds)
+    const int* seed_vertices, int num_seeds,
+    bool verbose)
 {
+    auto t0 = std::chrono::high_resolution_clock::now();
     constexpr uint32_t blockThreads = 256;
 
     // Build face-vertex lists
@@ -206,5 +209,11 @@ AttributeResult pipeline_geodesic(
     });
 
     CUDA_ERROR(cudaFree(d_error));
+    if (verbose) {
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        fprintf(stderr, "[pyrxmesh] geodesic: %d verts, %d seeds, %.1f ms\n",
+                num_vertices, num_seeds, ms);
+    }
     return result;
 }

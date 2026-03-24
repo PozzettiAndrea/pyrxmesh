@@ -383,3 +383,145 @@ class TestDelaunay:
         v_out, f_out = pyrxmesh.delaunay(v, f)
         assert np.all(f_out >= 0)
         assert np.all(f_out < v_out.shape[0])
+
+
+# =========================================================================
+# edge_split
+# =========================================================================
+
+class TestEdgeSplit:
+    def test_increases_count(self, bunnyhead):
+        """Splitting with low relative_len should add vertices."""
+        v, f = bunnyhead
+        v_out, f_out = pyrxmesh.edge_split(v, f, relative_len=0.5, iterations=1)
+        assert v_out.shape[0] > v.shape[0]
+        assert f_out.shape[0] > f.shape[0]
+
+    def test_valid_output(self, bunnyhead):
+        v, f = bunnyhead
+        v_out, f_out = pyrxmesh.edge_split(v, f, relative_len=0.5)
+        assert np.all(np.isfinite(v_out))
+        assert np.all(f_out >= 0)
+        assert np.all(f_out < v_out.shape[0])
+
+    def test_noop_high_threshold(self, bunnyhead):
+        """With very high relative_len, no edges should be split."""
+        v, f = bunnyhead
+        v_out, f_out = pyrxmesh.edge_split(v, f, relative_len=100.0)
+        assert v_out.shape[0] == v.shape[0]
+        assert f_out.shape[0] == f.shape[0]
+
+
+# =========================================================================
+# edge_collapse
+# =========================================================================
+
+class TestEdgeCollapse:
+    def test_decreases_count(self, bunnyhead):
+        """Collapsing with high relative_len should remove vertices."""
+        v, f = bunnyhead
+        v_out, f_out = pyrxmesh.edge_collapse(v, f, relative_len=2.0, iterations=1)
+        assert v_out.shape[0] < v.shape[0]
+        assert f_out.shape[0] < f.shape[0]
+
+    def test_valid_output(self, bunnyhead):
+        v, f = bunnyhead
+        v_out, f_out = pyrxmesh.edge_collapse(v, f, relative_len=2.0)
+        assert np.all(np.isfinite(v_out))
+        assert np.all(f_out >= 0)
+        assert np.all(f_out < v_out.shape[0])
+
+    def test_noop_low_threshold(self, bunnyhead):
+        """With very low relative_len, no edges should be collapsed."""
+        v, f = bunnyhead
+        v_out, f_out = pyrxmesh.edge_collapse(v, f, relative_len=0.01)
+        assert v_out.shape[0] == v.shape[0]
+        assert f_out.shape[0] == f.shape[0]
+
+
+# =========================================================================
+# edge_flip
+# =========================================================================
+
+class TestEdgeFlip:
+    def test_preserves_counts(self, bunnyhead):
+        """Flipping should not change vertex or face counts."""
+        v, f = bunnyhead
+        v_out, f_out = pyrxmesh.edge_flip(v, f, iterations=1)
+        assert v_out.shape[0] == v.shape[0]
+        assert f_out.shape[0] == f.shape[0]
+
+    def test_valid_output(self, bunnyhead):
+        v, f = bunnyhead
+        v_out, f_out = pyrxmesh.edge_flip(v, f)
+        assert np.all(np.isfinite(v_out))
+        assert np.all(f_out >= 0)
+        assert np.all(f_out < v_out.shape[0])
+
+    def test_vertices_unchanged(self, bunnyhead):
+        """Flip only changes connectivity, not vertex positions."""
+        v, f = bunnyhead
+        v_out, _ = pyrxmesh.edge_flip(v, f)
+        np.testing.assert_allclose(v_out.min(axis=0), v.min(axis=0), atol=1e-6)
+        np.testing.assert_allclose(v_out.max(axis=0), v.max(axis=0), atol=1e-6)
+
+
+# =========================================================================
+# quadwild_preprocess (GPU)
+# =========================================================================
+
+class TestQuadwildPreprocess:
+    def test_valid_output(self, bunnyhead):
+        v, f = bunnyhead
+        v_out, f_out = pyrxmesh.quadwild_preprocess(v, f, target_faces=5000)
+        assert v_out.shape[1] == 3
+        assert f_out.shape[1] == 3
+        assert np.all(np.isfinite(v_out))
+        assert np.all(f_out >= 0)
+        assert np.all(f_out < v_out.shape[0])
+
+    def test_reduces_for_small_target(self, bunnyhead):
+        """With target_faces < input faces, should reduce."""
+        v, f = bunnyhead
+        v_out, f_out = pyrxmesh.quadwild_preprocess(v, f, target_faces=1000)
+        assert f_out.shape[0] < f.shape[0]
+
+    def test_explicit_edge_length(self, bunnyhead):
+        v, f = bunnyhead
+        v_out, f_out = pyrxmesh.quadwild_preprocess(
+            v, f, target_edge_length=0.1, num_iterations=1)
+        assert v_out.shape[1] == 3
+        assert np.all(np.isfinite(v_out))
+
+
+# =========================================================================
+# vcg_remesh (CPU)
+# =========================================================================
+
+class TestVcgRemesh:
+    def test_valid_output(self, bunnyhead):
+        v, f = bunnyhead
+        v_out, f_out = pyrxmesh.vcg_remesh(v, f, target_faces=5000, iterations=1)
+        assert v_out.shape[1] == 3
+        assert f_out.shape[1] == 3
+        assert np.all(np.isfinite(v_out))
+        assert np.all(f_out >= 0)
+        assert np.all(f_out < v_out.shape[0])
+
+    def test_non_adaptive(self, bunnyhead):
+        v, f = bunnyhead
+        v_out, f_out = pyrxmesh.vcg_remesh(
+            v, f, target_faces=5000, iterations=1, adaptive=False)
+        assert v_out.shape[1] == 3
+        assert np.all(np.isfinite(v_out))
+
+    def test_gpu_vs_cpu_same_target(self, bunnyhead):
+        """Both GPU and CPU should produce valid meshes for same target."""
+        v, f = bunnyhead
+        vg, fg = pyrxmesh.quadwild_preprocess(v, f, target_faces=5000)
+        vc, fc = pyrxmesh.vcg_remesh(v, f, target_faces=5000, iterations=1)
+        # Both should produce valid output
+        assert np.all(np.isfinite(vg))
+        assert np.all(np.isfinite(vc))
+        assert np.all(fg >= 0) and np.all(fg < vg.shape[0])
+        assert np.all(fc >= 0) and np.all(fc < vc.shape[0])

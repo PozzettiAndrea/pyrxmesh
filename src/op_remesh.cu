@@ -2,6 +2,7 @@
 
 #include "pipeline.h"
 #include <filesystem>
+#include <chrono>
 #include <cstdio>
 
 #include "rxmesh/util/log.h"
@@ -66,28 +67,53 @@ MeshResult pipeline_remesh(
     const int* faces, int num_faces,
     double relative_len,
     int iterations,
-    int smooth_iterations)
+    int smooth_iterations,
+    bool verbose)
 {
+    using clk = std::chrono::high_resolution_clock;
+    auto ms_since = [](auto t0) {
+        return std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+    };
+    auto t0 = clk::now();
+    if (verbose)
+        fprintf(stderr, "[pyrxmesh] remesh: input %d verts, %d faces, relative_len=%.2f\n",
+                num_vertices, num_faces, relative_len);
+
+    auto tp = clk::now();
     auto in_path = write_temp_obj_rm(vertices, num_vertices, faces, num_faces);
     auto out_path = (std::filesystem::temp_directory_path() / "pyrxmesh_remesh_out.obj").string();
+    double t_write = ms_since(tp);
 
     Arg.obj_file_name = in_path;
     Arg.relative_len = static_cast<float>(relative_len);
     Arg.num_iter = static_cast<uint32_t>(iterations);
     Arg.num_smooth_iters = smooth_iterations;
 
+    tp = clk::now();
     RXMeshDynamic rx(in_path, "", 512, 2.0f, 2);
+    double t_build = ms_since(tp);
 
     if (!rx.is_edge_manifold())
         throw std::runtime_error("Remesh requires an edge-manifold mesh");
 
+    tp = clk::now();
     remesh_rxmesh(rx);
+    CUDA_ERROR(cudaDeviceSynchronize());
+    double t_gpu = ms_since(tp);
 
+    tp = clk::now();
     auto coords = rx.get_input_vertex_coordinates();
     rx.export_obj(out_path, *coords);
-
     auto result = read_obj_rm(out_path);
+    double t_readback = ms_since(tp);
+
     std::filesystem::remove(in_path);
     std::filesystem::remove(out_path);
+    if (verbose) {
+        fprintf(stderr, "[pyrxmesh] remesh: obj_write=%.1fms, mesh_build=%.1fms, gpu=%.1fms, readback=%.1fms\n",
+                t_write, t_build, t_gpu, t_readback);
+        fprintf(stderr, "[pyrxmesh] remesh: output %d verts, %d faces, total %.1f ms\n",
+                result.num_vertices, result.num_faces, ms_since(t0));
+    }
     return result;
 }

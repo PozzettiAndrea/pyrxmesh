@@ -7,6 +7,14 @@ endif()
 
 project(pyrxmesh LANGUAGES C CXX CUDA)
 
+# Use ccache if available (saves ~90% rebuild time)
+find_program(CCACHE_PROGRAM ccache)
+if(CCACHE_PROGRAM)
+    set(CMAKE_C_COMPILER_LAUNCHER ${CCACHE_PROGRAM})
+    set(CMAKE_CXX_COMPILER_LAUNCHER ${CCACHE_PROGRAM})
+    set(CMAKE_CUDA_COMPILER_LAUNCHER ${CCACHE_PROGRAM})
+endif()
+
 # ---------------------------------------------------------------------------
 # Configure RXMesh as static library
 # ---------------------------------------------------------------------------
@@ -49,6 +57,13 @@ add_library(rxmesh_pipeline STATIC
   src/op_geodesic.cu
   src/op_scp.cu
   src/op_param.cu
+  src/op_edge_split.cu
+  src/op_edge_collapse.cu
+  src/op_edge_flip.cu
+  src/op_quadwild.cu
+  src/op_feature_remesh.cu
+  src/gpu_bvh.cu
+  src/pyrxmesh_c.cu
 )
 
 target_link_libraries(rxmesh_pipeline PUBLIC RXMesh)
@@ -73,6 +88,37 @@ if(NOT MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
+# VCG CPU remeshing library (host C++ only — no CUDA)
+# ---------------------------------------------------------------------------
+add_library(vcg_remesh STATIC src/vcg_remesh.cpp)
+target_include_directories(vcg_remesh PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/vcglib
+  ${CMAKE_CURRENT_SOURCE_DIR}/vcglib/eigenlib
+)
+target_compile_features(vcg_remesh PUBLIC cxx_std_17)
+set_target_properties(vcg_remesh PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(NOT MSVC)
+  target_compile_options(vcg_remesh PRIVATE -O3 -w)
+endif()
+
+# ---------------------------------------------------------------------------
+# Shared library with C API (for linking from non-CUDA projects like QuadWild)
+# All CUDA/RXMesh code + device symbols resolved inside this .so.
+# ---------------------------------------------------------------------------
+add_library(pyrxmesh_c SHARED src/pyrxmesh_c.cu)
+target_link_libraries(pyrxmesh_c PRIVATE rxmesh_pipeline)
+set_target_properties(pyrxmesh_c PROPERTIES
+  CUDA_RESOLVE_DEVICE_SYMBOLS OFF
+  CUDA_SEPARABLE_COMPILATION OFF
+  POSITION_INDEPENDENT_CODE ON
+  OUTPUT_NAME pyrxmesh_c
+)
+target_include_directories(pyrxmesh_c PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+install(TARGETS pyrxmesh_c LIBRARY DESTINATION lib)
+install(FILES src/pyrxmesh_c.h DESTINATION include)
+
+# ---------------------------------------------------------------------------
 # Nanobind extension module (host C++ only — no CUDA)
 # ---------------------------------------------------------------------------
 nanobind_add_module(
@@ -82,7 +128,7 @@ nanobind_add_module(
 )
 
 # Link the pipeline library — only pipeline.h is included, no CUDA leaks
-target_link_libraries(_pyrxmesh PRIVATE rxmesh_pipeline)
+target_link_libraries(_pyrxmesh PRIVATE rxmesh_pipeline vcg_remesh)
 
 # Prevent CMake from adding a redundant device link step to _pyrxmesh.
 # Device symbols are already resolved in rxmesh_pipeline.
@@ -101,3 +147,9 @@ endif()
 
 # Install into the pyrxmesh Python package directory
 install(TARGETS _pyrxmesh LIBRARY DESTINATION pyrxmesh)
+
+# ---------------------------------------------------------------------------
+# QuadWild pipeline is vendored at quadwild/ (git submodule).
+# Build separately with: ./build_quadwild.sh
+# Produces: quadwild/build/Build/bin/{quadwild,quad_from_patches,cli_trace}
+# ---------------------------------------------------------------------------

@@ -3,6 +3,7 @@
 
 #include "pipeline.h"
 #include <filesystem>
+#include <chrono>
 #include <cstdio>
 #include <limits>
 
@@ -102,8 +103,10 @@ __global__ static void scp_conformal_energy(
 AttributeResult pipeline_scp(
     const double* vertices, int num_vertices,
     const int* faces, int num_faces,
-    int iterations)
+    int iterations,
+    bool verbose)
 {
+    auto t0 = std::chrono::high_resolution_clock::now();
     // Write to temp OBJ for file-based construction
     auto tmp = std::filesystem::temp_directory_path() / "pyrxmesh_scp_in.obj";
     FILE* fp = fopen(tmp.string().c_str(), "w");
@@ -236,5 +239,11 @@ AttributeResult pipeline_scp(
     B.release();
     T1.release();
 
+    if (verbose) {
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        fprintf(stderr, "[pyrxmesh] scp: %d verts, %d iters, %.1f ms\n",
+                num_vertices, iterations, ms);
+    }
     return result;
 }

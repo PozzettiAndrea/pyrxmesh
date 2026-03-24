@@ -69,12 +69,13 @@ static nb::tuple py_load_obj(const std::string& path) {
 
 static nb::object py_vertex_normals(
     const NDArray<const double, 2> vertices,
-    const NDArray<const int, 2> faces)
+    const NDArray<const int, 2> faces,
+    bool verbose)
 {
     validate_mesh(vertices, faces);
     AttributeResult result = pipeline_vertex_normals(
         vertices.data(), static_cast<int>(vertices.shape(0)),
-        faces.data(), static_cast<int>(faces.shape(0)));
+        faces.data(), static_cast<int>(faces.shape(0)), verbose);
 
     NDArray<double, 2> arr = MakeNDArray<double, 2>({result.num_elements, result.num_cols});
     std::memcpy(arr.data(), result.data.data(),
@@ -85,24 +86,25 @@ static nb::object py_vertex_normals(
 static nb::tuple py_smooth(
     const NDArray<const double, 2> vertices,
     const NDArray<const int, 2> faces,
-    int iterations, double lambda)
+    int iterations, double lambda, bool verbose)
 {
     validate_mesh(vertices, faces);
     if (iterations < 0) throw std::runtime_error("iterations must be non-negative");
     return mesh_result_to_tuple(pipeline_smooth(
         vertices.data(), static_cast<int>(vertices.shape(0)),
         faces.data(), static_cast<int>(faces.shape(0)),
-        iterations, lambda));
+        iterations, lambda, verbose));
 }
 
 static nb::object py_gaussian_curvature(
     const NDArray<const double, 2> vertices,
-    const NDArray<const int, 2> faces)
+    const NDArray<const int, 2> faces,
+    bool verbose)
 {
     validate_mesh(vertices, faces);
     AttributeResult result = pipeline_gaussian_curvature(
         vertices.data(), static_cast<int>(vertices.shape(0)),
-        faces.data(), static_cast<int>(faces.shape(0)));
+        faces.data(), static_cast<int>(faces.shape(0)), verbose);
 
     NDArray<double, 1> arr = MakeNDArray<double, 1>({result.num_elements});
     std::memcpy(arr.data(), result.data.data(), result.num_elements * sizeof(double));
@@ -112,67 +114,68 @@ static nb::object py_gaussian_curvature(
 static nb::tuple py_filter(
     const NDArray<const double, 2> vertices,
     const NDArray<const int, 2> faces,
-    int iterations)
+    int iterations, bool verbose)
 {
     validate_mesh(vertices, faces);
     return mesh_result_to_tuple(pipeline_filter(
         vertices.data(), static_cast<int>(vertices.shape(0)),
         faces.data(), static_cast<int>(faces.shape(0)),
-        iterations));
+        iterations, verbose));
 }
 
 static nb::tuple py_mcf(
     const NDArray<const double, 2> vertices,
     const NDArray<const int, 2> faces,
-    double time_step, bool use_uniform_laplace)
+    double time_step, bool use_uniform_laplace, bool verbose)
 {
     validate_mesh(vertices, faces);
     return mesh_result_to_tuple(pipeline_mcf(
         vertices.data(), static_cast<int>(vertices.shape(0)),
         faces.data(), static_cast<int>(faces.shape(0)),
-        time_step, use_uniform_laplace));
+        time_step, use_uniform_laplace, verbose));
 }
 
 static nb::tuple py_qslim(
     const NDArray<const double, 2> vertices,
     const NDArray<const int, 2> faces,
-    double target_ratio)
+    double target_ratio, bool verbose)
 {
     validate_mesh(vertices, faces);
     return mesh_result_to_tuple(pipeline_qslim(
         vertices.data(), static_cast<int>(vertices.shape(0)),
         faces.data(), static_cast<int>(faces.shape(0)),
-        target_ratio));
+        target_ratio, verbose));
 }
 
 static nb::tuple py_remesh(
     const NDArray<const double, 2> vertices,
     const NDArray<const int, 2> faces,
-    double relative_len, int iterations, int smooth_iterations)
+    double relative_len, int iterations, int smooth_iterations, bool verbose)
 {
     validate_mesh(vertices, faces);
     return mesh_result_to_tuple(pipeline_remesh(
         vertices.data(), static_cast<int>(vertices.shape(0)),
         faces.data(), static_cast<int>(faces.shape(0)),
-        relative_len, iterations, smooth_iterations));
+        relative_len, iterations, smooth_iterations, verbose));
 }
 
 static nb::tuple py_sec(
     const NDArray<const double, 2> vertices,
     const NDArray<const int, 2> faces,
-    double target_ratio)
+    double target_ratio, bool verbose)
 {
     validate_mesh(vertices, faces);
     return mesh_result_to_tuple(pipeline_sec(
         vertices.data(), static_cast<int>(vertices.shape(0)),
         faces.data(), static_cast<int>(faces.shape(0)),
-        target_ratio));
+        target_ratio, verbose));
 }
 
 static nb::object py_geodesic(
     const NDArray<const double, 2> vertices,
     const NDArray<const int, 2> faces,
-    const NDArray<const int, 1> seeds)
+    const NDArray<const int, 1> seeds,
+    bool verbose)
 {
     validate_mesh(vertices, faces);
     if (seeds.shape(0) == 0)
@@ -181,7 +184,7 @@ static nb::object py_geodesic(
     AttributeResult result = pipeline_geodesic(
         vertices.data(), static_cast<int>(vertices.shape(0)),
         faces.data(), static_cast<int>(faces.shape(0)),
-        seeds.data(), static_cast<int>(seeds.shape(0)));
+        seeds.data(), static_cast<int>(seeds.shape(0)), verbose);
 
     NDArray<double, 1> arr = MakeNDArray<double, 1>({result.num_elements});
     std::memcpy(arr.data(), result.data.data(), result.num_elements * sizeof(double));
@@ -191,13 +194,13 @@ static nb::object py_geodesic(
 static nb::object py_scp(
     const NDArray<const double, 2> vertices,
     const NDArray<const int, 2> faces,
-    int iterations)
+    int iterations, bool verbose)
 {
     validate_mesh(vertices, faces);
     AttributeResult result = pipeline_scp(
         vertices.data(), static_cast<int>(vertices.shape(0)),
         faces.data(), static_cast<int>(faces.shape(0)),
-        iterations);
+        iterations, verbose);
 
     NDArray<double, 2> arr = MakeNDArray<double, 2>({result.num_elements, 2});
     std::memcpy(arr.data(), result.data.data(), result.num_elements * 2 * sizeof(double));
@@ -207,13 +210,13 @@ static nb::object py_scp(
 static nb::object py_param(
     const NDArray<const double, 2> vertices,
     const NDArray<const int, 2> faces,
-    int newton_iterations)
+    int newton_iterations, bool verbose)
 {
     validate_mesh(vertices, faces);
     AttributeResult result = pipeline_param(
         vertices.data(), static_cast<int>(vertices.shape(0)),
         faces.data(), static_cast<int>(faces.shape(0)),
-        newton_iterations);
+        newton_iterations, verbose);
 
     NDArray<double, 2> arr = MakeNDArray<double, 2>({result.num_elements, 2});
     std::memcpy(arr.data(), result.data.data(), result.num_elements * 2 * sizeof(double));
@@ -222,12 +225,199 @@ static nb::object py_param(
 
 static nb::tuple py_delaunay(
     const NDArray<const double, 2> vertices,
-    const NDArray<const int, 2> faces)
+    const NDArray<const int, 2> faces,
+    bool verbose)
 {
     validate_mesh(vertices, faces);
     return mesh_result_to_tuple(pipeline_delaunay(
         vertices.data(), static_cast<int>(vertices.shape(0)),
-        faces.data(), static_cast<int>(faces.shape(0))));
+        faces.data(), static_cast<int>(faces.shape(0)), verbose));
+}
+
+// --- GPU feature detection ---
+
+static nb::tuple py_detect_features(
+    const NDArray<const double, 2> vertices,
+    const NDArray<const int, 2> faces,
+    float crease_angle_deg, int erode_dilate_steps, bool verbose)
+{
+    validate_mesh(vertices, faces);
+    FeatureResult fr = pipeline_detect_features(
+        vertices.data(), static_cast<int>(vertices.shape(0)),
+        faces.data(), static_cast<int>(faces.shape(0)),
+        crease_angle_deg, erode_dilate_steps, verbose);
+
+    int ne = fr.num_edges;
+    int nv = static_cast<int>(vertices.shape(0));
+
+    NDArray<int, 1> ef = MakeNDArray<int, 1>({ne});
+    std::memcpy(ef.data(), fr.edge_is_feature.data(), ne * sizeof(int));
+
+    NDArray<int, 1> vf = MakeNDArray<int, 1>({nv});
+    std::memcpy(vf.data(), fr.vertex_is_feature.data(), nv * sizeof(int));
+
+    NDArray<int, 1> vb = MakeNDArray<int, 1>({nv});
+    std::memcpy(vb.data(), fr.vertex_is_boundary.data(), nv * sizeof(int));
+
+    return nb::make_tuple(ef, vf, vb, fr.num_feature_edges);
+}
+
+// --- GPU ExpectedEdgeL ---
+
+static nb::tuple py_expected_edge_length(
+    const NDArray<const double, 2> vertices,
+    const NDArray<const int, 2> faces,
+    int min_faces, bool verbose)
+{
+    validate_mesh(vertices, faces);
+    EdgeLengthResult r = pipeline_expected_edge_length(
+        vertices.data(), static_cast<int>(vertices.shape(0)),
+        faces.data(), static_cast<int>(faces.shape(0)),
+        min_faces, verbose);
+    return nb::make_tuple(r.area, r.volume, r.sphericity,
+                          r.target_edge_length, r.avg_edge_length);
+}
+
+// --- VCG CPU remesh ---
+
+static nb::tuple py_vcg_remesh(
+    const NDArray<const double, 2> vertices,
+    const NDArray<const int, 2> faces,
+    float target_edge_length, int target_faces,
+    int iterations, bool adaptive, bool project,
+    float crease_angle_deg, bool verbose)
+{
+    validate_mesh(vertices, faces);
+    VcgRemeshParams p;
+    p.target_edge_length = target_edge_length;
+    p.target_faces       = target_faces;
+    p.iterations         = iterations;
+    p.adaptive           = adaptive;
+    p.project            = project;
+    p.crease_angle_deg   = crease_angle_deg;
+
+    VcgRemeshResult r = vcg_remesh(
+        vertices.data(), static_cast<int>(vertices.shape(0)),
+        faces.data(), static_cast<int>(faces.shape(0)),
+        p, verbose);
+
+    NDArray<double, 2> verts_arr = MakeNDArray<double, 2>({r.num_vertices, 3});
+    std::memcpy(verts_arr.data(), r.vertices.data(), r.num_vertices * 3 * sizeof(double));
+
+    NDArray<int, 2> faces_arr = MakeNDArray<int, 2>({r.num_faces, 3});
+    std::memcpy(faces_arr.data(), r.faces.data(), r.num_faces * 3 * sizeof(int));
+
+    return nb::make_tuple(verts_arr, faces_arr);
+}
+
+// --- Feature-aware GPU remesh ---
+
+static nb::tuple py_feature_remesh(
+    const NDArray<const double, 2> vertices,
+    const NDArray<const int, 2> faces,
+    double relative_len, int iterations, int smooth_iterations,
+    float crease_angle_deg, bool verbose)
+{
+    validate_mesh(vertices, faces);
+    return mesh_result_to_tuple(pipeline_feature_remesh(
+        vertices.data(), static_cast<int>(vertices.shape(0)),
+        faces.data(), static_cast<int>(faces.shape(0)),
+        relative_len, iterations, smooth_iterations,
+        crease_angle_deg, verbose));
+}
+
+// --- QuadWild preprocessing ---
+
+static nb::tuple py_quadwild_preprocess(
+    const NDArray<const double, 2> vertices,
+    const NDArray<const int, 2> faces,
+    float target_edge_length, int target_faces,
+    int num_iterations, int num_smooth_iters, bool verbose)
+{
+    validate_mesh(vertices, faces);
+    int nv = static_cast<int>(vertices.shape(0));
+    int nf = static_cast<int>(faces.shape(0));
+
+    // Convert double vertices to float
+    std::vector<float> vf(nv * 3);
+    for (int i = 0; i < nv * 3; ++i)
+        vf[i] = static_cast<float>(vertices.data()[i]);
+
+    QuadwildParams qp;
+    qp.target_edge_length = target_edge_length;
+    qp.target_faces       = target_faces;
+    qp.num_iterations     = num_iterations;
+    qp.num_smooth_iters   = num_smooth_iters;
+
+    return mesh_result_to_tuple(pipeline_quadwild_preprocess(
+        vf.data(), nv, faces.data(), nf, qp, verbose));
+}
+
+// --- Patch visualization ---
+
+static nb::tuple py_patch_info(
+    const NDArray<const double, 2> vertices,
+    const NDArray<const int, 2> faces)
+{
+    validate_mesh(vertices, faces);
+    PatchResult pr = pipeline_patch_info(
+        vertices.data(), static_cast<int>(vertices.shape(0)),
+        faces.data(), static_cast<int>(faces.shape(0)));
+
+    int nv = static_cast<int>(vertices.shape(0));
+    int nf = static_cast<int>(faces.shape(0));
+
+    NDArray<int, 1> v_patch = MakeNDArray<int, 1>({nv});
+    std::memcpy(v_patch.data(), pr.vertex_patch_ids.data(), nv * sizeof(int));
+
+    NDArray<int, 1> f_patch = MakeNDArray<int, 1>({nf});
+    std::memcpy(f_patch.data(), pr.face_patch_ids.data(), nf * sizeof(int));
+
+    NDArray<int, 1> v_ribbon = MakeNDArray<int, 1>({nv});
+    std::memcpy(v_ribbon.data(), pr.vertex_is_ribbon.data(), nv * sizeof(int));
+
+    NDArray<int, 1> f_ribbon = MakeNDArray<int, 1>({nf});
+    std::memcpy(f_ribbon.data(), pr.face_is_ribbon.data(), nf * sizeof(int));
+
+    return nb::make_tuple(v_patch, f_patch, v_ribbon, f_ribbon, pr.num_patches);
+}
+
+// --- Standalone edge operations ---
+
+static nb::tuple py_edge_split(
+    const NDArray<const double, 2> vertices,
+    const NDArray<const int, 2> faces,
+    double relative_len, int iterations, bool verbose)
+{
+    validate_mesh(vertices, faces);
+    return mesh_result_to_tuple(pipeline_edge_split(
+        vertices.data(), static_cast<int>(vertices.shape(0)),
+        faces.data(), static_cast<int>(faces.shape(0)),
+        relative_len, iterations, verbose));
+}
+
+static nb::tuple py_edge_collapse(
+    const NDArray<const double, 2> vertices,
+    const NDArray<const int, 2> faces,
+    double relative_len, int iterations, bool verbose)
+{
+    validate_mesh(vertices, faces);
+    return mesh_result_to_tuple(pipeline_edge_collapse(
+        vertices.data(), static_cast<int>(vertices.shape(0)),
+        faces.data(), static_cast<int>(faces.shape(0)),
+        relative_len, iterations, verbose));
+}
+
+static nb::tuple py_edge_flip(
+    const NDArray<const double, 2> vertices,
+    const NDArray<const int, 2> faces,
+    int iterations, bool verbose)
+{
+    validate_mesh(vertices, faces);
+    return mesh_result_to_tuple(pipeline_edge_flip(
+        vertices.data(), static_cast<int>(vertices.shape(0)),
+        faces.data(), static_cast<int>(faces.shape(0)),
+        iterations, verbose));
 }
 
 // ---------------------------------------------------------------------------
@@ -323,60 +513,137 @@ NB_MODULE(_pyrxmesh, m) {
 
     m.def("vertex_normals", &py_vertex_normals,
         "Compute area-weighted vertex normals on GPU.",
-        nb::arg("vertices"), nb::arg("faces"));
+        nb::arg("vertices"), nb::arg("faces"),
+        nb::arg("verbose") = false);
 
     m.def("smooth", &py_smooth, "Laplacian mesh smoothing on GPU.",
         nb::arg("vertices"), nb::arg("faces"),
-        nb::arg("iterations") = 10, nb::arg("lambda_") = 0.5);
+        nb::arg("iterations") = 10, nb::arg("lambda_") = 0.5,
+        nb::arg("verbose") = false);
 
     m.def("gaussian_curvature", &py_gaussian_curvature,
         "Compute discrete Gaussian curvature per vertex (Meyer et al. 2003).",
-        nb::arg("vertices"), nb::arg("faces"));
+        nb::arg("vertices"), nb::arg("faces"),
+        nb::arg("verbose") = false);
 
     m.def("filter", &py_filter,
         "Bilateral mesh denoising on GPU (Fleishman et al. 2003).",
         nb::arg("vertices"), nb::arg("faces"),
-        nb::arg("iterations") = 5);
+        nb::arg("iterations") = 5,
+        nb::arg("verbose") = false);
 
     m.def("mcf", &py_mcf,
         "Mean Curvature Flow smoothing via Cholesky solver.",
         nb::arg("vertices"), nb::arg("faces"),
-        nb::arg("time_step") = 10.0, nb::arg("use_uniform_laplace") = true);
+        nb::arg("time_step") = 10.0, nb::arg("use_uniform_laplace") = true,
+        nb::arg("verbose") = false);
 
     m.def("qslim", &py_qslim,
         "QSlim mesh decimation (edge collapse).",
         nb::arg("vertices"), nb::arg("faces"),
-        nb::arg("target_ratio") = 0.5);
+        nb::arg("target_ratio") = 0.5,
+        nb::arg("verbose") = false);
 
     m.def("remesh", &py_remesh,
         "Isotropic remeshing (split/collapse/flip/smooth).",
         nb::arg("vertices"), nb::arg("faces"),
         nb::arg("relative_len") = 1.0,
-        nb::arg("iterations") = 3, nb::arg("smooth_iterations") = 5);
+        nb::arg("iterations") = 3, nb::arg("smooth_iterations") = 5,
+        nb::arg("verbose") = false);
 
     m.def("sec", &py_sec,
         "Shortest-edge-collapse decimation.",
         nb::arg("vertices"), nb::arg("faces"),
-        nb::arg("target_ratio") = 0.5);
+        nb::arg("target_ratio") = 0.5,
+        nb::arg("verbose") = false);
 
     m.def("geodesic", &py_geodesic,
         "Compute geodesic distances from seed vertices on GPU.",
         nb::arg("vertices"), nb::arg("faces"),
-        nb::arg("seeds"));
+        nb::arg("seeds"),
+        nb::arg("verbose") = false);
 
     m.def("scp", &py_scp,
         "Spectral Conformal Parameterization (UV coords via power method).",
         nb::arg("vertices"), nb::arg("faces"),
-        nb::arg("iterations") = 32);
+        nb::arg("iterations") = 32,
+        nb::arg("verbose") = false);
 
     m.def("param", &py_param,
         "UV Parameterization via Tutte + symmetric Dirichlet energy.",
         nb::arg("vertices"), nb::arg("faces"),
-        nb::arg("newton_iterations") = 100);
+        nb::arg("newton_iterations") = 100,
+        nb::arg("verbose") = false);
 
     m.def("delaunay", &py_delaunay,
         "Delaunay edge flipping (maximize minimum angles).",
+        nb::arg("vertices"), nb::arg("faces"),
+        nb::arg("verbose") = false);
+
+    m.def("detect_features", &py_detect_features,
+        "Detect feature edges on GPU via dihedral angle threshold.",
+        nb::arg("vertices"), nb::arg("faces"),
+        nb::arg("crease_angle_deg") = 35.0f,
+        nb::arg("erode_dilate_steps") = 4,
+        nb::arg("verbose") = false);
+
+    m.def("expected_edge_length", &py_expected_edge_length,
+        "Compute QuadWild's ExpectedEdgeL on GPU (sphericity-based target).",
+        nb::arg("vertices"), nb::arg("faces"),
+        nb::arg("min_faces") = 10000,
+        nb::arg("verbose") = false);
+
+    m.def("vcg_remesh", &py_vcg_remesh,
+        "CPU isotropic remeshing via VCG (same as QuadWild's AutoRemesher).",
+        nb::arg("vertices"), nb::arg("faces"),
+        nb::arg("target_edge_length") = 0.0f,
+        nb::arg("target_faces") = 10000,
+        nb::arg("iterations") = 3,
+        nb::arg("adaptive") = true,
+        nb::arg("project") = true,
+        nb::arg("crease_angle_deg") = 35.0f,
+        nb::arg("verbose") = false);
+
+    m.def("feature_remesh", &py_feature_remesh,
+        "Feature-aware GPU remeshing (skips feature edges during split/collapse/flip).",
+        nb::arg("vertices"), nb::arg("faces"),
+        nb::arg("relative_len") = 1.0,
+        nb::arg("iterations") = 15,
+        nb::arg("smooth_iterations") = 5,
+        nb::arg("crease_angle_deg") = 35.0f,
+        nb::arg("verbose") = false);
+
+    m.def("quadwild_preprocess", &py_quadwild_preprocess,
+        "GPU isotropic remeshing for QuadWild preprocessing.",
+        nb::arg("vertices"), nb::arg("faces"),
+        nb::arg("target_edge_length") = 0.0f,
+        nb::arg("target_faces") = 10000,
+        nb::arg("num_iterations") = 15,
+        nb::arg("num_smooth_iters") = 5,
+        nb::arg("verbose") = false);
+
+    m.def("patch_info", &py_patch_info,
+        "Get per-vertex/face patch IDs and ribbon masks for visualization.",
         nb::arg("vertices"), nb::arg("faces"));
+
+    // ── Standalone edge operations ──
+    m.def("edge_split", &py_edge_split,
+        "Split long edges (from isotropic remeshing sub-op).",
+        nb::arg("vertices"), nb::arg("faces"),
+        nb::arg("relative_len") = 1.0, nb::arg("iterations") = 1,
+        nb::arg("verbose") = false);
+
+    m.def("edge_collapse", &py_edge_collapse,
+        "Collapse short edges (from isotropic remeshing sub-op).",
+        nb::arg("vertices"), nb::arg("faces"),
+        nb::arg("relative_len") = 1.0, nb::arg("iterations") = 1,
+        nb::arg("verbose") = false);
+
+    m.def("edge_flip", &py_edge_flip,
+        "Flip edges to equalize vertex valences (target = 6).",
+        nb::arg("vertices"), nb::arg("faces"),
+        nb::arg("iterations") = 1,
+        nb::arg("verbose") = false);
 
     // ── Persistent Mesh class ──
     nb::class_<PyMesh>(m, "Mesh",
