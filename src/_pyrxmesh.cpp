@@ -310,20 +310,61 @@ static nb::tuple py_vcg_remesh(
     return nb::make_tuple(verts_arr, faces_arr);
 }
 
+// --- VCG remesh with checkpoints ---
+
+static nb::tuple mesh_result_to_np(const VcgRemeshResult& r) {
+    NDArray<double, 2> v = MakeNDArray<double, 2>({r.num_vertices, 3});
+    std::memcpy(v.data(), r.vertices.data(), r.num_vertices * 3 * sizeof(double));
+    NDArray<int, 2> f = MakeNDArray<int, 2>({r.num_faces, 3});
+    std::memcpy(f.data(), r.faces.data(), r.num_faces * 3 * sizeof(int));
+    return nb::make_tuple(v, f);
+}
+
+static nb::dict py_vcg_remesh_checkpoints(
+    const NDArray<const double, 2> vertices,
+    const NDArray<const int, 2> faces,
+    float target_edge_length, int target_faces,
+    int iterations, bool adaptive, bool project,
+    float crease_angle_deg, bool verbose)
+{
+    validate_mesh(vertices, faces);
+    VcgRemeshParams p;
+    p.target_edge_length = target_edge_length;
+    p.target_faces       = target_faces;
+    p.iterations         = iterations;
+    p.adaptive           = adaptive;
+    p.project            = project;
+    p.crease_angle_deg   = crease_angle_deg;
+
+    VcgRemeshCheckpoints ck = vcg_remesh_with_checkpoints(
+        vertices.data(), static_cast<int>(vertices.shape(0)),
+        faces.data(), static_cast<int>(faces.shape(0)),
+        p, verbose);
+
+    nb::dict d;
+    d["after_pass1"] = mesh_result_to_np(ck.after_pass1);
+    d["after_micro_collapse"] = mesh_result_to_np(ck.after_micro_collapse);
+    if (ck.has_pass2)
+        d["after_pass2"] = mesh_result_to_np(ck.after_pass2);
+    d["after_cleanup"] = mesh_result_to_np(ck.after_cleanup);
+    d["after_refine"] = mesh_result_to_np(ck.after_refine);
+    return d;
+}
+
 // --- Feature-aware GPU remesh ---
 
 static nb::tuple py_feature_remesh(
     const NDArray<const double, 2> vertices,
     const NDArray<const int, 2> faces,
     double relative_len, int iterations, int smooth_iterations,
-    float crease_angle_deg, bool verbose)
+    float crease_angle_deg, int max_passes, bool verbose)
 {
     validate_mesh(vertices, faces);
     return mesh_result_to_tuple(pipeline_feature_remesh(
         vertices.data(), static_cast<int>(vertices.shape(0)),
         faces.data(), static_cast<int>(faces.shape(0)),
         relative_len, iterations, smooth_iterations,
-        crease_angle_deg, verbose));
+        crease_angle_deg, max_passes, verbose));
 }
 
 // --- QuadWild preprocessing ---
@@ -604,6 +645,17 @@ NB_MODULE(_pyrxmesh, m) {
         nb::arg("crease_angle_deg") = 35.0f,
         nb::arg("verbose") = false);
 
+    m.def("vcg_remesh_checkpoints", &py_vcg_remesh_checkpoints,
+        "CPU remeshing with intermediate checkpoints at each pipeline stage.",
+        nb::arg("vertices"), nb::arg("faces"),
+        nb::arg("target_edge_length") = 0.0f,
+        nb::arg("target_faces") = 10000,
+        nb::arg("iterations") = 3,
+        nb::arg("adaptive") = true,
+        nb::arg("project") = true,
+        nb::arg("crease_angle_deg") = 35.0f,
+        nb::arg("verbose") = false);
+
     m.def("feature_remesh", &py_feature_remesh,
         "Feature-aware GPU remeshing (skips feature edges during split/collapse/flip).",
         nb::arg("vertices"), nb::arg("faces"),
@@ -611,6 +663,7 @@ NB_MODULE(_pyrxmesh, m) {
         nb::arg("iterations") = 15,
         nb::arg("smooth_iterations") = 5,
         nb::arg("crease_angle_deg") = 35.0f,
+        nb::arg("max_passes") = 2,
         nb::arg("verbose") = false);
 
     m.def("quadwild_preprocess", &py_quadwild_preprocess,

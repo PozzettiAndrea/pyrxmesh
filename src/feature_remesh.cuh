@@ -842,7 +842,7 @@ __global__ static void feature_erode_kernel(
         if (v_boundary(v0) && v_boundary(v1)) return;
         T len = glm::length(coords.to_glm<3>(v1) - coords.to_glm<3>(v0));
         if (len > max_len) return;
-        if (feat_valence(v0) == 2 || feat_valence(v1) == 2)
+        if (feat_valence(v0) == 1 || feat_valence(v1) == 1)
             edge_feature(eh) = 0;
     };
     auto block = cooperative_groups::this_thread_block();
@@ -864,8 +864,8 @@ __global__ static void feature_dilate_kernel(
         if (edge_feature(eh) == 1) return;
         if (edge_feature_orig(eh) != 1) return;
         auto v0 = iter[0], v1 = iter[1];
-        if ((feat_valence(v0) == 2 && !v_high_val(v0)) ||
-            (feat_valence(v1) == 2 && !v_high_val(v1)))
+        if ((feat_valence(v0) == 1 && !v_high_val(v0)) ||
+            (feat_valence(v1) == 1 && !v_high_val(v1)))
             edge_feature(eh) = 1;
     };
     auto block = cooperative_groups::this_thread_block();
@@ -920,7 +920,7 @@ inline void erode_dilate_features(
     rx.for_each_vertex(DEVICE,
         [fv = *feat_valence, vb = *v_boundary, vh_out = *v_high_val]
         __device__(const VertexHandle vh) mutable {
-            vh_out(vh) = (fv(vh) > 4 || (vb(vh) && fv(vh) > 2)) ? 1 : 0;
+            vh_out(vh) = (fv(vh) > 2 || (vb(vh) && fv(vh) > 1)) ? 1 : 0;
         });
     CUDA_ERROR(cudaDeviceSynchronize());
 
@@ -1021,6 +1021,12 @@ inline void feature_split_long_edges(
         int split_inner = 0;
         while (!rx.is_queue_empty()) {
             split_inner++;
+
+            fprintf(stderr, "      [split o=%d i=%d] pre-kernel: V=%u E=%u F=%u P=%u\n",
+                    split_outer, split_inner,
+                    rx.get_num_vertices(), rx.get_num_edges(),
+                    rx.get_num_faces(), rx.get_num_patches());
+
             timers.start("Split");
             feature_edge_split<T, blockThreads>
                 <<<lb.blocks, lb.num_threads, lb.smem_bytes_dyn>>>(
@@ -1028,15 +1034,48 @@ inline void feature_split_long_edges(
                     *edge_is_feature, *sizing, high_edge_len_sq, low_edge_len_sq, 0);
             timers.stop("Split");
 
+            // Check for kernel errors immediately
+            cudaError_t err = cudaDeviceSynchronize();
+            if (err != cudaSuccess) {
+                fprintf(stderr, "      [split o=%d i=%d] KERNEL CRASH: %s\n",
+                        split_outer, split_inner, cudaGetErrorString(err));
+                fprintf(stderr, "      post-crash: V=%u E=%u F=%u P=%u\n",
+                        rx.get_num_vertices(), rx.get_num_edges(),
+                        rx.get_num_faces(), rx.get_num_patches());
+                // Try to find which patch overflowed
+                rx.update_host();
+                for (uint32_t p = 0; p < rx.get_num_patches(); p++) {
+                    // Access patch info to check sizes
+                }
+                throw std::runtime_error("Split kernel crashed");
+            }
+
+            fprintf(stderr, "      [split o=%d i=%d] post-kernel OK: V=%u E=%u F=%u P=%u\n",
+                    split_outer, split_inner,
+                    rx.get_num_vertices(), rx.get_num_edges(),
+                    rx.get_num_faces(), rx.get_num_patches());
+
             timers.start("SplitCleanup");
             rx.cleanup();
             timers.stop("SplitCleanup");
+
+            fprintf(stderr, "      [split o=%d i=%d] post-cleanup: V=%u E=%u F=%u P=%u\n",
+                    split_outer, split_inner,
+                    rx.get_num_vertices(), rx.get_num_edges(),
+                    rx.get_num_faces(), rx.get_num_patches());
+
             timers.start("SplitSlice");
-            rx.slice_patches(*coords, *edge_status, *v_boundary);
+            rx.slice_patches(*coords, *edge_status, *v_boundary,
+                             *edge_is_feature, *sizing);
             timers.stop("SplitSlice");
             timers.start("SplitCleanup");
             rx.cleanup();
             timers.stop("SplitCleanup");
+
+            fprintf(stderr, "      [split o=%d i=%d] post-slice: V=%u E=%u F=%u P=%u\n",
+                    split_outer, split_inner,
+                    rx.get_num_vertices(), rx.get_num_edges(),
+                    rx.get_num_faces(), rx.get_num_patches());
         }
         int remaining = is_done(rx, edge_status, d_buffer);
         fprintf(stderr, "    [split] outer=%d inner=%d remaining=%d/%d\n",
@@ -1099,7 +1138,9 @@ inline void feature_collapse_short_edges(
             rx.cleanup();
             timers.stop("CollapseCleanup");
             timers.start("CollapseSlice");
-            rx.slice_patches(*coords, *edge_status);
+            rx.slice_patches(*coords, *edge_status, *v_boundary,
+                             *edge_is_feature, *vertex_is_feature,
+                             *sizing);
             timers.stop("CollapseSlice");
             timers.start("CollapseCleanup");
             rx.cleanup();
@@ -1172,7 +1213,8 @@ inline void feature_equalize_valences(
             rx.cleanup();
             timers.stop("FlipCleanup");
             timers.start("FlipSlice");
-            rx.slice_patches(*coords, *edge_status);
+            rx.slice_patches(*coords, *edge_status, *v_boundary,
+                             *edge_is_feature);
             timers.stop("FlipSlice");
             timers.start("FlipCleanup");
             rx.cleanup();

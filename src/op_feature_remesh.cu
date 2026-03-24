@@ -159,6 +159,7 @@ MeshResult pipeline_feature_remesh(
     int iterations,
     int smooth_iterations,
     float crease_angle_deg,
+    int max_passes,
     bool verbose)
 {
     using clk = std::chrono::high_resolution_clock;
@@ -183,7 +184,7 @@ MeshResult pipeline_feature_remesh(
     Arg.num_smooth_iters = smooth_iterations;
 
     tp = clk::now();
-    RXMeshDynamic rx(in_path, "", 512, 2.0f, 2);
+    RXMeshDynamic rx(in_path, "", 512, 3.5f, 5);
     double t_build = ms_since(tp);
 
     if (!rx.is_edge_manifold())
@@ -444,6 +445,14 @@ MeshResult pipeline_feature_remesh(
                 "checkpoint %.1f ms\n",
                 mid_result.num_vertices, mid_result.num_faces, t_checkpoint);
 
+    if (max_passes <= 1) {
+        std::filesystem::remove(in_path);
+        std::filesystem::remove(mid_path);
+        if (verbose)
+            fprintf(stderr, "[pyrxmesh] feature_remesh: returning after pass 1 (max_passes=%d)\n", max_passes);
+        return mid_result;
+    }
+
     // ── Micro-edge collapse (CPU, exact QuadWild match) ──────────────
     // Collapses shortest edge of triangles with QualityRadii <= 0.01
     tp = clk::now();
@@ -476,7 +485,7 @@ MeshResult pipeline_feature_remesh(
     }
 
     Arg.obj_file_name = pass2_path;
-    RXMeshDynamic rx2(pass2_path, "", 512, 2.0f, 2);
+    RXMeshDynamic rx2(pass2_path, "", 512, 3.5f, 5);
     double t_build2 = ms_since(tp);
 
     if (verbose)

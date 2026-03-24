@@ -29,6 +29,7 @@ from pyrxmesh._pyrxmesh import (
     feature_remesh as _feature_remesh,
     quadwild_preprocess as _quadwild_preprocess,
     vcg_remesh as _vcg_remesh,
+    vcg_remesh_checkpoints as _vcg_remesh_checkpoints,
 )
 
 
@@ -358,6 +359,32 @@ def vcg_remesh(
                        adaptive, project, crease_angle_deg, verbose)
 
 
+def vcg_remesh_checkpoints(
+    vertices: NDArray[np.float64],
+    faces: NDArray[np.int32],
+    target_edge_length: float = 0.0,
+    target_faces: int = 10000,
+    iterations: int = 15,
+    adaptive: bool = True,
+    project: bool = True,
+    crease_angle_deg: float = 35.0,
+    verbose: bool = False,
+) -> dict:
+    """CPU remeshing with intermediate checkpoints at each pipeline stage.
+
+    Returns a dict with keys:
+    - 'after_pass1': (verts, faces) after non-adaptive remesh
+    - 'after_micro_collapse': (verts, faces) after micro-edge collapse
+    - 'after_pass2': (verts, faces) after adaptive remesh (only if adaptive=True)
+    - 'after_cleanup': (verts, faces) after SolveGeometricArtifacts
+    - 'after_refine': (verts, faces) after RefineIfNeeded (final)
+    """
+    v, f = _validate_mesh(vertices, faces)
+    return _vcg_remesh_checkpoints(v, f, target_edge_length, target_faces,
+                                    iterations, adaptive, project,
+                                    crease_angle_deg, verbose)
+
+
 def feature_remesh(
     vertices: NDArray[np.float64],
     faces: NDArray[np.int32],
@@ -365,16 +392,22 @@ def feature_remesh(
     iterations: int = 15,
     smooth_iterations: int = 5,
     crease_angle_deg: float = 35.0,
+    max_passes: int = 2,
     verbose: bool = False,
 ) -> tuple[NDArray[np.float64], NDArray[np.int32]]:
     """Feature-aware GPU isotropic remeshing.
 
     Like remesh() but detects feature edges (dihedral angle > crease_angle_deg)
     and skips them during split/collapse/flip operations, preserving sharp edges.
+
+    Parameters
+    ----------
+    max_passes : int
+        1 = non-adaptive pass only, 2 = non-adaptive + adaptive (default).
     """
     v, f = _validate_mesh(vertices, faces)
     return _feature_remesh(v, f, relative_len, iterations, smooth_iterations,
-                           crease_angle_deg, verbose)
+                           crease_angle_deg, max_passes, verbose)
 
 
 # ── QuadWild preprocessing ──────────────────────────────────────────────────

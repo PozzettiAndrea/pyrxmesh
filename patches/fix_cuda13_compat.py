@@ -239,6 +239,31 @@ def patch_delaunay_openmesh():
     print("  Patched delaunay_rxmesh.cuh")
 
 
+def patch_attribute_remove_inline():
+    """Remove __inline__ from declarations in attribute.h.
+
+    CUDA 13 + gcc 13 errors on 'inline function used but never defined'.
+    The definitions live in attribute.cu (compiled separately). Removing
+    __inline__ lets the linker resolve them normally via explicit
+    instantiations + separable compilation (-rdc=true).
+    """
+    path = RXMESH_ROOT / "include" / "rxmesh" / "attribute.h"
+    text = path.read_text()
+    if SENTINEL in text:
+        print("  Already patched attribute.h")
+        return
+    old_text = text
+    text = text.replace("__host__ __device__ __inline__",
+                        "__host__ __device__")
+    if text == old_text:
+        print("  No __inline__ found in attribute.h")
+        return
+    # Add sentinel so patch is idempotent
+    text = text.replace("#pragma once", "#pragma once  // " + SENTINEL, 1)
+    path.write_text(text)
+    print("  Patched attribute.h (removed __inline__)")
+
+
 def main():
     print("Patching RXMesh for CUDA 12.4+ / 13+ compatibility...")
 
@@ -275,6 +300,10 @@ def main():
 
     # 4. Remove OpenMesh dependency from Delaunay app (used for verification only)
     patch_delaunay_openmesh()
+
+    # 5. Remove __inline__ from attribute.h declarations (fixes "used but
+    #    never defined" errors with CUDA 13 + gcc 13)
+    patch_attribute_remove_inline()
 
     print("Done.")
 

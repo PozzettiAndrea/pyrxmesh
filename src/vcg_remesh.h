@@ -46,4 +46,20 @@ VcgRemeshResult vcg_micro_collapse(
     int max_iter = 2,
     bool verbose = false);
 
+// Full pipeline with intermediate checkpoints at each stage.
+struct VcgRemeshCheckpoints {
+    VcgRemeshResult after_pass1;          // after non-adaptive remesh
+    VcgRemeshResult after_micro_collapse; // after micro-edge collapse
+    VcgRemeshResult after_pass2;          // after adaptive remesh (empty if adaptive=false)
+    VcgRemeshResult after_cleanup;        // after SolveGeometricArtifacts
+    VcgRemeshResult after_refine;         // after RefineIfNeeded (final)
+    bool has_pass2;                       // true if adaptive was enabled
+};
+
+VcgRemeshCheckpoints vcg_remesh_with_checkpoints(
+    const double* vertices, int num_vertices,
+    const int* faces, int num_faces,
+    const VcgRemeshParams& params,
+    bool verbose = false);
+
 #endif // PYRXMESH_VCG_REMESH_H

@@ -1,7 +1,24 @@
 """Serve the pyrxmesh demo site on port 8001."""
 
+import os
+import signal
+import subprocess
 import uvicorn
 from pathlib import Path
+
+
+def kill_existing():
+    """Kill any existing uvicorn processes serving on port 8001."""
+    try:
+        result = subprocess.run(
+            ["lsof", "-ti", ":8001"], capture_output=True, text=True)
+        for pid in result.stdout.strip().split():
+            pid = int(pid)
+            if pid != os.getpid():
+                os.kill(pid, signal.SIGTERM)
+                print(f"Killed existing server (PID {pid})")
+    except Exception:
+        pass
 
 SITE_DIR = Path(__file__).parent / "docs" / "_site"
 
@@ -27,10 +44,14 @@ async def app(scope, receive, send):
     body = file.read_bytes()
 
     await send({"type": "http.response.start", "status": 200,
-                 "headers": [[b"content-type", ct.encode()]]})
+                 "headers": [[b"content-type", ct.encode()],
+                              [b"cache-control", b"no-cache, no-store, must-revalidate"],
+                              [b"pragma", b"no-cache"],
+                              [b"expires", b"0"]]})
     await send({"type": "http.response.body", "body": body})
 
 
 if __name__ == "__main__":
+    kill_existing()
     print(f"Serving {SITE_DIR} at http://localhost:8001")
     uvicorn.run("serve_demo:app", host="0.0.0.0", port=8001)

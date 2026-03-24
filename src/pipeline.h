@@ -217,6 +217,7 @@ MeshResult pipeline_feature_remesh(
     int iterations,
     int smooth_iterations,
     float crease_angle_deg = 35.0f,
+    int max_passes = 2,
     bool verbose = false);
 
 // =========================================================================

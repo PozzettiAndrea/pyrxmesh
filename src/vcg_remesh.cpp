@@ -539,6 +539,147 @@ VcgRemeshResult vcg_remesh(
 }
 
 // =========================================================================
+// Helper: extract current VCG mesh state to VcgRemeshResult
+// =========================================================================
+
+static VcgRemeshResult extract_mesh(QwMesh& mesh) {
+    mesh.UpdateDataStructures();
+    VcgRemeshResult r;
+    r.num_vertices = mesh.VN();
+    r.num_faces = mesh.FN();
+    r.vertices.resize(r.num_vertices * 3);
+    r.faces.resize(r.num_faces * 3);
+    for (int i = 0; i < r.num_vertices; ++i) {
+        r.vertices[i*3+0] = mesh.vert[i].P()[0];
+        r.vertices[i*3+1] = mesh.vert[i].P()[1];
+        r.vertices[i*3+2] = mesh.vert[i].P()[2];
+    }
+    for (int i = 0; i < r.num_faces; ++i) {
+        r.faces[i*3+0] = vcg::tri::Index(mesh, mesh.face[i].V(0));
+        r.faces[i*3+1] = vcg::tri::Index(mesh, mesh.face[i].V(1));
+        r.faces[i*3+2] = vcg::tri::Index(mesh, mesh.face[i].V(2));
+    }
+    return r;
+}
+
+// =========================================================================
+// vcg_remesh_with_checkpoints — full pipeline with intermediates
+// =========================================================================
+
+VcgRemeshCheckpoints vcg_remesh_with_checkpoints(
+    const double* vertices, int num_vertices,
+    const int* faces, int num_faces,
+    const VcgRemeshParams& params,
+    bool verbose)
+{
+    using clk = std::chrono::high_resolution_clock;
+    auto ms_since = [](auto t0) {
+        return std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+    };
+    auto t0 = clk::now();
+
+    VcgRemeshCheckpoints ck;
+    ck.has_pass2 = params.adaptive;
+
+    // Build VCG mesh
+    QwMesh mesh;
+    mesh.LimitConcave = -0.99;
+    vcg::tri::Allocator<QwMesh>::AddVertices(mesh, num_vertices);
+    for (int i = 0; i < num_vertices; ++i)
+        mesh.vert[i].P() = CoordType(vertices[i*3], vertices[i*3+1], vertices[i*3+2]);
+    vcg::tri::Allocator<QwMesh>::AddFaces(mesh, num_faces);
+    for (int i = 0; i < num_faces; ++i) {
+        mesh.face[i].V(0) = &mesh.vert[faces[i*3]];
+        mesh.face[i].V(1) = &mesh.vert[faces[i*3+1]];
+        mesh.face[i].V(2) = &mesh.vert[faces[i*3+2]];
+    }
+    mesh.UpdateDataStructures();
+
+    // Step 1: Feature detection + erode/dilate
+    float crease_deg = params.crease_angle_deg > 0 ? params.crease_angle_deg : 35.0f;
+    mesh.InitSharpFeatures(crease_deg);
+    mesh.ErodeDilate(4);
+
+    // Step 2: Target edge length
+    ScalarType target_edge = params.target_edge_length;
+    size_t min_faces = params.target_faces > 0 ? params.target_faces : 10000;
+    if (target_edge <= 0)
+        target_edge = expected_edge_length(mesh, 2000, min_faces);
+
+    if (verbose)
+        fprintf(stderr, "[pyrxmesh] checkpoints: target_edge=%.6f\n", target_edge);
+
+    // Step 3: Pass 1 — non-adaptive remesh
+    typename vcg::tri::IsotropicRemeshing<QwMesh>::Params para;
+    int iters = params.iterations > 0 ? params.iterations : 15;
+    para.iter = iters;
+    para.SetTargetLen(target_edge);
+    para.splitFlag = true; para.swapFlag = true; para.collapseFlag = true;
+    para.smoothFlag = true; para.projectFlag = params.project;
+    para.selectedOnly = false; para.adapt = false;
+    para.aspectRatioThr = 0.3; para.cleanFlag = true;
+    para.maxSurfDist = mesh.bbox.Diag() / 2500.0;
+    para.surfDistCheck = mesh.FN() < 400000 ? params.project : false;
+    para.userSelectedCreases = true;
+
+    auto tp = clk::now();
+    vcg::tri::IsotropicRemeshing<QwMesh>::Do(mesh, para);
+    if (verbose)
+        fprintf(stderr, "[pyrxmesh] checkpoints: pass1 done, %d V, %d F, %.1f ms\n",
+                mesh.VN(), mesh.FN(), ms_since(tp));
+    ck.after_pass1 = extract_mesh(mesh);
+
+    // Step 4: Micro-edge collapse
+    tp = clk::now();
+    collapse_micro_edges(mesh, 0.01);
+    if (verbose)
+        fprintf(stderr, "[pyrxmesh] checkpoints: micro_collapse done, %d V, %d F, %.1f ms\n",
+                mesh.VN(), mesh.FN(), ms_since(tp));
+    ck.after_micro_collapse = extract_mesh(mesh);
+
+    // Step 5: Re-detect features
+    update_coherent_sharp(mesh, crease_deg);
+
+    // Step 6: Pass 2 — adaptive remesh
+    if (params.adaptive) {
+        para.adapt = true;
+        para.smoothFlag = true;
+        para.maxSurfDist = mesh.bbox.Diag() / 2500.0;
+
+        tp = clk::now();
+        vcg::tri::IsotropicRemeshing<QwMesh>::Do(mesh, para);
+        if (verbose)
+            fprintf(stderr, "[pyrxmesh] checkpoints: pass2 done, %d V, %d F, %.1f ms\n",
+                    mesh.VN(), mesh.FN(), ms_since(tp));
+        ck.after_pass2 = extract_mesh(mesh);
+    }
+
+    mesh.UpdateDataStructures();
+    mesh.InitFeatureCoordsTable();
+
+    // Step 7: Geometric cleanup
+    tp = clk::now();
+    solve_geometric_artifacts(mesh);
+    if (verbose)
+        fprintf(stderr, "[pyrxmesh] checkpoints: cleanup done, %d V, %d F, %.1f ms\n",
+                mesh.VN(), mesh.FN(), ms_since(tp));
+    ck.after_cleanup = extract_mesh(mesh);
+
+    // Step 8: Refine if needed
+    mesh.InitSharpFeatures(crease_deg);
+    refine_if_needed(mesh);
+    if (verbose)
+        fprintf(stderr, "[pyrxmesh] checkpoints: refine done, %d V, %d F, %.1f ms\n",
+                mesh.VN(), mesh.FN(), ms_since(tp));
+    ck.after_refine = extract_mesh(mesh);
+
+    if (verbose)
+        fprintf(stderr, "[pyrxmesh] checkpoints: total %.1f ms\n", ms_since(t0));
+
+    return ck;
+}
+
+// =========================================================================
 // vcg_clean_mesh — SolveGeometricArtifacts from QuadWild
 // =========================================================================
 

@@ -882,8 +882,8 @@ __global__ static void erode_features_kernel(
         T len = glm::length(p1 - p0);
         if (len > max_len) return;
 
-        // Erode if either endpoint has feature-valence == 2 (dead-end)
-        if (vertex_valence(v0) == 2 || vertex_valence(v1) == 2) {
+        // Erode if either endpoint has feature-valence == 1 (dead-end)
+        if (vertex_valence(v0) == 1 || vertex_valence(v1) == 1) {
             edge_feature(eh) = 0;
         }
     };
@@ -911,9 +911,9 @@ __global__ static void dilate_features_kernel(
         VertexHandle v0 = iter[0];
         VertexHandle v1 = iter[1];
 
-        // Restore if either endpoint has valence == 2 AND is not a high-valence junction
-        if ((vertex_valence(v0) == 2 && !vertex_high_valence(v0)) ||
-            (vertex_valence(v1) == 2 && !vertex_high_valence(v1))) {
+        // Restore if either endpoint has valence == 1 AND is not a high-valence junction
+        if ((vertex_valence(v0) == 1 && !vertex_high_valence(v0)) ||
+            (vertex_valence(v1) == 1 && !vertex_high_valence(v1))) {
             edge_feature(eh) = 1;
         }
     };
@@ -1049,7 +1049,8 @@ FeatureResult pipeline_detect_features(
             });
         CUDA_ERROR(cudaDeviceSynchronize());
 
-        // Mark high-valence junctions (valence > 4 or boundary with valence > 2)
+        // Mark high-valence junctions (graph degree > 2, or boundary with degree > 1)
+        // CPU uses face-edge valence (2x), so Q()>4 = degree>2, Q()>2 = degree>1
         auto v_high_val = rx.add_vertex_attribute<int>("v_high_val", 1, DEVICE);
 
         auto feat_valence = rx.add_vertex_attribute<int>("feat_valence", 1, LOCATION_ALL);
@@ -1080,8 +1081,8 @@ FeatureResult pipeline_detect_features(
             [feat_valence = *feat_valence, v_boundary = *v_boundary,
              v_high_val = *v_high_val]
             __device__(const VertexHandle vh) mutable {
-                v_high_val(vh) = (feat_valence(vh) > 4 ||
-                                  (v_boundary(vh) && feat_valence(vh) > 2)) ? 1 : 0;
+                v_high_val(vh) = (feat_valence(vh) > 2 ||
+                                  (v_boundary(vh) && feat_valence(vh) > 1)) ? 1 : 0;
             });
         CUDA_ERROR(cudaDeviceSynchronize());
 

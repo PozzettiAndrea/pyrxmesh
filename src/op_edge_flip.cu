@@ -85,7 +85,7 @@ MeshResult pipeline_edge_flip(
     Arg.obj_file_name = in_path;
 
     tp = clk::now();
-    RXMeshDynamic rx(in_path, "", 512, 2.0f, 2);
+    RXMeshDynamic rx(in_path, "", 512, 3.5f, 5);
     double t_build = ms_since(tp);
 
     if (!rx.is_edge_manifold())
