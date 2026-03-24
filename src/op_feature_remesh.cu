@@ -335,23 +335,28 @@ MeshResult pipeline_feature_remesh(
     for (uint32_t iter = 0; iter < Arg.num_iter; ++iter) {
         auto t_iter = clk::now();
 
-        if (verbose)
-            fprintf(stderr, "  [iter %u/%u] V=%u E=%u F=%u P=%u\n",
-                    iter, Arg.num_iter, rx.get_num_vertices(),
-                    rx.get_num_edges(), rx.get_num_faces(), rx.get_num_patches());
+        if (verbose) {
+            uint32_t lv = rx.get_num_vertices(true);
+            uint32_t le = rx.get_num_edges(true);
+            uint32_t lf = rx.get_num_faces(true);
+            fprintf(stderr, "  [gpu iter %u/%u] V=%u E=%u F=%u\n",
+                    iter, Arg.num_iter, lv, le, lf);
+        }
 
-        feature_split_long_edges(rx, coords.get(), edge_status.get(),
-            v_boundary.get(), edge_feature.get(), sizing.get(),
+        feature_split_long_edges(rx, coords.get(),
+            edge_status.get(), v_boundary.get(), edge_feature.get(),
+            vertex_feature.get(), sizing.get(),
             high_edge_len_sq, low_edge_len_sq, timers, d_buffer);
 
-        feature_collapse_short_edges(rx, coords.get(), edge_status.get(),
-            edge_link.get(), v_boundary.get(), edge_feature.get(),
-            vertex_feature.get(), sizing.get(),
+        feature_collapse_short_edges(rx, coords.get(),
+            edge_status.get(), edge_link.get(), v_boundary.get(),
+            edge_feature.get(), vertex_feature.get(), sizing.get(),
             low_edge_len_sq, high_edge_len_sq, timers, d_buffer);
 
-        feature_equalize_valences(rx, coords.get(), v_valence.get(),
-            edge_status.get(), edge_link.get(), v_boundary.get(),
-            edge_feature.get(), timers, d_buffer);
+        feature_equalize_valences(rx, coords.get(),
+            v_valence.get(), edge_status.get(), edge_link.get(),
+            v_boundary.get(), edge_feature.get(), vertex_feature.get(),
+            sizing.get(), timers, d_buffer);
 
         tangential_relaxation(rx, coords.get(), new_coords.get(),
             v_boundary.get(), Arg.num_smooth_iters, timers);
@@ -600,18 +605,20 @@ MeshResult pipeline_feature_remesh(
                     iter, Arg.num_iter, rx2.get_num_vertices(),
                     rx2.get_num_edges(), rx2.get_num_faces(), rx2.get_num_patches());
 
-        feature_split_long_edges(rx2, coords2.get(), edge_status2.get(),
-            v_boundary2.get(), edge_feature2.get(), sizing2.get(),
+        feature_split_long_edges(rx2, coords2.get(),
+            edge_status2.get(), v_boundary2.get(), edge_feature2.get(),
+            vertex_feature2.get(), sizing2.get(),
             high2_sq, low2_sq, timers2, d_buffer2);
 
-        feature_collapse_short_edges(rx2, coords2.get(), edge_status2.get(),
-            edge_link2.get(), v_boundary2.get(), edge_feature2.get(),
-            vertex_feature2.get(), sizing2.get(),
+        feature_collapse_short_edges(rx2, coords2.get(),
+            edge_status2.get(), edge_link2.get(), v_boundary2.get(),
+            edge_feature2.get(), vertex_feature2.get(), sizing2.get(),
             low2_sq, high2_sq, timers2, d_buffer2);
 
-        feature_equalize_valences(rx2, coords2.get(), v_valence2.get(),
-            edge_status2.get(), edge_link2.get(), v_boundary2.get(),
-            edge_feature2.get(), timers2, d_buffer2);
+        feature_equalize_valences(rx2, coords2.get(),
+            v_valence2.get(), edge_status2.get(), edge_link2.get(),
+            v_boundary2.get(), edge_feature2.get(), vertex_feature2.get(),
+            sizing2.get(), timers2, d_buffer2);
 
         tangential_relaxation(rx2, coords2.get(), new_coords2.get(),
             v_boundary2.get(), Arg.num_smooth_iters, timers2);

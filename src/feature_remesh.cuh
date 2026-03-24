@@ -290,8 +290,10 @@ __global__ static void __launch_bounds__(blockThreads)
 
     uint32_t shmem_before = shrd_alloc.get_allocated_size_bytes();
 
-    Bitmask v0_mask(cavity.patch_info().num_vertices[0], shrd_alloc);
-    Bitmask v1_mask(cavity.patch_info().num_vertices[0], shrd_alloc);
+    // Use vertices_capacity (not num_vertices[0]) to avoid shared memory
+    // overflow when vertex local IDs exceed live count after compaction.
+    Bitmask v0_mask(cavity.patch_info().vertices_capacity, shrd_alloc);
+    Bitmask v1_mask(cavity.patch_info().vertices_capacity, shrd_alloc);
 
     Query<blockThreads> query(context, pid);
     query.prologue<Op::EVDiamond>(block, shrd_alloc);
@@ -313,6 +315,13 @@ __global__ static void __launch_bounds__(blockThreads)
 
             const VertexHandle v0 = iter[0], v1 = iter[2];
             const VertexHandle v2 = iter[1], v3 = iter[3];
+
+            // FEATURE: don't collapse edges touching feature vertices
+            // Matches CPU behavior: feature vertices should not move
+            if (vertex_is_feature(v0) || vertex_is_feature(v1)) {
+                edge_status(eh) = SKIP;
+                return;
+            }
 
             if (v2.is_valid() && v3.is_valid()) {
                 if (v0 == v1 || v0 == v2 || v0 == v3 || v1 == v2 || v1 == v3 || v2 == v3)
@@ -458,8 +467,10 @@ __global__ static void __launch_bounds__(blockThreads)
 
     uint32_t shmem_before = shrd_alloc.get_allocated_size_bytes();
 
-    Bitmask v0_mask(cavity.patch_info().num_vertices[0], shrd_alloc);
-    Bitmask v1_mask(cavity.patch_info().num_vertices[0], shrd_alloc);
+    // Use vertices_capacity (not num_vertices[0]) to avoid shared memory
+    // overflow when vertex local IDs exceed live count after compaction.
+    Bitmask v0_mask(cavity.patch_info().vertices_capacity, shrd_alloc);
+    Bitmask v1_mask(cavity.patch_info().vertices_capacity, shrd_alloc);
 
     Query<blockThreads> query(context, cavity.patch_id());
     query.prologue<Op::EVDiamond>(block, shrd_alloc);
@@ -982,6 +993,13 @@ inline void pre_skip_feature_edges(
 }
 
 // =========================================================================
+// Cross collapse: TODO — implement GPU kernel for collapsing low-valence
+// interior vertices (valence 3 or 4). For now, this is handled on CPU
+// via vcg_collapse_crosses() called from op_feature_remesh.cu between
+// iterations (the mesh is already on host for BVH projection).
+// =========================================================================
+
+// =========================================================================
 // Feature-aware wrapper functions (matching split_long_edges etc.)
 // =========================================================================
 
@@ -992,6 +1010,7 @@ inline void feature_split_long_edges(
     rxmesh::EdgeAttribute<EdgeStatus>* edge_status,
     rxmesh::VertexAttribute<bool>*     v_boundary,
     rxmesh::EdgeAttribute<int>*        edge_is_feature,
+    rxmesh::VertexAttribute<int>*      vertex_is_feature,
     rxmesh::VertexAttribute<T>*        sizing,
     const T                            high_edge_len_sq,
     const T                            low_edge_len_sq,
@@ -1022,11 +1041,6 @@ inline void feature_split_long_edges(
         while (!rx.is_queue_empty()) {
             split_inner++;
 
-            fprintf(stderr, "      [split o=%d i=%d] pre-kernel: V=%u E=%u F=%u P=%u\n",
-                    split_outer, split_inner,
-                    rx.get_num_vertices(), rx.get_num_edges(),
-                    rx.get_num_faces(), rx.get_num_patches());
-
             timers.start("Split");
             feature_edge_split<T, blockThreads>
                 <<<lb.blocks, lb.num_threads, lb.smem_bytes_dyn>>>(
@@ -1034,52 +1048,26 @@ inline void feature_split_long_edges(
                     *edge_is_feature, *sizing, high_edge_len_sq, low_edge_len_sq, 0);
             timers.stop("Split");
 
-            // Check for kernel errors immediately
-            cudaError_t err = cudaDeviceSynchronize();
-            if (err != cudaSuccess) {
-                fprintf(stderr, "      [split o=%d i=%d] KERNEL CRASH: %s\n",
-                        split_outer, split_inner, cudaGetErrorString(err));
-                fprintf(stderr, "      post-crash: V=%u E=%u F=%u P=%u\n",
-                        rx.get_num_vertices(), rx.get_num_edges(),
-                        rx.get_num_faces(), rx.get_num_patches());
-                // Try to find which patch overflowed
-                rx.update_host();
-                for (uint32_t p = 0; p < rx.get_num_patches(); p++) {
-                    // Access patch info to check sizes
-                }
-                throw std::runtime_error("Split kernel crashed");
-            }
-
-            fprintf(stderr, "      [split o=%d i=%d] post-kernel OK: V=%u E=%u F=%u P=%u\n",
-                    split_outer, split_inner,
-                    rx.get_num_vertices(), rx.get_num_edges(),
-                    rx.get_num_faces(), rx.get_num_patches());
-
             timers.start("SplitCleanup");
             rx.cleanup();
             timers.stop("SplitCleanup");
-
-            fprintf(stderr, "      [split o=%d i=%d] post-cleanup: V=%u E=%u F=%u P=%u\n",
-                    split_outer, split_inner,
-                    rx.get_num_vertices(), rx.get_num_edges(),
-                    rx.get_num_faces(), rx.get_num_patches());
-
             timers.start("SplitSlice");
-            rx.slice_patches(*coords, *edge_status, *v_boundary,
-                             *edge_is_feature, *sizing);
+            {
+                uint32_t pre_p = rx.get_num_patches();
+                rx.slice_patches(*coords, *v_boundary,
+                                 *edge_is_feature, *vertex_is_feature, *sizing);
+                uint32_t post_p = rx.get_num_patches();
+                if (post_p != pre_p)
+                    fprintf(stderr, "        [SLICE] %u → %u patches\n", pre_p, post_p);
+            }
             timers.stop("SplitSlice");
             timers.start("SplitCleanup");
             rx.cleanup();
             timers.stop("SplitCleanup");
-
-            fprintf(stderr, "      [split o=%d i=%d] post-slice: V=%u E=%u F=%u P=%u\n",
-                    split_outer, split_inner,
-                    rx.get_num_vertices(), rx.get_num_edges(),
-                    rx.get_num_faces(), rx.get_num_patches());
         }
         int remaining = is_done(rx, edge_status, d_buffer);
-        fprintf(stderr, "    [split] outer=%d inner=%d remaining=%d/%d\n",
-                split_outer, split_inner, remaining, prv_remaining_work);
+        //fprintf(stderr, "    [split] outer=%d inner=%d remaining=%d/%d\n",
+        //        split_outer, split_inner, remaining, prv_remaining_work);
         if (remaining == 0 || prv_remaining_work == remaining) break;
         prv_remaining_work = remaining;
     }
@@ -1138,17 +1126,22 @@ inline void feature_collapse_short_edges(
             rx.cleanup();
             timers.stop("CollapseCleanup");
             timers.start("CollapseSlice");
-            rx.slice_patches(*coords, *edge_status, *v_boundary,
-                             *edge_is_feature, *vertex_is_feature,
-                             *sizing);
+            {
+                uint32_t pre_p = rx.get_num_patches();
+                rx.slice_patches(*coords, *v_boundary,
+                                 *edge_is_feature, *vertex_is_feature, *sizing);
+                uint32_t post_p = rx.get_num_patches();
+                if (post_p != pre_p)
+                    fprintf(stderr, "        [SLICE] %u → %u patches\n", pre_p, post_p);
+            }
             timers.stop("CollapseSlice");
             timers.start("CollapseCleanup");
             rx.cleanup();
             timers.stop("CollapseCleanup");
         }
         int remaining = is_done(rx, edge_status, d_buffer);
-        fprintf(stderr, "    [collapse] outer=%d inner=%d remaining=%d/%d\n",
-                col_outer, col_inner, remaining, prv_remaining_work);
+        //fprintf(stderr, "    [collapse] outer=%d inner=%d remaining=%d/%d\n",
+        //        col_outer, col_inner, remaining, prv_remaining_work);
         if (remaining == 0 || prv_remaining_work == remaining) break;
         prv_remaining_work = remaining;
     }
@@ -1164,6 +1157,8 @@ inline void feature_equalize_valences(
     rxmesh::EdgeAttribute<int8_t>*         edge_link,
     rxmesh::VertexAttribute<bool>*         v_boundary,
     rxmesh::EdgeAttribute<int>*            edge_is_feature,
+    rxmesh::VertexAttribute<int>*          vertex_is_feature,
+    rxmesh::VertexAttribute<T>*            sizing,
     rxmesh::Timers<rxmesh::GPUTimer>&      timers,
     int*                                   d_buffer)
 {
@@ -1213,16 +1208,22 @@ inline void feature_equalize_valences(
             rx.cleanup();
             timers.stop("FlipCleanup");
             timers.start("FlipSlice");
-            rx.slice_patches(*coords, *edge_status, *v_boundary,
-                             *edge_is_feature);
+            {
+                uint32_t pre_p = rx.get_num_patches();
+                rx.slice_patches(*coords, *v_boundary,
+                                 *edge_is_feature, *vertex_is_feature, *sizing);
+                uint32_t post_p = rx.get_num_patches();
+                if (post_p != pre_p)
+                    fprintf(stderr, "        [SLICE] %u → %u patches\n", pre_p, post_p);
+            }
             timers.stop("FlipSlice");
             timers.start("FlipCleanup");
             rx.cleanup();
             timers.stop("FlipCleanup");
         }
         int remaining = is_done(rx, edge_status, d_buffer);
-        fprintf(stderr, "    [flip] outer=%d inner=%d remaining=%d/%d\n",
-                flip_outer, flip_inner, remaining, prv_remaining_work);
+        //fprintf(stderr, "    [flip] outer=%d inner=%d remaining=%d/%d\n",
+        //        flip_outer, flip_inner, remaining, prv_remaining_work);
         if (remaining == 0 || prv_remaining_work == remaining) break;
         prv_remaining_work = remaining;
     }

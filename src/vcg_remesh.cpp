@@ -464,7 +464,19 @@ VcgRemeshResult vcg_remesh(
     para.userSelectedCreases = true;
 
     tp = clk::now();
-    vcg::tri::IsotropicRemeshing<QwMesh>::Do(mesh, para);
+    if (verbose) {
+        // Run one iteration at a time to log per-iteration stats
+        para.iter = 1;
+        for (int i = 0; i < iters; i++) {
+            auto t_it = clk::now();
+            vcg::tri::IsotropicRemeshing<QwMesh>::Do(mesh, para);
+            fprintf(stderr, "  [cpu iter %d] V=%d F=%d (%.1f ms)\n",
+                    i, mesh.VN(), mesh.FN(), ms_since(t_it));
+        }
+        para.iter = iters;  // restore for pass 2
+    } else {
+        vcg::tri::IsotropicRemeshing<QwMesh>::Do(mesh, para);
+    }
     double t_pass1 = ms_since(tp);
 
     if (verbose)
