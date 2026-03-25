@@ -1052,14 +1052,10 @@ inline void feature_split_long_edges(
             rx.cleanup();
             timers.stop("SplitCleanup");
             timers.start("SplitSlice");
-            {
-                uint32_t pre_p = rx.get_num_patches();
-                rx.slice_patches(*coords, *v_boundary,
-                                 *edge_is_feature, *vertex_is_feature, *sizing);
-                uint32_t post_p = rx.get_num_patches();
-                if (post_p != pre_p)
-                    fprintf(stderr, "        [SLICE] %u → %u patches\n", pre_p, post_p);
-            }
+            // Use only 3 attrs (the official RXMesh-tested combo).
+            // Extra attrs (edge_is_feature, sizing, vertex_is_feature)
+            // are refreshed via pre_skip_feature_edges at start of each op.
+            rx.slice_patches(*coords, *edge_status, *v_boundary);
             timers.stop("SplitSlice");
             timers.start("SplitCleanup");
             rx.cleanup();
@@ -1126,14 +1122,10 @@ inline void feature_collapse_short_edges(
             rx.cleanup();
             timers.stop("CollapseCleanup");
             timers.start("CollapseSlice");
-            {
-                uint32_t pre_p = rx.get_num_patches();
-                rx.slice_patches(*coords, *v_boundary,
-                                 *edge_is_feature, *vertex_is_feature, *sizing);
-                uint32_t post_p = rx.get_num_patches();
-                if (post_p != pre_p)
-                    fprintf(stderr, "        [SLICE] %u → %u patches\n", pre_p, post_p);
-            }
+            // Use only 3 attrs (the official RXMesh-tested combo).
+            // Extra attrs (edge_is_feature, sizing, vertex_is_feature)
+            // are refreshed via pre_skip_feature_edges at start of each op.
+            rx.slice_patches(*coords, *edge_status, *v_boundary);
             timers.stop("CollapseSlice");
             timers.start("CollapseCleanup");
             rx.cleanup();
@@ -1208,14 +1200,10 @@ inline void feature_equalize_valences(
             rx.cleanup();
             timers.stop("FlipCleanup");
             timers.start("FlipSlice");
-            {
-                uint32_t pre_p = rx.get_num_patches();
-                rx.slice_patches(*coords, *v_boundary,
-                                 *edge_is_feature, *vertex_is_feature, *sizing);
-                uint32_t post_p = rx.get_num_patches();
-                if (post_p != pre_p)
-                    fprintf(stderr, "        [SLICE] %u → %u patches\n", pre_p, post_p);
-            }
+            // Use only 3 attrs (the official RXMesh-tested combo).
+            // Extra attrs (edge_is_feature, sizing, vertex_is_feature)
+            // are refreshed via pre_skip_feature_edges at start of each op.
+            rx.slice_patches(*coords, *edge_status, *v_boundary);
             timers.stop("FlipSlice");
             timers.start("FlipCleanup");
             rx.cleanup();

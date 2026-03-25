@@ -19,3 +19,4 @@ compile_commands.json
 docs/_site/
 RXMesh.log
 docs/runs/
+.claude
