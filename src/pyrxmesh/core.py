@@ -30,6 +30,9 @@ from pyrxmesh._pyrxmesh import (
     quadwild_preprocess as _quadwild_preprocess,
     vcg_remesh as _vcg_remesh,
     vcg_remesh_checkpoints as _vcg_remesh_checkpoints,
+    vcg_micro_collapse as _vcg_micro_collapse,
+    vcg_clean_mesh as _vcg_clean_mesh,
+    vcg_refine_if_needed as _vcg_refine_if_needed,
 )
 
 
@@ -383,6 +386,42 @@ def vcg_remesh_checkpoints(
     return _vcg_remesh_checkpoints(v, f, target_edge_length, target_faces,
                                     iterations, adaptive, project,
                                     crease_angle_deg, verbose)
+
+
+def vcg_micro_collapse(
+    vertices: NDArray[np.float64],
+    faces: NDArray[np.int32],
+    quality_thr: float = 0.01,
+    max_iter: int = 2,
+    verbose: bool = False,
+) -> tuple[NDArray[np.float64], NDArray[np.int32]]:
+    """Collapse micro-edges in degenerate triangles (CPU).
+
+    Matches QuadWild's collapseSurvivingMicroEdges.
+    """
+    v, f = _validate_mesh(vertices, faces)
+    return _vcg_micro_collapse(v, f, quality_thr, max_iter, verbose)
+
+
+def vcg_clean_mesh(
+    vertices: NDArray[np.float64],
+    faces: NDArray[np.int32],
+    verbose: bool = False,
+) -> tuple[NDArray[np.float64], NDArray[np.int32]]:
+    """SolveGeometricArtifacts: remove zero-area faces, non-manifold, small components (CPU)."""
+    v, f = _validate_mesh(vertices, faces)
+    return _vcg_clean_mesh(v, f, verbose)
+
+
+def vcg_refine_if_needed(
+    vertices: NDArray[np.float64],
+    faces: NDArray[np.int32],
+    crease_angle_deg: float = 35.0,
+    verbose: bool = False,
+) -> tuple[NDArray[np.float64], NDArray[np.int32]]:
+    """RefineIfNeeded: split faces with 3 sharp edges at centroid (CPU)."""
+    v, f = _validate_mesh(vertices, faces)
+    return _vcg_refine_if_needed(v, f, crease_angle_deg, verbose)
 
 
 def feature_remesh(

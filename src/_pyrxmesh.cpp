@@ -351,6 +351,50 @@ static nb::dict py_vcg_remesh_checkpoints(
     return d;
 }
 
+// --- Standalone micro-edge collapse ---
+
+static nb::tuple py_vcg_micro_collapse(
+    const NDArray<const double, 2> vertices,
+    const NDArray<const int, 2> faces,
+    float quality_thr, int max_iter, bool verbose)
+{
+    validate_mesh(vertices, faces);
+    VcgRemeshResult r = vcg_micro_collapse(
+        vertices.data(), static_cast<int>(vertices.shape(0)),
+        faces.data(), static_cast<int>(faces.shape(0)),
+        quality_thr, max_iter, verbose);
+
+    NDArray<double, 2> v = MakeNDArray<double, 2>({r.num_vertices, 3});
+    std::memcpy(v.data(), r.vertices.data(), r.num_vertices * 3 * sizeof(double));
+    NDArray<int, 2> f = MakeNDArray<int, 2>({r.num_faces, 3});
+    std::memcpy(f.data(), r.faces.data(), r.num_faces * 3 * sizeof(int));
+    return nb::make_tuple(v, f);
+}
+
+static nb::tuple py_vcg_clean_mesh(
+    const NDArray<const double, 2> vertices,
+    const NDArray<const int, 2> faces,
+    bool verbose)
+{
+    validate_mesh(vertices, faces);
+    return mesh_result_to_np(vcg_clean_mesh(
+        vertices.data(), static_cast<int>(vertices.shape(0)),
+        faces.data(), static_cast<int>(faces.shape(0)),
+        verbose));
+}
+
+static nb::tuple py_vcg_refine_if_needed(
+    const NDArray<const double, 2> vertices,
+    const NDArray<const int, 2> faces,
+    float crease_angle_deg, bool verbose)
+{
+    validate_mesh(vertices, faces);
+    return mesh_result_to_np(vcg_refine_if_needed(
+        vertices.data(), static_cast<int>(vertices.shape(0)),
+        faces.data(), static_cast<int>(faces.shape(0)),
+        crease_angle_deg, verbose));
+}
+
 // --- Feature-aware GPU remesh ---
 
 static nb::tuple py_feature_remesh(
@@ -653,6 +697,24 @@ NB_MODULE(_pyrxmesh, m) {
         nb::arg("iterations") = 3,
         nb::arg("adaptive") = true,
         nb::arg("project") = true,
+        nb::arg("crease_angle_deg") = 35.0f,
+        nb::arg("verbose") = false);
+
+    m.def("vcg_micro_collapse", &py_vcg_micro_collapse,
+        "Collapse micro-edges in degenerate triangles (CPU).",
+        nb::arg("vertices"), nb::arg("faces"),
+        nb::arg("quality_thr") = 0.01f,
+        nb::arg("max_iter") = 2,
+        nb::arg("verbose") = false);
+
+    m.def("vcg_clean_mesh", &py_vcg_clean_mesh,
+        "SolveGeometricArtifacts: remove zero-area faces, non-manifold, small components (CPU).",
+        nb::arg("vertices"), nb::arg("faces"),
+        nb::arg("verbose") = false);
+
+    m.def("vcg_refine_if_needed", &py_vcg_refine_if_needed,
+        "RefineIfNeeded: split faces with 3 sharp edges at centroid (CPU).",
+        nb::arg("vertices"), nb::arg("faces"),
         nb::arg("crease_angle_deg") = 35.0f,
         nb::arg("verbose") = false);
 

@@ -285,59 +285,95 @@ def _render_demo(d):
     </section>"""
 
 
-def _render_table(demos):
-    """Render demos as a CPU vs GPU comparison table with 4 result columns.
+def _fmt_metrics(m):
+    """Format a metrics dict as a compact HTML snippet."""
+    if not m:
+        return ""
+    parts = []
+    parts.append(f"{m['V']:,}V {m['F']:,}F")
+    parts.append(f"Q: {m['quality_avg']:.2f} avg, {m['quality_max']:.0f} max")
+    parts.append(f"edge std: {m['edge_std']:.4f}")
+    parts.append(f"val6: {m['pct_val6']:.0f}%")
+    if "dist_avg" in m:
+        parts.append(f"dist: {m['dist_avg']:.4f}")
+    return "<br>".join(parts)
 
-    Demos should have "side" (cpu/gpu) and "step_name" fields.
-    Each side shows input (before) and result (after) images.
-    Demos with the same step_name are paired into one row.
+
+def _render_table(demos):
+    """Render demos as a 3-column comparison table: CPU (QuadWild), CPU (ours), GPU.
+
+    Demos should have "side" (cpu_orig/cpu_ours/gpu) and "step_name" fields.
+    Each cell shows just the result image — no before/after (pipeline is sequential).
+    Demos with the same step_name are grouped into one row.
     """
+    SIDES = ("cpu_orig", "cpu_ours", "gpu", "gpu_fast")
+    SIDE_LABELS = {"cpu_orig": "CPU (QuadWild)", "cpu_ours": "CPU (ours)", "gpu": "GPU", "gpu_fast": "GPU (fast)"}
+
     from collections import OrderedDict
+    # Fixed row order so columns align even when pipelines skip steps
+    ROW_ORDER = ["Input", "Raw Features", "Erode/Dilate", "Isotropic Remesh",
+                 "Micro Collapse", "Re-detect Features", "Adaptive Remesh",
+                 "Clean", "Refine", "Cross Field", "Trace", "Quad Output"]
     steps = OrderedDict()
+    # Pre-populate in canonical order
+    for s in ROW_ORDER:
+        steps[s] = {}
     for d in demos:
         step = d.get("step_name", d.get("after_label", ""))
         if step not in steps:
             steps[step] = {}
         side = d.get("side", "gpu")
         steps[step][side] = d
+    # Remove empty rows
+    steps = OrderedDict((k, v) for k, v in steps.items() if v)
 
     rows = ""
     for step, sides in steps.items():
         step_html = html_escape(step)
         cells = []
-        for side in ("cpu", "gpu"):
+        has_metrics = False
+        metric_cells = []
+        for side in SIDES:
             d = sides.get(side)
             if d is None:
-                cells.append("<td>&mdash;</td><td>&mdash;</td>")
+                cells.append("<td>&mdash;</td>")
+                metric_cells.append("<td></td>")
                 continue
             timing = fmt_time(d["elapsed"]) if d["elapsed"] > 0 else ""
             timing_html = f'<span class="cell-label">{timing}</span>' if timing else ""
-            if d["type"] == "before_after":
-                before_img = f"{d['name']}_before.png"
-                after_img = f"{d['name']}_after.png"
-            elif d["type"] == "scalar":
-                before_img = f"{d['name']}_input.png"
-                after_img = f"{d['name']}_scalar.png"
-            else:
-                before_img = f"{d['name']}_before.png"
-                after_img = f"{d['name']}_after.png"
+            img = f"{d['name']}.png"
+            label = d.get("after_label", "")
+            label_html = f'<span class="cell-label">{html_escape(label)}</span>' if label else ""
             cells.append(
-                f'<td><img src="{before_img}" alt="{side} input"></td>'
-                f'<td><img src="{after_img}" alt="{side} result">{timing_html}</td>')
+                f'<td><img src="{img}" alt="{side} result">{timing_html}{label_html}</td>')
+            m = d.get("metrics")
+            if m:
+                has_metrics = True
+                metric_cells.append(
+                    f'<td><span class="metrics">{_fmt_metrics(m)}</span></td>')
+            else:
+                metric_cells.append("<td></td>")
 
+        all_cells = "\n        ".join(cells)
         rows += f"""
       <tr>
         <td>{step_html}</td>
-        {cells[0]}
-        {cells[1]}
+        {all_cells}
+      </tr>"""
+        if has_metrics:
+            all_mcells = "\n        ".join(metric_cells)
+            rows += f"""
+      <tr class="metrics-row">
+        <td></td>
+        {all_mcells}
       </tr>"""
 
+    header_cells = "".join(f"<th>{SIDE_LABELS[s]}</th>" for s in SIDES)
     return f"""
     <table class="comparison-table">
       <thead><tr>
         <th>Step</th>
-        <th>CPU Input</th><th>CPU Result</th>
-        <th>GPU Input</th><th>GPU Result</th>
+        {header_cells}
       </tr></thead>
       <tbody>{rows}
       </tbody>
@@ -770,7 +806,7 @@ if __name__ == "__main__":
     import argparse
 
     section_names = [name for name, _, _ in SECTIONS]
-    quadwild_subs = ["quadwild_erode", "quadwild_remesh"]
+    quadwild_subs = ["quadwild_erode", "quadwild_remesh_isotropic", "quadwild_micro", "quadwild_remesh_adaptive"]
 
     parser = argparse.ArgumentParser(
         description="Generate pyrxmesh demo site.",

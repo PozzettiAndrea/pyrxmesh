@@ -30,6 +30,10 @@ from pyrxmesh.core import (
     quadwild_preprocess,
     quadwild_pipeline,
     vcg_remesh,
+    vcg_remesh_checkpoints,
+    vcg_micro_collapse,
+    vcg_clean_mesh,
+    vcg_refine_if_needed,
 )
 
 __version__ = "0.1.0"
@@ -63,5 +67,9 @@ __all__ = [
     "quadwild_preprocess",
     "quadwild_pipeline",
     "vcg_remesh",
+    "vcg_remesh_checkpoints",
+    "vcg_micro_collapse",
+    "vcg_clean_mesh",
+    "vcg_refine_if_needed",
     "__version__",
 ]

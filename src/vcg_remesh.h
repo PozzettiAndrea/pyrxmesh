@@ -46,6 +46,14 @@ VcgRemeshResult vcg_micro_collapse(
     int max_iter = 2,
     bool verbose = false);
 
+// Refine faces that have 3 sharp edges by splitting at centroid.
+// Matches QuadWild's RefineInternalFacesStepFromEdgeSel (simplified — no cross field).
+VcgRemeshResult vcg_refine_if_needed(
+    const double* vertices, int num_vertices,
+    const int* faces, int num_faces,
+    float crease_angle_deg = 35.0f,
+    bool verbose = false);
+
 // Full pipeline with intermediate checkpoints at each stage.
 struct VcgRemeshCheckpoints {
     VcgRemeshResult after_pass1;          // after non-adaptive remesh

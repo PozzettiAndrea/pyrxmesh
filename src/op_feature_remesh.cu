@@ -13,6 +13,7 @@
 #include "glm_compat.h"
 #include "gpu_bvh.cuh"
 #include "vcg_remesh.h"  // for vcg_micro_collapse, vcg_clean_mesh
+#include "op_cross_collapse.cuh"
 
 using namespace rxmesh;
 using namespace pyrxmesh_bvh;
@@ -378,8 +379,10 @@ MeshResult pipeline_feature_remesh(
             fprintf(stderr, "    [gpu] after split:    V=%u E=%u F=%u\n",
                     rx.get_num_vertices(true), rx.get_num_edges(true), rx.get_num_faces(true));
 
-        // Run collapse multiple times to approximate CPU's sequential cascade.
-        // Each call re-marks edges from scratch against the updated mesh.
+        // TODO: surface distance check (CPU checks dist(midpoint, surface) < bbox/2500)
+        // Requires device-callable BVH query — not yet implemented.
+
+        // Run collapse
         for (int col_pass = 0; col_pass < 1; col_pass++) {
             uint32_t pre_v = rx.get_num_vertices(true);
             feature_collapse_short_edges(rx, coords.get(),
@@ -408,6 +411,29 @@ MeshResult pipeline_feature_remesh(
 
         if (verbose)
             fprintf(stderr, "    [gpu] after collapse: V=%u E=%u F=%u\n",
+                    rx.get_num_vertices(true), rx.get_num_edges(true), rx.get_num_faces(true));
+
+        // CollapseCrosses: remove valence 3-4 interior vertices (matches CPU)
+        // Set PYRXMESH_NO_CROSSES=1 to disable for debugging.
+        if (!getenv("PYRXMESH_NO_CROSSES"))
+            collapse_crosses(rx, coords.get(), edge_status.get(), v_boundary.get(),
+                vertex_feature.get(), high_edge_len_sq, timers, d_buffer, verbose);
+
+        // Re-detect features after crosses
+        {
+            edge_feature->reset(0, DEVICE);
+            LaunchBox<blockThreads> lb_fd;
+            rx.update_launch_box({Op::EVDiamond}, lb_fd,
+                (void*)detect_features_dynamic_kernel<float, blockThreads>);
+            detect_features_dynamic_kernel<float, blockThreads>
+                <<<lb_fd.blocks, lb_fd.num_threads, lb_fd.smem_bytes_dyn>>>(
+                    rx.get_context(), *coords, *edge_feature, cos_threshold);
+            CUDA_ERROR(cudaDeviceSynchronize());
+            mark_feature_vertices(rx, edge_feature.get(), vertex_feature.get());
+        }
+
+        if (verbose)
+            fprintf(stderr, "    [gpu] after crosses:  V=%u E=%u F=%u\n",
                     rx.get_num_vertices(true), rx.get_num_edges(true), rx.get_num_faces(true));
 
         feature_equalize_valences(rx, coords.get(),
@@ -596,26 +622,7 @@ MeshResult pipeline_feature_remesh(
         mark_feature_vertices(rx2, edge_feature2.get(), vertex_feature2.get());
     }
 
-    // Compute adaptive sizing
-    compute_adaptive_sizing(rx2, coords2.get(), sizing2.get(), 0.3f, 3.0f);
-    CUDA_ERROR(cudaDeviceSynchronize());
-
-    if (verbose) {
-        rx2.update_host();
-        sizing2->move(DEVICE, HOST);
-        float min_s = 999.f, max_s = 0.f, sum_s = 0.f;
-        int cnt_s = 0;
-        rx2.for_each_vertex(HOST, [&](const VertexHandle& vh) {
-            float s = (*sizing2)(vh, 0);
-            min_s = std::min(min_s, s); max_s = std::max(max_s, s);
-            sum_s += s; cnt_s++;
-        });
-        sizing2->move(HOST, DEVICE);
-        fprintf(stderr, "[pyrxmesh] feature_remesh: pass2 sizing min=%.2f avg=%.2f max=%.2f\n",
-                min_s, cnt_s > 0 ? sum_s / cnt_s : 0, max_s);
-    }
-
-    // Compute pass 2 edge length stats
+    // Compute pass 2 edge length stats (same thresholds as pass 1, no adaptive mult yet)
     auto edge_len2 = rx2.add_edge_attribute<float>("edgeLen", 1);
     auto vv_attr2 = rx2.add_vertex_attribute<int>("vertexValence", 1);
     Stats stats2;
@@ -626,11 +633,11 @@ MeshResult pipeline_feature_remesh(
     const float high2 = (4.f / 3.f) * Arg.relative_len * stats2.avg_edge_len;
     const float high2_sq = high2 * high2;
 
-    // TODO: BVH projection in pass 2 causes segfault after dynamic topology changes.
-    // Needs investigation — likely stale device pointers after cavity ops.
-    // VCG's adaptive pass uses maxSurfDist constraint inside remeshing, not post-hoc projection.
-#if 0
-    // Build BVH on ORIGINAL mesh for pass 2 projection
+    if (verbose)
+        fprintf(stderr, "[pyrxmesh] feature_remesh: pass2 thresholds: split=%.6f collapse=%.6f avg=%.6f\n",
+                high2, low2, stats2.avg_edge_len);
+
+    // BVH for pass 2 surface projection (built on ORIGINAL input mesh)
     float* d_ref_V2 = nullptr;
     int* d_ref_F2 = nullptr;
     CUDA_ERROR(cudaMalloc(&d_ref_V2, num_vertices * 3 * sizeof(float)));
@@ -647,12 +654,17 @@ MeshResult pipeline_feature_remesh(
     GpuBVH bvh2;
     gpu_bvh_build(bvh2, d_ref_V2, d_ref_F2, num_faces, num_vertices);
 
+    auto global_id2 = rx2.add_vertex_attribute<uint32_t>("globalId", 1);
+    rx2.for_each_vertex(HOST, [&](const VertexHandle& vh) {
+        (*global_id2)(vh) = rx2.map_to_global(vh);
+    });
+    global_id2->move(HOST, DEVICE);
+
     uint32_t flat_capacity2 = rx2.get_num_vertices() * 2;
     float* d_flat_V2 = nullptr;
     NearestResult* d_bvh_results2 = nullptr;
     CUDA_ERROR(cudaMalloc(&d_flat_V2, flat_capacity2 * 3 * sizeof(float)));
     CUDA_ERROR(cudaMalloc(&d_bvh_results2, flat_capacity2 * sizeof(NearestResult)));
-#endif
 
     Timers<GPUTimer> timers2;
     timers2.add("SplitTotal"); timers2.add("Split");
@@ -667,33 +679,119 @@ MeshResult pipeline_feature_remesh(
     for (uint32_t iter = 0; iter < Arg.num_iter; ++iter) {
         auto t_iter = clk::now();
 
-        if (verbose)
-            fprintf(stderr, "  [pass2 iter %u/%u] V=%u E=%u F=%u P=%u\n",
-                    iter, Arg.num_iter, rx2.get_num_vertices(),
-                    rx2.get_num_edges(), rx2.get_num_faces(), rx2.get_num_patches());
+        if (verbose) {
+            uint32_t lv = rx2.get_num_vertices(true);
+            uint32_t le = rx2.get_num_edges(true);
+            uint32_t lf = rx2.get_num_faces(true);
+            fprintf(stderr, "  [pass2 iter %u/%u] V=%u E=%u F=%u\n",
+                    iter, Arg.num_iter, lv, le, lf);
+        }
 
+        // ── Split ──
         feature_split_long_edges(rx2, coords2.get(),
             edge_status2.get(), v_boundary2.get(),
             high2_sq, low2_sq, timers2, d_buffer2);
 
-        feature_collapse_short_edges(rx2, coords2.get(),
-            edge_status2.get(), v_boundary2.get(),
-            edge_feature2.get(), vertex_feature2.get(),
-            low2_sq, high2_sq, timers2, d_buffer2);
+        // Re-detect features after split
+        {
+            edge_feature2->reset(0, DEVICE);
+            LaunchBox<blockThreads> lb_fd;
+            rx2.update_launch_box({Op::EVDiamond}, lb_fd,
+                (void*)detect_features_dynamic_kernel<float, blockThreads>);
+            detect_features_dynamic_kernel<float, blockThreads>
+                <<<lb_fd.blocks, lb_fd.num_threads, lb_fd.smem_bytes_dyn>>>(
+                    rx2.get_context(), *coords2, *edge_feature2, cos_threshold);
+            CUDA_ERROR(cudaDeviceSynchronize());
+            mark_feature_vertices(rx2, edge_feature2.get(), vertex_feature2.get());
+        }
 
+        if (verbose)
+            fprintf(stderr, "    [pass2] after split:    V=%u E=%u F=%u\n",
+                    rx2.get_num_vertices(true), rx2.get_num_edges(true), rx2.get_num_faces(true));
+
+        // ── Collapse ──
+        for (int col_pass = 0; col_pass < 1; col_pass++) {
+            uint32_t pre_v = rx2.get_num_vertices(true);
+            feature_collapse_short_edges(rx2, coords2.get(),
+                edge_status2.get(), v_boundary2.get(),
+                edge_feature2.get(), vertex_feature2.get(),
+                low2_sq, high2_sq, timers2, d_buffer2);
+            uint32_t post_v = rx2.get_num_vertices(true);
+            if (verbose)
+                fprintf(stderr, "    [pass2] collapse: V %u → %u (-%u)\n",
+                        pre_v, post_v, pre_v - post_v);
+            if (pre_v == post_v) break;
+        }
+
+        // Re-detect features after collapse
+        {
+            edge_feature2->reset(0, DEVICE);
+            LaunchBox<blockThreads> lb_fd;
+            rx2.update_launch_box({Op::EVDiamond}, lb_fd,
+                (void*)detect_features_dynamic_kernel<float, blockThreads>);
+            detect_features_dynamic_kernel<float, blockThreads>
+                <<<lb_fd.blocks, lb_fd.num_threads, lb_fd.smem_bytes_dyn>>>(
+                    rx2.get_context(), *coords2, *edge_feature2, cos_threshold);
+            CUDA_ERROR(cudaDeviceSynchronize());
+            mark_feature_vertices(rx2, edge_feature2.get(), vertex_feature2.get());
+        }
+
+        if (verbose)
+            fprintf(stderr, "    [pass2] after collapse: V=%u E=%u F=%u\n",
+                    rx2.get_num_vertices(true), rx2.get_num_edges(true), rx2.get_num_faces(true));
+
+        // ── Cross-collapse ──
+        if (!getenv("PYRXMESH_NO_CROSSES"))
+            collapse_crosses(rx2, coords2.get(), edge_status2.get(), v_boundary2.get(),
+                vertex_feature2.get(), high2_sq, timers2, d_buffer2, verbose);
+
+        // Re-detect features after crosses
+        {
+            edge_feature2->reset(0, DEVICE);
+            LaunchBox<blockThreads> lb_fd;
+            rx2.update_launch_box({Op::EVDiamond}, lb_fd,
+                (void*)detect_features_dynamic_kernel<float, blockThreads>);
+            detect_features_dynamic_kernel<float, blockThreads>
+                <<<lb_fd.blocks, lb_fd.num_threads, lb_fd.smem_bytes_dyn>>>(
+                    rx2.get_context(), *coords2, *edge_feature2, cos_threshold);
+            CUDA_ERROR(cudaDeviceSynchronize());
+            mark_feature_vertices(rx2, edge_feature2.get(), vertex_feature2.get());
+        }
+
+        if (verbose)
+            fprintf(stderr, "    [pass2] after crosses:  V=%u E=%u F=%u\n",
+                    rx2.get_num_vertices(true), rx2.get_num_edges(true), rx2.get_num_faces(true));
+
+        // ── Flip ──
         feature_equalize_valences(rx2, coords2.get(),
             v_valence2.get(), edge_status2.get(), edge_link2.get(),
             v_boundary2.get(), edge_feature2.get(), vertex_feature2.get(),
             sizing2.get(), timers2, d_buffer2);
 
+        if (verbose)
+            fprintf(stderr, "    [pass2] after flip:     V=%u E=%u F=%u\n",
+                    rx2.get_num_vertices(true), rx2.get_num_edges(true), rx2.get_num_faces(true));
+
+        // ── Smooth ──
         tangential_relaxation(rx2, coords2.get(), new_coords2.get(),
             v_boundary2.get(), Arg.num_smooth_iters, timers2);
         std::swap(new_coords2, coords2);
 
-        // BVH projection disabled in pass 2 — see TODO above
-#if 0
+        if (verbose)
+            fprintf(stderr, "    [pass2] after smooth:   V=%u E=%u F=%u\n",
+                    rx2.get_num_vertices(true), rx2.get_num_edges(true), rx2.get_num_faces(true));
+
+        // ── BVH surface projection ──
         {
             uint32_t nv2 = rx2.get_num_vertices();
+
+            // Update global_id mapping
+            global_id2->reset(UINT32_MAX, HOST);
+            rx2.for_each_vertex(HOST, [&](const VertexHandle& vh) {
+                (*global_id2)(vh) = rx2.map_to_global(vh);
+            });
+            global_id2->move(HOST, DEVICE);
+
             if (nv2 > flat_capacity2) {
                 flat_capacity2 = nv2 * 2;
                 CUDA_ERROR(cudaFree(d_flat_V2));
@@ -707,9 +805,11 @@ MeshResult pipeline_feature_remesh(
             std::vector<float> h_flat(nv2 * 3, 0.0f);
             rx2.for_each_vertex(HOST, [&](const VertexHandle& vh) {
                 uint32_t gid = rx2.map_to_global(vh);
-                h_flat[gid*3+0] = (*coords2)(vh, 0);
-                h_flat[gid*3+1] = (*coords2)(vh, 1);
-                h_flat[gid*3+2] = (*coords2)(vh, 2);
+                if (gid < nv2) {
+                    h_flat[gid*3+0] = (*coords2)(vh, 0);
+                    h_flat[gid*3+1] = (*coords2)(vh, 1);
+                    h_flat[gid*3+2] = (*coords2)(vh, 2);
+                }
             });
             CUDA_ERROR(cudaMemcpy(d_flat_V2, h_flat.data(),
                 nv2 * 3 * sizeof(float), cudaMemcpyHostToDevice));
@@ -720,6 +820,7 @@ MeshResult pipeline_feature_remesh(
                 nv2 * sizeof(NearestResult), cudaMemcpyDeviceToHost));
             rx2.for_each_vertex(HOST, [&](const VertexHandle& vh) {
                 uint32_t gid = rx2.map_to_global(vh);
+                if (gid >= nv2) return;
                 if ((*vertex_feature2)(vh) > 0) return;
                 (*coords2)(vh, 0) = h_results[gid].nearest_x;
                 (*coords2)(vh, 1) = h_results[gid].nearest_y;
@@ -727,7 +828,6 @@ MeshResult pipeline_feature_remesh(
             });
             coords2->move(HOST, DEVICE);
         }
-#endif
 
         if (verbose)
             fprintf(stderr, "  [pass2 iter %u] done in %.1f ms\n", iter, ms_since(t_iter));
@@ -737,13 +837,11 @@ MeshResult pipeline_feature_remesh(
     double t_gpu = t_pass1 + t_pass2;
 
     // Free pass 2 resources
-#if 0
     gpu_bvh_free(bvh2);
     CUDA_ERROR(cudaFree(d_ref_V2));
     CUDA_ERROR(cudaFree(d_ref_F2));
     CUDA_ERROR(cudaFree(d_flat_V2));
     CUDA_ERROR(cudaFree(d_bvh_results2));
-#endif
     CUDA_ERROR(cudaFree(d_buffer2));
 
     // Export final result

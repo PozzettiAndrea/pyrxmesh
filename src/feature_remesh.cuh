@@ -8,6 +8,15 @@
 
 #include "rxmesh/cavity_manager.cuh"
 #include "rxmesh/query.h"
+
+// Use RXMESH_CUDA_ERROR instead of CUDA_ERROR to avoid include issues
+#ifndef RXMESH_CUDA_CHECK
+#define RXMESH_CUDA_CHECK(err) do { \
+    cudaError_t e_ = (err); \
+    if (e_ != cudaSuccess) \
+        fprintf(stderr, "[%s:%d] CUDA Error: %s\n", __FILE__, __LINE__, cudaGetErrorString(e_)); \
+} while(0)
+#endif
 #include "rxmesh/rxmesh_dynamic.h"
 
 #include "Remesh/util.cuh"
@@ -286,12 +295,14 @@ __global__ static void __launch_bounds__(blockThreads)
 
             if (!v0.is_valid() || !v1.is_valid() || !v2.is_valid() || !v3.is_valid())
                 return;
-            if (v_boundary(v0) || v_boundary(v1) || v_boundary(v2) || v_boundary(v3))
-                return;
-            // Don't collapse edges touching feature vertices (conservative).
-            // CPU uses direction check; we skip entirely for now.
-            if (vertex_is_feature(v0) || vertex_is_feature(v1))
-                return;
+            // No boundary skip — CPU doesn't skip boundary vertices.
+
+            // Feature vertex check: both immovable → skip. One moveable → allow.
+            {
+                bool v0_move = (vertex_is_feature(v0) == 0);
+                bool v1_move = (vertex_is_feature(v1) == 0);
+                if (!v0_move && !v1_move) return;
+            }
             if (v0 == v1 || v0 == v2 || v0 == v3 || v1 == v2 || v1 == v3 || v2 == v3)
                 return;
 
@@ -419,7 +430,17 @@ __global__ static void __launch_bounds__(blockThreads)
 
             const vec3<T> p0 = coords.to_glm<3>(v0);
             const vec3<T> p1 = coords.to_glm<3>(v1);
-            const vec3<T> new_p((p0[0] + p1[0]) * T(0.5),
+
+            // Collapse toward immovable feature vertex (matches CPU)
+            bool v0_feat = (vertex_is_feature(v0) != 0);
+            bool v1_feat = (vertex_is_feature(v1) != 0);
+            vec3<T> new_p;
+            if (v0_feat && !v1_feat)
+                new_p = p0;  // v0 immovable, collapse toward it
+            else if (v1_feat && !v0_feat)
+                new_p = p1;  // v1 immovable, collapse toward it
+            else
+                new_p = vec3<T>((p0[0] + p1[0]) * T(0.5),
                                 (p0[1] + p1[1]) * T(0.5),
                                 (p0[2] + p1[2]) * T(0.5));
 
@@ -455,11 +476,17 @@ __global__ static void __launch_bounds__(blockThreads)
                     T old_c2 = glm::distance2(bp0, bp1);
                     T new_a2 = glm::distance2(bp0, new_p);
                     T new_b2 = glm::distance2(bp1, new_p);
+                    // QualityRadii: Q = 4*sqrt(3)*area / (a²+b²+c²)
+                    constexpr T K = T(6.928203230275509);  // 4*sqrt(3)
                     T old_denom = old_a2 + old_b2 + old_c2;
-                    T new_denom = new_a2 + new_b2 + old_c2;  // c unchanged
-                    T oldQ = (old_denom > T(1e-20)) ? old_area / old_denom : T(0);
-                    T newQ = (new_denom > T(1e-20)) ? new_area / new_denom : T(0);
+                    T new_denom = new_a2 + new_b2 + old_c2;
+                    T oldQ = (old_denom > T(1e-20)) ? (K * old_area) / old_denom : T(0);
+                    T newQ = (new_denom > T(1e-20)) ? (K * new_area) / new_denom : T(0);
+
+                    // Relative check: reject if quality drops below 50%
                     if (newQ < T(0.5) * oldQ) { reject = true; break; }
+                    // Absolute floor: reject if quality below 0.3 (matches CPU aspectRatioThr)
+                    if (newQ < T(0.3)) { reject = true; break; }
                 }
             }
 
@@ -750,7 +777,7 @@ inline void compute_adaptive_sizing(
     compute_face_quality_kernel<float, blockThreads>
         <<<lb.blocks, lb.num_threads, lb.smem_bytes_dyn>>>(
             rx.get_context(), *coords, *v_qsum, *v_qcnt);
-    CUDA_ERROR(cudaDeviceSynchronize());
+    RXMESH_CUDA_CHECK(cudaDeviceSynchronize());
 
     // DEBUG: check FV kernel output
     {
@@ -776,7 +803,7 @@ inline void compute_adaptive_sizing(
             int cnt = v_qcnt(vh, 0);
             sizing(vh, 0) = (cnt > 0) ? v_qsum(vh, 0) / float(cnt) : 0.5f;
         });
-    CUDA_ERROR(cudaDeviceSynchronize());
+    RXMESH_CUDA_CHECK(cudaDeviceSynchronize());
 
     // DEBUG: check after averaging
     {
@@ -801,7 +828,7 @@ inline void compute_adaptive_sizing(
         smooth_quality_kernel<float, blockThreads>
             <<<lb.blocks, lb.num_threads, lb.smem_bytes_dyn>>>(
                 rx.get_context(), *v_qtmp, *sizing);
-        CUDA_ERROR(cudaDeviceSynchronize());
+        RXMESH_CUDA_CHECK(cudaDeviceSynchronize());
     }
 
     // Step 3: map quality [0,1] → sizing multiplier [minMult, maxMult]
@@ -812,7 +839,7 @@ inline void compute_adaptive_sizing(
             q = fminf(fmaxf(q, 0.0f), 1.0f);
             sizing(vh, 0) = min_mult + q * (max_mult - min_mult);
         });
-    CUDA_ERROR(cudaDeviceSynchronize());
+    RXMESH_CUDA_CHECK(cudaDeviceSynchronize());
 
     // DEBUG: check after lerp
     {
@@ -883,7 +910,7 @@ inline void mark_feature_vertices(
     mark_feature_verts_kernel<blockThreads>
         <<<lb.blocks, lb.num_threads, lb.smem_bytes_dyn>>>(
             rx.get_context(), *edge_feature, *vertex_feature);
-    CUDA_ERROR(cudaDeviceSynchronize());
+    RXMESH_CUDA_CHECK(cudaDeviceSynchronize());
 }
 
 // =========================================================================
@@ -985,7 +1012,7 @@ inline void erode_dilate_features(
         [vb = *v_bd_bool, vbi = *v_boundary] __device__(const VertexHandle vh) mutable {
             vbi(vh) = vb(vh) ? 1 : 0;
         });
-    CUDA_ERROR(cudaDeviceSynchronize());
+    RXMESH_CUDA_CHECK(cudaDeviceSynchronize());
 
     // Prepare launch boxes
     LaunchBox<blockThreads> lb_val, lb_erode, lb_dilate;
@@ -998,14 +1025,14 @@ inline void erode_dilate_features(
     feature_edge_valence_kernel<blockThreads>
         <<<lb_val.blocks, lb_val.num_threads, lb_val.smem_bytes_dyn>>>(
             rx.get_context(), *edge_feature, *feat_valence);
-    CUDA_ERROR(cudaDeviceSynchronize());
+    RXMESH_CUDA_CHECK(cudaDeviceSynchronize());
 
     rx.for_each_vertex(DEVICE,
         [fv = *feat_valence, vb = *v_boundary, vh_out = *v_high_val]
         __device__(const VertexHandle vh) mutable {
             vh_out(vh) = (fv(vh) > 2 || (vb(vh) && fv(vh) > 1)) ? 1 : 0;
         });
-    CUDA_ERROR(cudaDeviceSynchronize());
+    RXMESH_CUDA_CHECK(cudaDeviceSynchronize());
 
     // Erode steps
     for (int s = 0; s < steps; s++) {
@@ -1013,13 +1040,13 @@ inline void erode_dilate_features(
         feature_edge_valence_kernel<blockThreads>
             <<<lb_val.blocks, lb_val.num_threads, lb_val.smem_bytes_dyn>>>(
                 rx.get_context(), *edge_feature, *feat_valence);
-        CUDA_ERROR(cudaDeviceSynchronize());
+        RXMESH_CUDA_CHECK(cudaDeviceSynchronize());
 
         feature_erode_kernel<float, blockThreads>
             <<<lb_erode.blocks, lb_erode.num_threads, lb_erode.smem_bytes_dyn>>>(
                 rx.get_context(), *coords, *edge_feature, *feat_valence,
                 *v_boundary, max_erode_len);
-        CUDA_ERROR(cudaDeviceSynchronize());
+        RXMESH_CUDA_CHECK(cudaDeviceSynchronize());
     }
 
     // Dilate steps
@@ -1028,13 +1055,13 @@ inline void erode_dilate_features(
         feature_edge_valence_kernel<blockThreads>
             <<<lb_val.blocks, lb_val.num_threads, lb_val.smem_bytes_dyn>>>(
                 rx.get_context(), *edge_feature, *feat_valence);
-        CUDA_ERROR(cudaDeviceSynchronize());
+        RXMESH_CUDA_CHECK(cudaDeviceSynchronize());
 
         feature_dilate_kernel<blockThreads>
             <<<lb_dilate.blocks, lb_dilate.num_threads, lb_dilate.smem_bytes_dyn>>>(
                 rx.get_context(), *edge_feature, *edge_orig,
                 *feat_valence, *v_high_val);
-        CUDA_ERROR(cudaDeviceSynchronize());
+        RXMESH_CUDA_CHECK(cudaDeviceSynchronize());
     }
 
     // Cleanup
@@ -1061,7 +1088,7 @@ inline void pre_skip_feature_edges(
                 edge_status(eh) = SKIP;
             }
         });
-    CUDA_ERROR(cudaDeviceSynchronize());
+    RXMESH_CUDA_CHECK(cudaDeviceSynchronize());
 }
 
 // =========================================================================
@@ -1251,7 +1278,7 @@ inline void feature_equalize_valences(
         feature_compute_valence<blockThreads>
             <<<lb_valence.blocks, lb_valence.num_threads, lb_valence.smem_bytes_dyn>>>(
                 rx.get_context(), *v_valence);
-        CUDA_ERROR(cudaDeviceSynchronize());
+        RXMESH_CUDA_CHECK(cudaDeviceSynchronize());
 
         int flip_inner = 0;
         while (!rx.is_queue_empty()) {
