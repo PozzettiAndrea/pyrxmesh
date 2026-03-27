@@ -450,6 +450,11 @@ VcgRemeshResult vcg_remesh(
     int iters = params.iterations > 0 ? params.iterations : 15;
     para.iter = iters;
     para.SetTargetLen(target_edge);
+
+    if (verbose)
+        fprintf(stderr, "[pyrxmesh] cpu thresholds: split_above=%.6f collapse_below=%.6f target=%.6f\n",
+                para.maxLength, para.minLength, target_edge);
+
     para.splitFlag    = true;
     para.swapFlag     = true;
     para.collapseFlag = true;

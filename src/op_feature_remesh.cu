@@ -274,6 +274,11 @@ MeshResult pipeline_feature_remesh(
     const float high_edge_len = (4.f / 3.f) * Arg.relative_len * stats.avg_edge_len;
     const float high_edge_len_sq = high_edge_len * high_edge_len;
 
+    if (verbose)
+        fprintf(stderr, "[pyrxmesh] thresholds: split_above=%.6f collapse_below=%.6f "
+                "relative_len=%.4f avg_edge=%.6f\n",
+                high_edge_len, low_edge_len, Arg.relative_len, stats.avg_edge_len);
+
     // Adaptive sizing attribute (1.0 = uniform for pass 1)
     auto sizing = rx.add_vertex_attribute<float>("sizing", 1, LOCATION_ALL);
     sizing->reset(1.0f, DEVICE);
@@ -344,23 +349,83 @@ MeshResult pipeline_feature_remesh(
         }
 
         feature_split_long_edges(rx, coords.get(),
-            edge_status.get(), v_boundary.get(), edge_feature.get(),
-            vertex_feature.get(), sizing.get(),
+            edge_status.get(), v_boundary.get(),
             high_edge_len_sq, low_edge_len_sq, timers, d_buffer);
 
-        feature_collapse_short_edges(rx, coords.get(),
-            edge_status.get(), edge_link.get(), v_boundary.get(),
-            edge_feature.get(), vertex_feature.get(), sizing.get(),
-            low_edge_len_sq, high_edge_len_sq, timers, d_buffer);
+        // Re-detect features after split via dihedral angle.
+        // Mathematically equivalent to inheritance (see boffins session).
+        {
+            edge_feature->reset(0, DEVICE);
+            LaunchBox<blockThreads> lb_fd;
+            rx.update_launch_box({Op::EVDiamond}, lb_fd,
+                (void*)detect_features_dynamic_kernel<float, blockThreads>);
+            detect_features_dynamic_kernel<float, blockThreads>
+                <<<lb_fd.blocks, lb_fd.num_threads, lb_fd.smem_bytes_dyn>>>(
+                    rx.get_context(), *coords, *edge_feature, cos_threshold);
+            CUDA_ERROR(cudaDeviceSynchronize());
+            mark_feature_vertices(rx, edge_feature.get(), vertex_feature.get());
+        }
+
+        // Count how many edges are below collapse threshold
+        if (verbose) {
+            Stats post_stats;
+            compute_stats(rx, coords.get(), edge_len.get(), vertex_valence_attr.get(), post_stats);
+            fprintf(stderr, "    [gpu] edge stats: avg=%.6f min=%.6f max=%.6f\n",
+                    post_stats.avg_edge_len, post_stats.min_edge_len, post_stats.max_edge_len);
+        }
+
+        if (verbose)
+            fprintf(stderr, "    [gpu] after split:    V=%u E=%u F=%u\n",
+                    rx.get_num_vertices(true), rx.get_num_edges(true), rx.get_num_faces(true));
+
+        // Run collapse multiple times to approximate CPU's sequential cascade.
+        // Each call re-marks edges from scratch against the updated mesh.
+        for (int col_pass = 0; col_pass < 1; col_pass++) {
+            uint32_t pre_v = rx.get_num_vertices(true);
+            feature_collapse_short_edges(rx, coords.get(),
+                edge_status.get(), v_boundary.get(),
+                edge_feature.get(), vertex_feature.get(),
+                low_edge_len_sq, high_edge_len_sq, timers, d_buffer);
+            uint32_t post_v = rx.get_num_vertices(true);
+            if (verbose)
+                fprintf(stderr, "    [gpu] collapse pass %d: V %u → %u (-%u)\n",
+                        col_pass, pre_v, post_v, pre_v - post_v);
+            if (pre_v == post_v) break;  // no progress, stop
+        }
+
+        // Re-detect features after collapse
+        {
+            edge_feature->reset(0, DEVICE);
+            LaunchBox<blockThreads> lb_fd;
+            rx.update_launch_box({Op::EVDiamond}, lb_fd,
+                (void*)detect_features_dynamic_kernel<float, blockThreads>);
+            detect_features_dynamic_kernel<float, blockThreads>
+                <<<lb_fd.blocks, lb_fd.num_threads, lb_fd.smem_bytes_dyn>>>(
+                    rx.get_context(), *coords, *edge_feature, cos_threshold);
+            CUDA_ERROR(cudaDeviceSynchronize());
+            mark_feature_vertices(rx, edge_feature.get(), vertex_feature.get());
+        }
+
+        if (verbose)
+            fprintf(stderr, "    [gpu] after collapse: V=%u E=%u F=%u\n",
+                    rx.get_num_vertices(true), rx.get_num_edges(true), rx.get_num_faces(true));
 
         feature_equalize_valences(rx, coords.get(),
             v_valence.get(), edge_status.get(), edge_link.get(),
             v_boundary.get(), edge_feature.get(), vertex_feature.get(),
             sizing.get(), timers, d_buffer);
 
+        if (verbose)
+            fprintf(stderr, "    [gpu] after flip:     V=%u E=%u F=%u\n",
+                    rx.get_num_vertices(true), rx.get_num_edges(true), rx.get_num_faces(true));
+
         tangential_relaxation(rx, coords.get(), new_coords.get(),
             v_boundary.get(), Arg.num_smooth_iters, timers);
         std::swap(new_coords, coords);
+
+        if (verbose)
+            fprintf(stderr, "    [gpu] after smooth:   V=%u E=%u F=%u\n",
+                    rx.get_num_vertices(true), rx.get_num_edges(true), rx.get_num_faces(true));
 
         // ── BVH surface projection after smooth ─────────────────
         auto t_proj = clk::now();
@@ -408,8 +473,7 @@ MeshResult pipeline_feature_remesh(
 
             rx.for_each_vertex(HOST, [&](const VertexHandle& vh) {
                 uint32_t gid = rx.map_to_global(vh);
-                // Don't project feature vertices (they should stay on features)
-                if ((*vertex_feature)(vh) > 0) return;
+                // Project ALL vertices to surface (matching CPU behavior)
                 const auto& r = h_results[gid];
                 (*coords)(vh, 0) = r.nearest_x;
                 (*coords)(vh, 1) = r.nearest_y;
@@ -421,9 +485,12 @@ MeshResult pipeline_feature_remesh(
         double proj_ms = ms_since(t_proj);
         t_proj_total += proj_ms;
 
-        if (verbose)
+        if (verbose) {
+            fprintf(stderr, "    [gpu] after project:  V=%u E=%u F=%u\n",
+                    rx.get_num_vertices(true), rx.get_num_edges(true), rx.get_num_faces(true));
             fprintf(stderr, "  [iter %u] done in %.1f ms (proj %.1f ms)\n",
                     iter, ms_since(t_iter), proj_ms);
+        }
     }
     CUDA_ERROR(cudaDeviceSynchronize());
     double t_pass1 = ms_since(tp);
@@ -606,13 +673,12 @@ MeshResult pipeline_feature_remesh(
                     rx2.get_num_edges(), rx2.get_num_faces(), rx2.get_num_patches());
 
         feature_split_long_edges(rx2, coords2.get(),
-            edge_status2.get(), v_boundary2.get(), edge_feature2.get(),
-            vertex_feature2.get(), sizing2.get(),
+            edge_status2.get(), v_boundary2.get(),
             high2_sq, low2_sq, timers2, d_buffer2);
 
         feature_collapse_short_edges(rx2, coords2.get(),
-            edge_status2.get(), edge_link2.get(), v_boundary2.get(),
-            edge_feature2.get(), vertex_feature2.get(), sizing2.get(),
+            edge_status2.get(), v_boundary2.get(),
+            edge_feature2.get(), vertex_feature2.get(),
             low2_sq, high2_sq, timers2, d_buffer2);
 
         feature_equalize_valences(rx2, coords2.get(),

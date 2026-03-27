@@ -299,6 +299,7 @@ public:
 
             if(params.splitFlag)
                 SplitLongEdges(toRemesh, params);
+            fprintf(stderr, "    [cpu] after split:    V=%d F=%d\n", toRemesh.VN(), toRemesh.FN());
 
 #ifdef DEBUG_CREASE
             debug_crease(toRemesh, std::string("after_ref"), i);
@@ -307,17 +308,22 @@ public:
             if(params.collapseFlag)
             {
                 CollapseShortEdges(toRemesh, params);
+                fprintf(stderr, "    [cpu] after collapse: V=%d F=%d\n", toRemesh.VN(), toRemesh.FN());
                 CollapseCrosses(toRemesh, params);
+                fprintf(stderr, "    [cpu] after crosses:  V=%d F=%d\n", toRemesh.VN(), toRemesh.FN());
             }
 
             if(params.swapFlag)
                 ImproveValence(toRemesh, params);
+            fprintf(stderr, "    [cpu] after flip:     V=%d F=%d\n", toRemesh.VN(), toRemesh.FN());
 
             if(params.smoothFlag)
                 ImproveByLaplacian(toRemesh, params);
+            fprintf(stderr, "    [cpu] after smooth:   V=%d F=%d\n", toRemesh.VN(), toRemesh.FN());
 
             if(params.projectFlag)
                 ProjectToSurface(toRemesh, params);
+            fprintf(stderr, "    [cpu] after project:  V=%d F=%d\n", toRemesh.VN(), toRemesh.FN());
         }
     }
 

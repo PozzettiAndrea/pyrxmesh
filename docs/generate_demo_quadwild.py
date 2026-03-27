@@ -330,9 +330,9 @@ def gen_quadwild(dragon_v, dragon_f, stop_after=None):
 
     # CPU non-adaptive
     d = run_before_after("qw_cpu_remesh_p1",
-        lambda v, f: pyrxmesh.vcg_remesh(v, f, target_faces=10000, iterations=15, adaptive=False, verbose=True),
+        lambda v, f: pyrxmesh.vcg_remesh(v, f, target_faces=10000, iterations=1, adaptive=False, verbose=True),
         dragon_v, dragon_f,
-        "pyrxmesh.vcg_remesh(v, f, target_faces=10000, iterations=15, adaptive=False)",
+        "pyrxmesh.vcg_remesh(v, f, target_faces=10000, iterations=1, adaptive=False)",
         after_label="CPU Non-Adaptive")
     d["step_name"] = "Remesh (non-adaptive)"
     d["side"] = "cpu"
@@ -342,7 +342,7 @@ def gen_quadwild(dragon_v, dragon_f, stop_after=None):
     d = run_before_after("qw_gpu_remesh_p1",
         lambda v, f: pyrxmesh.feature_remesh(v, f,
             relative_len=el_gpu.target_edge_length / el_gpu.avg_edge_length,
-            iterations=15, crease_angle_deg=35.0, max_passes=1, verbose=True),
+            iterations=1, crease_angle_deg=35.0, max_passes=1, verbose=True),
         dragon_v, dragon_f,
         "pyrxmesh.feature_remesh(v, f, ..., max_passes=1)",
         after_label="GPU Non-Adaptive")

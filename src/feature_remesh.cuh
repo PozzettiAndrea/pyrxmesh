@@ -120,14 +120,15 @@ __global__ static void feature_compute_valence(
 // Feature-aware edge split
 // =========================================================================
 
+// Based on official RXMesh split kernel (RXMesh/apps/Remesh/split.cuh).
+// Differences from official: no min_new_edge_len check (CPU doesn't have it),
+// no boundary vertex skip (CPU splits boundary edges).
 template <typename T, uint32_t blockThreads>
 __global__ static void feature_edge_split(
     rxmesh::Context                       context,
     const rxmesh::VertexAttribute<T>      coords,
     rxmesh::EdgeAttribute<EdgeStatus>     edge_status,
     rxmesh::VertexAttribute<bool>         v_boundary,
-    const rxmesh::EdgeAttribute<int>      edge_is_feature,
-    const rxmesh::VertexAttribute<T>      sizing,  // per-vertex sizing multiplier (1.0 = non-adaptive)
     const T high_edge_len_sq,
     const T low_edge_len_sq,
     int     iteration)
@@ -151,56 +152,28 @@ __global__ static void feature_edge_split(
         assert(iter.size() == 4);
 
         if (edge_status(eh) == UNSEEN) {
-
-            // FEATURE: don't split feature edges
-            if (edge_is_feature(eh) == 1) {
-                edge_status(eh) = SKIP;
-                return;
-            }
-
             const VertexHandle va = iter[0];
             const VertexHandle vb = iter[2];
             const VertexHandle vc = iter[1];
             const VertexHandle vd = iter[3];
 
+            // Don't split boundary edges (no adjacent face on one side)
             if (!vc.is_valid() || !vd.is_valid() || !va.is_valid() || !vb.is_valid()) {
                 edge_status(eh) = SKIP;
                 return;
             }
 
-            if (v_boundary(va) || v_boundary(vb) || v_boundary(vc) || v_boundary(vd))
-                return;
-
+            // Degenerate cases
             if (va == vb || vb == vc || vc == va || va == vd || vb == vd || vc == vd) {
                 edge_status(eh) = SKIP;
                 return;
             }
 
-            const vec3<T> pa = coords.to_glm<3>(va);
-            const vec3<T> pb = coords.to_glm<3>(vb);
-            const T edge_len = glm::distance2(pa, pb);
+            const T edge_len = glm::distance2(coords.to_glm<3>(va), coords.to_glm<3>(vb));
 
-            // ADAPTIVE: per-vertex sizing modulates threshold
-            T mult = min(sizing(va, 0), sizing(vb, 0));
-            T local_high = high_edge_len_sq * mult * mult;
-            T local_low = low_edge_len_sq * mult * mult;
-
-            if (edge_len > local_high) {
-                vec3<T> p_new = (pa + pb) * T(0.5);
-                vec3<T> pc = coords.to_glm<3>(vc);
-                vec3<T> pd = coords.to_glm<3>(vd);
-
-                T min_new_edge_len = std::numeric_limits<T>::max();
-                min_new_edge_len = std::min(min_new_edge_len, glm::distance2(p_new, pa));
-                min_new_edge_len = std::min(min_new_edge_len, glm::distance2(p_new, pb));
-                min_new_edge_len = std::min(min_new_edge_len, glm::distance2(p_new, pc));
-                min_new_edge_len = std::min(min_new_edge_len, glm::distance2(p_new, pd));
-
-                if (min_new_edge_len >= local_low) {
-                    cavity.create(eh);
-                } else {
-                    edge_status(eh) = SKIP;
-                }
+            if (edge_len > high_edge_len_sq) {
+                // No min_new_edge_len check — matches CPU behavior
+                cavity.create(eh);
             } else {
                 edge_status(eh) = SKIP;
             }
@@ -213,6 +186,8 @@ __global__ static void feature_edge_split(
 
     shrd_alloc.dealloc(shrd_alloc.get_allocated_size_bytes() - shmem_before);
 
+    // Only 3 attributes in prologue (RXMesh limit).
+    // Feature flags are re-detected after split via dihedral angle.
     if (cavity.prologue(block, shrd_alloc, coords, edge_status, v_boundary)) {
         cavity.for_each_cavity(block, [&](uint16_t c, uint16_t size) {
             assert(size == 4);
@@ -261,18 +236,20 @@ __global__ static void feature_edge_split(
 
 
 // =========================================================================
-// Feature-aware edge collapse
+// Edge collapse — uses official RXMesh pattern with atomicCAS conflict resolution.
+// Feature edges are pre-marked as SKIP via pre_skip_feature_edges() before launch.
 // =========================================================================
 
+// Official RXMesh collapse pattern — atomicCAS conflict resolution + VV link condition.
+// Feature edges are pre-marked as SKIP before this kernel launches.
 template <typename T, uint32_t blockThreads>
 __global__ static void __launch_bounds__(blockThreads)
     feature_edge_collapse(
         rxmesh::Context                       context,
         const rxmesh::VertexAttribute<T>      coords,
         rxmesh::EdgeAttribute<EdgeStatus>     edge_status,
-        const rxmesh::EdgeAttribute<int>      edge_is_feature,
+        rxmesh::VertexAttribute<bool>         v_boundary,
         const rxmesh::VertexAttribute<int>    vertex_is_feature,
-        const rxmesh::VertexAttribute<T>      sizing,  // per-vertex sizing multiplier
         const T                               low_edge_len_sq,
         const T                               high_edge_len_sq)
 {
@@ -285,70 +262,142 @@ __global__ static void __launch_bounds__(blockThreads)
     const uint32_t pid = cavity.patch_id();
     if (pid == INVALID32) return;
 
-    Bitmask edge_mask(cavity.patch_info().edges_capacity, shrd_alloc);
-    edge_mask.reset(block);
+    Bitmask is_updated(cavity.patch_info().edges_capacity, shrd_alloc);
 
     uint32_t shmem_before = shrd_alloc.get_allocated_size_bytes();
 
-    // Use vertices_capacity (not num_vertices[0]) to avoid shared memory
-    // overflow when vertex local IDs exceed live count after compaction.
-    Bitmask v0_mask(cavity.patch_info().vertices_capacity, shrd_alloc);
-    Bitmask v1_mask(cavity.patch_info().vertices_capacity, shrd_alloc);
+    // Per-vertex info for atomicCAS conflict resolution
+    uint16_t* v_info =
+        shrd_alloc.alloc<uint16_t>(2 * cavity.patch_info().vertices_capacity);
+    fill_n<blockThreads>(
+        v_info, 2 * cavity.patch_info().vertices_capacity, uint16_t(INVALID16));
 
-    Query<blockThreads> query(context, pid);
-    query.prologue<Op::EVDiamond>(block, shrd_alloc);
+    Bitmask e_collapse(cavity.patch_info().edges_capacity, shrd_alloc);
+    e_collapse.reset(block);
     block.sync();
 
-    // 1. mark edges to collapse
-    for_each_edge(cavity.patch_info(), [&](EdgeHandle eh) {
+    // 1. Mark short edges for collapse using atomicCAS conflict resolution
+    auto should_collapse = [&](const EdgeHandle& eh, const VertexIterator& iter) {
         if (edge_status(eh) == UNSEEN) {
-
-            // FEATURE: don't collapse feature edges
-            if (edge_is_feature(eh) == 1) {
-                edge_status(eh) = SKIP;
-                return;
-            }
-
-            const VertexIterator iter =
-                query.template get_iterator<VertexIterator>(eh.local_id());
             assert(iter.size() == 4);
 
             const VertexHandle v0 = iter[0], v1 = iter[2];
             const VertexHandle v2 = iter[1], v3 = iter[3];
 
-            // FEATURE: don't collapse edges touching feature vertices
-            // Matches CPU behavior: feature vertices should not move
-            if (vertex_is_feature(v0) || vertex_is_feature(v1)) {
-                edge_status(eh) = SKIP;
+            if (!v0.is_valid() || !v1.is_valid() || !v2.is_valid() || !v3.is_valid())
                 return;
+            if (v_boundary(v0) || v_boundary(v1) || v_boundary(v2) || v_boundary(v3))
+                return;
+            // Don't collapse edges touching feature vertices (conservative).
+            // CPU uses direction check; we skip entirely for now.
+            if (vertex_is_feature(v0) || vertex_is_feature(v1))
+                return;
+            if (v0 == v1 || v0 == v2 || v0 == v3 || v1 == v2 || v1 == v3 || v2 == v3)
+                return;
+
+            const vec3<T> pp0 = coords.to_glm<3>(v0);
+            const vec3<T> pp1 = coords.to_glm<3>(v1);
+            const T edge_len_sq = glm::distance2(pp0, pp1);
+
+            // Area check: also collapse edges in tiny-area faces (matches CPU)
+            const vec3<T> pp2 = coords.to_glm<3>(v2);
+            const T area0 = glm::length(glm::cross(pp1 - pp0, pp2 - pp0)) * T(0.5);
+            bool tiny_area = (area0 < low_edge_len_sq / T(100));
+            if (!tiny_area && v3.is_valid()) {
+                const vec3<T> pp3 = coords.to_glm<3>(v3);
+                const T area1 = glm::length(glm::cross(pp1 - pp0, pp3 - pp0)) * T(0.5);
+                tiny_area = (area1 < low_edge_len_sq / T(100));
             }
 
-            if (v2.is_valid() && v3.is_valid()) {
-                if (v0 == v1 || v0 == v2 || v0 == v3 || v1 == v2 || v1 == v3 || v2 == v3)
-                    return;
+            if (edge_len_sq < low_edge_len_sq || tiny_area) {
+                const uint16_t c0(iter.local(0)), c1(iter.local(2));
 
-                const T edge_len_sq = glm::distance2(
-                    coords.to_glm<3>(v0), coords.to_glm<3>(v1));
-
-                // ADAPTIVE: per-vertex sizing
-                T mult = min(sizing(v0, 0), sizing(v1, 0));
-                T local_low = low_edge_len_sq * mult * mult;
-
-                if (edge_len_sq < local_low) {
-                    edge_mask.set(eh.local_id(), true);
+                uint16_t ret = ::atomicCAS(v_info + 2 * c0, INVALID16, c1);
+                if (ret == INVALID16) {
+                    v_info[2 * c0 + 1] = eh.local_id();
+                    e_collapse.set(eh.local_id(), true);
+                } else {
+                    ret = ::atomicCAS(v_info + 2 * c1, INVALID16, c0);
+                    if (ret == INVALID16) {
+                        v_info[2 * c1 + 1] = eh.local_id();
+                        e_collapse.set(eh.local_id(), true);
+                    }
                 }
+            }
+        }
+    };
+
+    Query<blockThreads> query(context, cavity.patch_id());
+    query.dispatch<Op::EVDiamond>(block, shrd_alloc, should_collapse);
+    block.sync();
+
+    // 2. Link condition check via VV query
+    auto check_edges = [&](const VertexHandle& vh, const VertexIterator& iter) {
+        uint16_t opposite_v = v_info[2 * vh.local_id()];
+        if (opposite_v != INVALID16) {
+            int num_shared_v = 0;
+            const VertexIterator opp_iter =
+                query.template get_iterator<VertexIterator>(opposite_v);
+
+            for (uint16_t v = 0; v < iter.size(); ++v) {
+                for (uint16_t ov = 0; ov < opp_iter.size(); ++ov) {
+                    if (iter.local(v) == opp_iter.local(ov)) {
+                        num_shared_v++;
+                        break;
+                    }
+                }
+            }
+            if (num_shared_v > 2) {
+                e_collapse.reset(v_info[2 * vh.local_id() + 1], true);
+            }
+        }
+    };
+
+    query.dispatch<Op::VV>(block, shrd_alloc, check_edges,
+        [](VertexHandle) { return true; }, false, true);
+    block.sync();
+
+    // 2b. One-per-face limit (matches CPU's break-after-first-collapse-per-face)
+    for_each_face(cavity.patch_info(), [&](FaceHandle fh) {
+        const uint16_t f = fh.local_id();
+        const uint16_t e0 = cavity.patch_info().fe[3 * f + 0].id;
+        const uint16_t e1 = cavity.patch_info().fe[3 * f + 1].id;
+        const uint16_t e2 = cavity.patch_info().fe[3 * f + 2].id;
+
+        int count = int(e_collapse(e0)) + int(e_collapse(e1)) + int(e_collapse(e2));
+        if (count > 1) {
+            // Keep only the shortest marked edge, unmark others
+            // Read edge endpoints from EV to compute lengths
+            auto get_len_sq = [&](uint16_t eid) -> T {
+                const uint16_t va = cavity.patch_info().ev[2 * eid].id;
+                const uint16_t vb = cavity.patch_info().ev[2 * eid + 1].id;
+                return glm::distance2(
+                    coords.to_glm<3>(VertexHandle(pid, va)),
+                    coords.to_glm<3>(VertexHandle(pid, vb)));
+            };
+
+            T len0 = e_collapse(e0) ? get_len_sq(e0) : std::numeric_limits<T>::max();
+            T len1 = e_collapse(e1) ? get_len_sq(e1) : std::numeric_limits<T>::max();
+            T len2 = e_collapse(e2) ? get_len_sq(e2) : std::numeric_limits<T>::max();
+
+            // Keep shortest
+            if (len0 <= len1 && len0 <= len2) {
+                if (e_collapse(e1)) e_collapse.reset(e1, true);
+                if (e_collapse(e2)) e_collapse.reset(e2, true);
+            } else if (len1 <= len0 && len1 <= len2) {
+                if (e_collapse(e0)) e_collapse.reset(e0, true);
+                if (e_collapse(e2)) e_collapse.reset(e2, true);
+            } else {
+                if (e_collapse(e0)) e_collapse.reset(e0, true);
+                if (e_collapse(e1)) e_collapse.reset(e1, true);
             }
         }
     });
     block.sync();
 
-    // 2. link condition
-    link_condition(block, cavity.patch_info(), query, edge_mask, v0_mask, v1_mask, 0, 2);
-    block.sync();
-
-    // 3. create cavities
+    // 3. Create cavities
     for_each_edge(cavity.patch_info(), [&](EdgeHandle eh) {
-        if (edge_mask(eh.local_id())) {
+        if (e_collapse(eh.local_id())) {
             cavity.create(eh);
         } else {
             edge_status(eh) = SKIP;
@@ -358,8 +407,9 @@ __global__ static void __launch_bounds__(blockThreads)
 
     shrd_alloc.dealloc(shrd_alloc.get_allocated_size_bytes() - shmem_before);
 
-    if (cavity.prologue(block, shrd_alloc, coords, edge_status)) {
-        edge_mask.reset(block);
+    // 4. Prologue + cavity fill
+    if (cavity.prologue(block, shrd_alloc, coords, edge_status, v_boundary)) {
+        is_updated.reset(block);
         block.sync();
 
         cavity.for_each_cavity(block, [&](uint16_t c, uint16_t size) {
@@ -369,29 +419,51 @@ __global__ static void __launch_bounds__(blockThreads)
 
             const vec3<T> p0 = coords.to_glm<3>(v0);
             const vec3<T> p1 = coords.to_glm<3>(v1);
+            const vec3<T> new_p((p0[0] + p1[0]) * T(0.5),
+                                (p0[1] + p1[1]) * T(0.5),
+                                (p0[2] + p1[2]) * T(0.5));
 
-            // FEATURE FIX 1: collapse toward feature vertex, not midpoint
-            // If one endpoint is a feature vertex, keep it pinned
-            vec3<T> new_p;
-            if (vertex_is_feature(v0) && !vertex_is_feature(v1)) {
-                new_p = p0;  // keep feature vertex v0
-            } else if (vertex_is_feature(v1) && !vertex_is_feature(v0)) {
-                new_p = p1;  // keep feature vertex v1
-            } else {
-                new_p = (p0 + p1) * T(0.5);  // midpoint for non-feature or both-feature
-            }
-
-            // ADAPTIVE: use sizing of collapsed edge endpoints
-            T cmult = min(sizing(v0, 0), sizing(v1, 0));
-            T cavity_low = low_edge_len_sq * cmult * cmult;
-
-            bool long_edge = false;
+            // Quality checks matching CPU (checkFacesAfterCollapse):
+            // 1. Long edge check — don't create edges > split threshold
+            // 2. Normal flip check — dot(oldN, newN) >= 0.7
+            // 3. Quality check — new area >= 50% of old area
+            bool reject = false;
             for (uint16_t i = 0; i < size; ++i) {
-                const T d = glm::distance2(coords.to_glm<3>(cavity.get_cavity_vertex(c, i)), new_p);
-                if (d >= cavity_low) { long_edge = true; break; }
+                const vec3<T> bp0 = coords.to_glm<3>(cavity.get_cavity_vertex(c, i));
+                const vec3<T> bp1 = coords.to_glm<3>(cavity.get_cavity_vertex(c, (i + 1) % size));
+
+                // Long edge check
+                if (glm::distance2(bp0, new_p) > high_edge_len_sq) { reject = true; break; }
+
+                // Old face normal (using v0 as reference — one of the two original verts)
+                vec3<T> old_n = glm::cross(bp0 - p0, bp1 - p0);
+                vec3<T> new_n = glm::cross(bp0 - new_p, bp1 - new_p);
+
+                T old_len = glm::length(old_n);
+                T new_len = glm::length(new_n);
+
+                if (old_len > T(1e-10) && new_len > T(1e-10)) {
+                    // Normal flip check
+                    if (glm::dot(old_n / old_len, new_n / new_len) < T(0.7)) { reject = true; break; }
+
+                    // QualityRadii: Q = 4*sqrt(3)*area / (a²+b²+c²)
+                    // Compare new vs old quality, reject if < 50%
+                    T old_area = old_len * T(0.5);  // |cross|/2
+                    T new_area = new_len * T(0.5);
+                    T old_a2 = glm::distance2(bp0, p0);
+                    T old_b2 = glm::distance2(bp1, p0);
+                    T old_c2 = glm::distance2(bp0, bp1);
+                    T new_a2 = glm::distance2(bp0, new_p);
+                    T new_b2 = glm::distance2(bp1, new_p);
+                    T old_denom = old_a2 + old_b2 + old_c2;
+                    T new_denom = new_a2 + new_b2 + old_c2;  // c unchanged
+                    T oldQ = (old_denom > T(1e-20)) ? old_area / old_denom : T(0);
+                    T newQ = (new_denom > T(1e-20)) ? new_area / new_denom : T(0);
+                    if (newQ < T(0.5) * oldQ) { reject = true; break; }
+                }
             }
 
-            if (long_edge) {
+            if (reject) {
                 cavity.recover(src);
                 edge_status(src) = SKIP;
             } else {
@@ -403,7 +475,7 @@ __global__ static void __launch_bounds__(blockThreads)
 
                     DEdgeHandle e0 = cavity.add_edge(new_v, cavity.get_cavity_vertex(c, 0));
                     if (e0.is_valid()) {
-                        edge_mask.set(e0.local_id(), true);
+                        is_updated.set(e0.local_id(), true);
                         const DEdgeHandle e_init = e0;
 
                         for (uint16_t i = 0; i < size; ++i) {
@@ -411,9 +483,9 @@ __global__ static void __launch_bounds__(blockThreads)
                             const DEdgeHandle e1 =
                                 (i == size - 1) ?
                                     e_init.get_flip_dedge() :
-                                    cavity.add_edge(cavity.get_cavity_vertex(c, (i+1) % size), new_v);
+                                    cavity.add_edge(cavity.get_cavity_vertex(c, i + 1), new_v);
                             if (!e1.is_valid()) break;
-                            if (i != size - 1) edge_mask.set(e1.local_id(), true);
+                            if (i != size - 1) is_updated.set(e1.local_id(), true);
                             const FaceHandle new_f = cavity.add_face(e0, e, e1);
                             if (!new_f.is_valid()) break;
                             e0 = e1.get_flip_dedge();
@@ -430,7 +502,7 @@ __global__ static void __launch_bounds__(blockThreads)
 
     if (cavity.is_successful()) {
         for_each_edge(cavity.patch_info(), [&](EdgeHandle eh) {
-            if (edge_mask(eh.local_id()) || cavity.is_recovered(eh)) {
+            if (is_updated(eh.local_id()) || cavity.is_recovered(eh)) {
                 edge_status(eh) = ADDED;
             }
         });
@@ -1009,9 +1081,6 @@ inline void feature_split_long_edges(
     rxmesh::VertexAttribute<T>*        coords,
     rxmesh::EdgeAttribute<EdgeStatus>* edge_status,
     rxmesh::VertexAttribute<bool>*     v_boundary,
-    rxmesh::EdgeAttribute<int>*        edge_is_feature,
-    rxmesh::VertexAttribute<int>*      vertex_is_feature,
-    rxmesh::VertexAttribute<T>*        sizing,
     const T                            high_edge_len_sq,
     const T                            low_edge_len_sq,
     rxmesh::Timers<rxmesh::GPUTimer>&  timers,
@@ -1021,7 +1090,8 @@ inline void feature_split_long_edges(
     constexpr uint32_t blockThreads = 256;
 
     edge_status->reset(UNSEEN, DEVICE);
-    pre_skip_feature_edges(rx, edge_status, edge_is_feature);
+    // Don't skip feature edges for split — they SHOULD be split (matching CPU).
+    // Feature flag inheritance happens in the cavity fill.
     int prv_remaining_work = rx.get_num_edges();
 
     LaunchBox<blockThreads> lb;
@@ -1045,7 +1115,7 @@ inline void feature_split_long_edges(
             feature_edge_split<T, blockThreads>
                 <<<lb.blocks, lb.num_threads, lb.smem_bytes_dyn>>>(
                     rx.get_context(), *coords, *edge_status, *v_boundary,
-                    *edge_is_feature, *sizing, high_edge_len_sq, low_edge_len_sq, 0);
+                    high_edge_len_sq, low_edge_len_sq, 0);
             timers.stop("Split");
 
             timers.start("SplitCleanup");
@@ -1062,8 +1132,8 @@ inline void feature_split_long_edges(
             timers.stop("SplitCleanup");
         }
         int remaining = is_done(rx, edge_status, d_buffer);
-        //fprintf(stderr, "    [split] outer=%d inner=%d remaining=%d/%d\n",
-        //        split_outer, split_inner, remaining, prv_remaining_work);
+        fprintf(stderr, "    [split] outer=%d inner=%d remaining=%d/%d\n",
+                split_outer, split_inner, remaining, prv_remaining_work);
         if (remaining == 0 || prv_remaining_work == remaining) break;
         prv_remaining_work = remaining;
     }
@@ -1075,11 +1145,9 @@ inline void feature_collapse_short_edges(
     rxmesh::RXMeshDynamic&             rx,
     rxmesh::VertexAttribute<T>*        coords,
     rxmesh::EdgeAttribute<EdgeStatus>* edge_status,
-    rxmesh::EdgeAttribute<int8_t>*     edge_link,
     rxmesh::VertexAttribute<bool>*     v_boundary,
     rxmesh::EdgeAttribute<int>*        edge_is_feature,
     rxmesh::VertexAttribute<int>*      vertex_is_feature,
-    rxmesh::VertexAttribute<T>*        sizing,
     const T                            low_edge_len_sq,
     const T                            high_edge_len_sq,
     rxmesh::Timers<rxmesh::GPUTimer>&  timers,
@@ -1093,7 +1161,7 @@ inline void feature_collapse_short_edges(
     int prv_remaining_work = rx.get_num_edges();
 
     LaunchBox<blockThreads> lb;
-    rx.update_launch_box({Op::EVDiamond}, lb,
+    rx.update_launch_box({Op::EVDiamond, Op::VV}, lb,
         (void*)feature_edge_collapse<T, blockThreads>,
         true, false, false, false,
         [&](uint32_t v, uint32_t e, uint32_t f) {
@@ -1113,9 +1181,8 @@ inline void feature_collapse_short_edges(
             timers.start("Collapse");
             feature_edge_collapse<T, blockThreads>
                 <<<lb.blocks, lb.num_threads, lb.smem_bytes_dyn>>>(
-                    rx.get_context(), *coords, *edge_status,
-                    *edge_is_feature, *vertex_is_feature, *sizing,
-                    low_edge_len_sq, high_edge_len_sq);
+                    rx.get_context(), *coords, *edge_status, *v_boundary,
+                    *vertex_is_feature, low_edge_len_sq, high_edge_len_sq);
             timers.stop("Collapse");
 
             timers.start("CollapseCleanup");
@@ -1132,8 +1199,8 @@ inline void feature_collapse_short_edges(
             timers.stop("CollapseCleanup");
         }
         int remaining = is_done(rx, edge_status, d_buffer);
-        //fprintf(stderr, "    [collapse] outer=%d inner=%d remaining=%d/%d\n",
-        //        col_outer, col_inner, remaining, prv_remaining_work);
+        fprintf(stderr, "    [collapse] outer=%d inner=%d remaining=%d/%d\n",
+                col_outer, col_inner, remaining, prv_remaining_work);
         if (remaining == 0 || prv_remaining_work == remaining) break;
         prv_remaining_work = remaining;
     }
