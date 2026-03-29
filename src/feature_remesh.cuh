@@ -260,7 +260,9 @@ __global__ static void __launch_bounds__(blockThreads)
         rxmesh::VertexAttribute<bool>         v_boundary,
         const rxmesh::VertexAttribute<int>    vertex_is_feature,
         const T                               low_edge_len_sq,
-        const T                               high_edge_len_sq)
+        const T                               high_edge_len_sq,
+        const pyrxmesh_bvh::GpuBVHDevice      bvh_ctx,
+        const T                               max_surf_dist)
 {
     using namespace rxmesh;
     auto           block = cooperative_groups::this_thread_block();
@@ -380,8 +382,13 @@ __global__ static void __launch_bounds__(blockThreads)
             // Keep only the shortest marked edge, unmark others
             // Read edge endpoints from EV to compute lengths
             auto get_len_sq = [&](uint16_t eid) -> T {
+                if (eid >= cavity.patch_info().edges_capacity)
+                    return std::numeric_limits<T>::max();
                 const uint16_t va = cavity.patch_info().ev[2 * eid].id;
                 const uint16_t vb = cavity.patch_info().ev[2 * eid + 1].id;
+                if (va >= cavity.patch_info().vertices_capacity ||
+                    vb >= cavity.patch_info().vertices_capacity)
+                    return std::numeric_limits<T>::max();
                 return glm::distance2(
                     coords.to_glm<3>(VertexHandle(pid, va)),
                     coords.to_glm<3>(VertexHandle(pid, vb)));
@@ -463,20 +470,23 @@ __global__ static void __launch_bounds__(blockThreads)
                 T old_len = glm::length(old_n);
                 T new_len = glm::length(new_n);
 
-                if (old_len > T(1e-10) && new_len > T(1e-10)) {
+                // Reject if new face would be degenerate
+                if (new_len < T(1e-10)) { reject = true; break; }
+
+                // Skip quality checks only if old face was already degenerate
+                // (can't compare quality against a zero-area reference)
+                if (old_len > T(1e-10)) {
                     // Normal flip check
                     if (glm::dot(old_n / old_len, new_n / new_len) < T(0.7)) { reject = true; break; }
 
                     // QualityRadii: Q = 4*sqrt(3)*area / (a²+b²+c²)
-                    // Compare new vs old quality, reject if < 50%
-                    T old_area = old_len * T(0.5);  // |cross|/2
+                    T old_area = old_len * T(0.5);
                     T new_area = new_len * T(0.5);
                     T old_a2 = glm::distance2(bp0, p0);
                     T old_b2 = glm::distance2(bp1, p0);
                     T old_c2 = glm::distance2(bp0, bp1);
                     T new_a2 = glm::distance2(bp0, new_p);
                     T new_b2 = glm::distance2(bp1, new_p);
-                    // QualityRadii: Q = 4*sqrt(3)*area / (a²+b²+c²)
                     constexpr T K = T(6.928203230275509);  // 4*sqrt(3)
                     T old_denom = old_a2 + old_b2 + old_c2;
                     T new_denom = new_a2 + new_b2 + old_c2;
@@ -485,9 +495,17 @@ __global__ static void __launch_bounds__(blockThreads)
 
                     // Relative check: reject if quality drops below 50%
                     if (newQ < T(0.5) * oldQ) { reject = true; break; }
-                    // Absolute floor: reject if quality below 0.3 (matches CPU aspectRatioThr)
+                    // Absolute floor
                     if (newQ < T(0.3)) { reject = true; break; }
                 }
+            }
+
+            // Hausdorff surface distance check (matches CPU's testHausdorff)
+            // Reject if new midpoint is too far from original surface
+            if (!reject && max_surf_dist > T(0)) {
+                auto r = pyrxmesh_bvh::gpu_bvh_query_point(
+                    bvh_ctx, (float)new_p[0], (float)new_p[1], (float)new_p[2]);
+                if (r.dist > (float)max_surf_dist) reject = true;
             }
 
             if (reject) {
@@ -548,8 +566,9 @@ __global__ static void __launch_bounds__(blockThreads)
         const rxmesh::VertexAttribute<T>       coords,
         const rxmesh::VertexAttribute<uint8_t> v_valence,
         rxmesh::EdgeAttribute<EdgeStatus>      edge_status,
-        const rxmesh::EdgeAttribute<int>       edge_is_feature,  // FEATURE: added
-        int*                                   d_buffer)
+        const rxmesh::EdgeAttribute<int>       edge_is_feature,
+        int*                                   d_buffer,
+        const T                                flip_normal_thr)
 {
     using namespace rxmesh;
 
@@ -612,6 +631,40 @@ __global__ static void __launch_bounds__(blockThreads)
                 (vd+1 - target_valence)*(vd+1 - target_valence);
 
             if (dev_pre > dev_post) {
+                // Normal check: flip_normal_thr < 0 = skip (old behavior)
+                if (flip_normal_thr >= T(0)) {
+                    const vec3<T> p0 = coords.to_glm<3>(iter[0]);
+                    const vec3<T> p1 = coords.to_glm<3>(iter[1]);
+                    const vec3<T> p2 = coords.to_glm<3>(iter[2]);
+                    const vec3<T> p3 = coords.to_glm<3>(iter[3]);
+
+                    vec3<T> n_old0 = glm::cross(p2 - p0, p1 - p0);
+                    vec3<T> n_old1 = glm::cross(p3 - p0, p2 - p0);
+                    vec3<T> n_new0 = glm::cross(p3 - p1, p0 - p1);
+                    vec3<T> n_new1 = glm::cross(p2 - p1, p3 - p1);
+
+                    T len_new0 = glm::length(n_new0);
+                    T len_new1 = glm::length(n_new1);
+
+                    // Reject if any new face is degenerate
+                    if (len_new0 < T(1e-10) || len_new1 < T(1e-10))
+                        return;
+
+                    T len_old0 = glm::length(n_old0);
+                    T len_old1 = glm::length(n_old1);
+                    if (len_old0 > T(1e-10) && len_old1 > T(1e-10)) {
+                        vec3<T> n_avg = n_old0 / len_old0 + n_old1 / len_old1;
+                        T n_avg_len = glm::length(n_avg);
+                        if (n_avg_len > T(1e-10)) {
+                            n_avg = n_avg / n_avg_len;
+                            T dot0 = glm::dot(n_new0 / len_new0, n_avg);
+                            T dot1 = glm::dot(n_new1 / len_new1, n_avg);
+                            if (dot0 < flip_normal_thr || dot1 < flip_normal_thr)
+                                return;
+                        }
+                    }
+                }
+
                 edge_mask.set(eh.local_id(), true);
             }
         }
@@ -1178,7 +1231,9 @@ inline void feature_collapse_short_edges(
     const T                            low_edge_len_sq,
     const T                            high_edge_len_sq,
     rxmesh::Timers<rxmesh::GPUTimer>&  timers,
-    int*                               d_buffer)
+    int*                               d_buffer,
+    const pyrxmesh_bvh::GpuBVHDevice   bvh_ctx = {},
+    const T                            max_surf_dist = T(0))
 {
     using namespace rxmesh;
     constexpr uint32_t blockThreads = 256;
@@ -1209,7 +1264,8 @@ inline void feature_collapse_short_edges(
             feature_edge_collapse<T, blockThreads>
                 <<<lb.blocks, lb.num_threads, lb.smem_bytes_dyn>>>(
                     rx.get_context(), *coords, *edge_status, *v_boundary,
-                    *vertex_is_feature, low_edge_len_sq, high_edge_len_sq);
+                    *vertex_is_feature, low_edge_len_sq, high_edge_len_sq,
+                    bvh_ctx, max_surf_dist);
             timers.stop("Collapse");
 
             timers.start("CollapseCleanup");
@@ -1234,6 +1290,237 @@ inline void feature_collapse_short_edges(
     timers.stop("CollapseTotal");
 }
 
+// =========================================================================
+// GPU Micro-collapse: collapse shortest edge of faces with QualityRadii ≤ threshold.
+// Matches QuadWild's collapseSurvivingMicroEdges on GPU.
+// =========================================================================
+
+template <typename T, uint32_t blockThreads>
+__global__ static void micro_collapse_kernel(
+    rxmesh::Context                            context,
+    rxmesh::VertexAttribute<T>                 coords,
+    rxmesh::EdgeAttribute<EdgeStatus>          edge_status,
+    rxmesh::VertexAttribute<bool>              v_boundary,
+    const T                                    quality_thr)
+{
+    using namespace rxmesh;
+    auto block = cooperative_groups::this_thread_block();
+
+    ShmemAllocator shrd_alloc;
+    CavityManager<blockThreads, CavityOp::EV> cavity(
+        block, context, shrd_alloc, true);
+
+    if (cavity.patch_id() == INVALID32) return;
+
+    uint32_t shmem_before = shrd_alloc.get_allocated_size_bytes();
+
+    // Per-vertex info for atomicCAS conflict resolution
+    uint16_t* v_info =
+        shrd_alloc.alloc<uint16_t>(2 * cavity.patch_info().vertices_capacity);
+    fill_n<blockThreads>(
+        v_info, 2 * cavity.patch_info().vertices_capacity, uint16_t(INVALID16));
+
+    Bitmask e_collapse(cavity.patch_info().edges_capacity, shrd_alloc);
+    e_collapse.reset(block);
+    block.sync();
+
+    // Mark edges for collapse based on face quality
+    auto should_collapse = [&](const EdgeHandle& eh, const VertexIterator& iter) {
+        if (edge_status(eh) != UNSEEN) return;
+        assert(iter.size() == 4);
+
+        const VertexHandle v0 = iter[0], v1 = iter[2];  // edge endpoints
+        const VertexHandle v2 = iter[1], v3 = iter[3];  // opposite vertices
+
+        if (!v0.is_valid() || !v1.is_valid() || !v2.is_valid()) return;
+        if (v0 == v1 || v0 == v2 || v1 == v2) return;
+
+        const vec3<T> p0 = coords.to_glm<3>(v0);
+        const vec3<T> p1 = coords.to_glm<3>(v1);
+        const vec3<T> p2 = coords.to_glm<3>(v2);
+
+        // Compute QualityRadii for face (v0, v1, v2)
+        auto compute_qr = [](const vec3<T>& a, const vec3<T>& b, const vec3<T>& c) -> T {
+            T ea = glm::length(b - a);
+            T eb = glm::length(c - b);
+            T ec = glm::length(a - c);
+            T area = glm::length(glm::cross(b - a, c - a)) * T(0.5);
+            T denom = ea * eb * ec * (ea + eb + ec);
+            return (denom > T(1e-20)) ? (T(8) * area * area) / denom : T(0);
+        };
+
+        T q0 = compute_qr(p0, p1, p2);
+        bool bad = (q0 <= quality_thr);
+
+        // Check second face if it exists
+        if (!bad && v3.is_valid() && v3 != v0 && v3 != v1 && v3 != v2) {
+            const vec3<T> p3 = coords.to_glm<3>(v3);
+            T q1 = compute_qr(p0, p1, p3);
+            bad = (q1 <= quality_thr);
+        }
+
+        if (bad) {
+            const uint16_t c0(iter.local(0)), c1(iter.local(2));
+            uint16_t ret = ::atomicCAS(v_info + 2 * c0, INVALID16, c1);
+            if (ret == INVALID16) {
+                v_info[2 * c0 + 1] = eh.local_id();
+                e_collapse.set(eh.local_id(), true);
+            } else {
+                ret = ::atomicCAS(v_info + 2 * c1, INVALID16, c0);
+                if (ret == INVALID16) {
+                    v_info[2 * c1 + 1] = eh.local_id();
+                    e_collapse.set(eh.local_id(), true);
+                }
+            }
+        }
+    };
+
+    Query<blockThreads> query(context, cavity.patch_id());
+    query.dispatch<Op::EVDiamond>(block, shrd_alloc, should_collapse);
+    block.sync();
+
+    // One-per-face: keep only shortest marked edge per face
+    for_each_face(cavity.patch_info(), [&](FaceHandle fh) {
+        uint16_t e0 = cavity.patch_info().fe[3 * fh.local_id() + 0].id;
+        uint16_t e1 = cavity.patch_info().fe[3 * fh.local_id() + 1].id;
+        uint16_t e2 = cavity.patch_info().fe[3 * fh.local_id() + 2].id;
+        int count = (e_collapse(e0) ? 1 : 0) + (e_collapse(e1) ? 1 : 0) +
+                    (e_collapse(e2) ? 1 : 0);
+        if (count <= 1) return;
+
+        auto get_len_sq = [&](uint16_t eid) -> T {
+            if (eid >= cavity.patch_info().edges_capacity)
+                return std::numeric_limits<T>::max();
+            const uint16_t va = cavity.patch_info().ev[2 * eid].id;
+            const uint16_t vb = cavity.patch_info().ev[2 * eid + 1].id;
+            if (va >= cavity.patch_info().vertices_capacity ||
+                vb >= cavity.patch_info().vertices_capacity)
+                return std::numeric_limits<T>::max();
+            return glm::distance2(
+                coords.to_glm<3>(VertexHandle(cavity.patch_id(), va)),
+                coords.to_glm<3>(VertexHandle(cavity.patch_id(), vb)));
+        };
+
+        T len0 = e_collapse(e0) ? get_len_sq(e0) : std::numeric_limits<T>::max();
+        T len1 = e_collapse(e1) ? get_len_sq(e1) : std::numeric_limits<T>::max();
+        T len2 = e_collapse(e2) ? get_len_sq(e2) : std::numeric_limits<T>::max();
+
+        if (len0 <= len1 && len0 <= len2) {
+            if (e_collapse(e1)) e_collapse.reset(e1, true);
+            if (e_collapse(e2)) e_collapse.reset(e2, true);
+        } else if (len1 <= len0 && len1 <= len2) {
+            if (e_collapse(e0)) e_collapse.reset(e0, true);
+            if (e_collapse(e2)) e_collapse.reset(e2, true);
+        } else {
+            if (e_collapse(e0)) e_collapse.reset(e0, true);
+            if (e_collapse(e1)) e_collapse.reset(e1, true);
+        }
+    });
+    block.sync();
+
+    // Create cavities
+    for_each_edge(cavity.patch_info(), [&](EdgeHandle eh) {
+        if (e_collapse(eh.local_id())) {
+            cavity.create(eh);
+        } else {
+            edge_status(eh) = SKIP;
+        }
+    });
+    block.sync();
+
+    shrd_alloc.dealloc(shrd_alloc.get_allocated_size_bytes() - shmem_before);
+
+    if (cavity.prologue(block, shrd_alloc, coords, edge_status, v_boundary)) {
+        cavity.for_each_cavity(block, [&](uint16_t c, uint16_t size) {
+            const EdgeHandle src = cavity.template get_creator<EdgeHandle>(c);
+            VertexHandle v0, v1;
+            cavity.get_vertices(src, v0, v1);
+
+            const vec3<T> new_p = (coords.to_glm<3>(v0) + coords.to_glm<3>(v1)) * T(0.5);
+
+            const VertexHandle new_v = cavity.add_vertex();
+            if (new_v.is_valid()) {
+                coords(new_v, 0) = new_p[0];
+                coords(new_v, 1) = new_p[1];
+                coords(new_v, 2) = new_p[2];
+
+                DEdgeHandle e0 = cavity.add_edge(new_v, cavity.get_cavity_vertex(c, 0));
+                if (e0.is_valid()) {
+                    const DEdgeHandle e_init = e0;
+                    for (uint16_t i = 0; i < size; ++i) {
+                        const DEdgeHandle e = cavity.get_cavity_edge(c, i);
+                        const DEdgeHandle e1 =
+                            (i == size - 1) ?
+                                e_init.get_flip_dedge() :
+                                cavity.add_edge(cavity.get_cavity_vertex(c, i + 1), new_v);
+                        if (!e1.is_valid()) break;
+                        const FaceHandle new_f = cavity.add_face(e0, e, e1);
+                        if (!new_f.is_valid()) break;
+                        e0 = e1.get_flip_dedge();
+                    }
+                }
+            }
+        });
+    }
+    cavity.epilogue(block);
+    block.sync();
+}
+
+// Wrapper: run micro-collapse passes to remove degenerate faces
+template <typename T>
+inline void gpu_micro_collapse(
+    rxmesh::RXMeshDynamic&             rx,
+    rxmesh::VertexAttribute<T>*        coords,
+    rxmesh::EdgeAttribute<EdgeStatus>* edge_status,
+    rxmesh::VertexAttribute<bool>*     v_boundary,
+    T                                  quality_thr,
+    rxmesh::Timers<rxmesh::GPUTimer>&  timers,
+    int*                               d_buffer,
+    bool                               verbose = false)
+{
+    using namespace rxmesh;
+    constexpr uint32_t blockThreads = 256;
+
+    LaunchBox<blockThreads> lb;
+    rx.update_launch_box({Op::EVDiamond, Op::VV}, lb,
+        (void*)micro_collapse_kernel<T, blockThreads>,
+        true, false, false, false,
+        [&](uint32_t v, uint32_t e, uint32_t f) {
+            return detail::mask_num_bytes(e) +
+                   2 * v * sizeof(uint16_t) +
+                   2 * ShmemAllocator::default_alignment;
+        });
+
+    int total_removed = 0;
+    for (int pass = 0; pass < 5; pass++) {
+        edge_status->reset(UNSEEN, DEVICE);
+        uint32_t pre_v = rx.get_num_vertices(true);
+
+        rx.reset_scheduler();
+        while (!rx.is_queue_empty()) {
+            micro_collapse_kernel<T, blockThreads>
+                <<<lb.blocks, lb.num_threads, lb.smem_bytes_dyn>>>(
+                    rx.get_context(), *coords, *edge_status, *v_boundary,
+                    quality_thr);
+            rx.cleanup();
+            rx.slice_patches(*coords, *edge_status, *v_boundary);
+            rx.cleanup();
+        }
+
+        uint32_t post_v = rx.get_num_vertices(true);
+        int removed = pre_v - post_v;
+        total_removed += removed;
+        if (verbose && removed > 0)
+            fprintf(stderr, "    [gpu micro-collapse] pass %d: V %u → %u (-%d)\n",
+                    pass, pre_v, post_v, removed);
+        if (removed == 0) break;
+    }
+    if (verbose)
+        fprintf(stderr, "    [gpu micro-collapse] total removed: %d vertices\n",
+                total_removed);
+}
+
+
 template <typename T>
 inline void feature_equalize_valences(
     rxmesh::RXMeshDynamic&                 rx,
@@ -1246,7 +1533,8 @@ inline void feature_equalize_valences(
     rxmesh::VertexAttribute<int>*          vertex_is_feature,
     rxmesh::VertexAttribute<T>*            sizing,
     rxmesh::Timers<rxmesh::GPUTimer>&      timers,
-    int*                                   d_buffer)
+    int*                                   d_buffer,
+    T                                      flip_normal_thr = T(0.996))
 {
     using namespace rxmesh;
     constexpr uint32_t blockThreads = 256;
@@ -1287,7 +1575,7 @@ inline void feature_equalize_valences(
             feature_edge_flip<T, blockThreads>
                 <<<lb.blocks, lb.num_threads, lb.smem_bytes_dyn>>>(
                     rx.get_context(), *coords, *v_valence, *edge_status,
-                    *edge_is_feature, d_buffer);
+                    *edge_is_feature, d_buffer, flip_normal_thr);
             timers.stop("Flip");
 
             timers.start("FlipCleanup");

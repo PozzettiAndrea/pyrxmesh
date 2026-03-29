@@ -70,13 +70,54 @@ def compute_mesh_quality(mesh, input_mesh=None, label=""):
         "val_mode": val_hist.most_common(1)[0],
     }
 
-    # Distance to original mesh
+    # Surface distance: sampling-based bidirectional Hausdorff
     if input_mesh is not None:
-        closest = input_mesh.find_closest_cell(mesh.points)
-        closest_pts = input_mesh.cell_centers().points[closest]
-        dists = np.linalg.norm(mesh.points - closest_pts, axis=1)
-        metrics["dist_avg"] = float(dists.mean())
-        metrics["dist_max"] = float(dists.max())
+        try:
+            import vtk
+
+            # Sample random points on triangle surfaces (area-weighted)
+            def sample_surface(m, n=10000):
+                faces_arr = m.faces.reshape(-1, 4)[:, 1:]
+                pts = m.points
+                # Compute triangle areas for weighted sampling
+                v0 = pts[faces_arr[:, 0]]
+                v1 = pts[faces_arr[:, 1]]
+                v2 = pts[faces_arr[:, 2]]
+                areas = 0.5 * np.linalg.norm(np.cross(v1 - v0, v2 - v0), axis=1)
+                probs = areas / areas.sum()
+                # Sample triangles by area, then random barycentric coords
+                tri_idx = np.random.choice(len(faces_arr), size=n, p=probs)
+                r1 = np.sqrt(np.random.rand(n))
+                r2 = np.random.rand(n)
+                a = 1 - r1
+                b = r1 * (1 - r2)
+                c = r1 * r2
+                sampled = (a[:, None] * pts[faces_arr[tri_idx, 0]] +
+                           b[:, None] * pts[faces_arr[tri_idx, 1]] +
+                           c[:, None] * pts[faces_arr[tri_idx, 2]])
+                return sampled
+
+            N = 10000
+            result_samples = sample_surface(mesh, N)
+            input_samples = sample_surface(input_mesh, N)
+
+            # Forward: result surface → original surface
+            _, fwd_closest = input_mesh.find_closest_cell(result_samples, return_closest_point=True)
+            fwd_dists = np.linalg.norm(result_samples - fwd_closest, axis=1)
+
+            # Backward: original surface → result surface
+            _, bwd_closest = mesh.find_closest_cell(input_samples, return_closest_point=True)
+            bwd_dists = np.linalg.norm(input_samples - bwd_closest, axis=1)
+
+            metrics["dist_avg"] = float(max(fwd_dists.mean(), bwd_dists.mean()))
+            metrics["dist_max"] = float(max(fwd_dists.max(), bwd_dists.max()))
+            metrics["dist_fwd_avg"] = float(fwd_dists.mean())
+            metrics["dist_fwd_max"] = float(fwd_dists.max())
+            metrics["dist_bwd_avg"] = float(bwd_dists.mean())
+            metrics["dist_bwd_max"] = float(bwd_dists.max())
+        except Exception as e:
+            metrics["dist_avg"] = 0.0
+            metrics["dist_max"] = 0.0
 
     return metrics
 
@@ -110,7 +151,7 @@ def attach_metrics_to_demos(demos, input_mesh):
     print(" done.")
 
 
-def gen_quadwild(dragon_v, dragon_f, stop_after=None):
+def gen_quadwild(dragon_v, dragon_f, stop_after=None, iterations=15, flip_threshold=0.996, compare=False):
     """Generate QuadWild pipeline 3-column comparison: cpu_orig, cpu_ours, gpu.
 
     Each pipeline column is truly sequential -- step N output feeds step N+1.
@@ -151,8 +192,8 @@ def gen_quadwild(dragon_v, dragon_f, stop_after=None):
                 feat_pairs.append([v0, v1])
         n_feat = len(feat_pairs)
 
-        print(f"    GPU features: {len(verts)}V, {nE}E, {n}F, "
-              f"{n_feat} feature edges (reported: {feature_data.num_feature_edges})")
+        print(f"      {len(verts)}V, {nE}E, {n}F, "
+              f"{n_feat} feature edges")
 
         subtitle = f"{len(verts):,}V  {nE:,}E  {n:,}F  |  {n_feat} feature edges"
 
@@ -168,9 +209,8 @@ def gen_quadwild(dragon_v, dragon_f, stop_after=None):
 
         pl = pv.Plotter(off_screen=True, window_size=(800, 600))
         pl.add_mesh(mesh, color=MESH_COLOR_IN,
-                    show_edges=True, edge_color=EDGE_COLOR, line_width=0.3,
-                    lighting=True, smooth_shading=True,
-                    opacity=0.85 if feat_pairs else 1.0)
+                    show_edges=True, edge_color=EDGE_COLOR, line_width=0.5,
+                    lighting=True, smooth_shading=True)
         if feat_pairs:
             ea = np.array(feat_pairs)
             lines = np.column_stack([np.full(len(ea), 2), ea]).ravel()
@@ -370,14 +410,14 @@ def gen_quadwild(dragon_v, dragon_f, stop_after=None):
             if "remesh_isotropic" in steps:
                 v, f = pyrxmesh.feature_remesh(v, f,
                     relative_len=el.target_edge_length / el.avg_edge_length,
-                    iterations=1, crease_angle_deg=35.0, max_passes=1, verbose=False)
+                    iterations={iterations}, crease_angle_deg=35.0, flip_normal_thr={flip_threshold}, verbose=False)
             if "micro" in steps:
                 v, f = pyrxmesh.vcg_micro_collapse(v, f, verbose=False)
                 pyrxmesh.detect_features(v, f, crease_angle_deg=35.0, erode_dilate_steps=0)
             if "remesh_adaptive" in steps:
                 v, f = pyrxmesh.feature_remesh(v, f,
                     relative_len=el.target_edge_length / el.avg_edge_length,
-                    iterations=1, crease_angle_deg=35.0, max_passes=1, verbose=False)
+                    iterations={iterations}, crease_angle_deg=35.0, flip_normal_thr={flip_threshold}, verbose=False)
             if "clean" in steps:
                 v, f = pyrxmesh.vcg_clean_mesh(v, f, verbose=False)
             if "refine" in steps:
@@ -385,13 +425,20 @@ def gen_quadwild(dragon_v, dragon_f, stop_after=None):
 
             t_total = time.time() - t0
 
+            # Detect features on final mesh for rendering
+            fd_final = pyrxmesh.detect_features(v, f, crease_angle_deg=35.0, erode_dilate_steps=0)
+
             # Save result
             import pyvista as pv
             n = len(f)
             pv_f = np.column_stack([np.full(n, 3, dtype=np.int32), f]).ravel()
             m = pv.PolyData(v, pv_f)
             m.save("{out_vtk}")
-            json.dump({{"elapsed": t_total, "V": len(v), "F": len(f)}},
+            # Save feature arrays
+            np.save("{out_vtk}".replace(".vtk", "_edge_feat.npy"), fd_final.edge_is_feature)
+            np.save("{out_vtk}".replace(".vtk", "_vert_feat.npy"), fd_final.vertex_is_feature)
+            json.dump({{"elapsed": t_total, "V": len(v), "F": len(f),
+                        "num_feature_edges": int(fd_final.num_feature_edges)}},
                       open("{out_json}", "w"))
         """)
 
@@ -402,11 +449,33 @@ def gen_quadwild(dragon_v, dragon_f, stop_after=None):
             t_total = info["elapsed"]
             nv, nf = info["V"], info["F"]
 
-            # Render the result
+            # Render with features if available
             name = f"qw_fast_{up_to}"
-            m = pv.read(out_vtk)
-            render_mesh(m, os.path.join(OUT_DIR, f"{name}.png"),
-                        f"GPU fast: {nv:,}V {nf:,}F")
+            png_path = os.path.join(OUT_DIR, f"{name}.png")
+            edge_feat_path = out_vtk.replace(".vtk", "_edge_feat.npy")
+            vert_feat_path = out_vtk.replace(".vtk", "_vert_feat.npy")
+
+            if os.path.exists(edge_feat_path) and os.path.exists(vert_feat_path):
+                m = pv.read(out_vtk)
+                fast_v = np.array(m.points, dtype=np.float64)
+                fast_f = np.array(m.faces.reshape(-1, 4)[:, 1:], dtype=np.int32)
+                # Build a minimal feat_data-like object
+                class _FeatData:
+                    pass
+                fd = _FeatData()
+                fd.edge_is_feature = np.load(edge_feat_path)
+                fd.vertex_is_feature = np.load(vert_feat_path)
+                fd.num_feature_edges = info.get("num_feature_edges", 0)
+                # Render to tmp then copy (render_gpu_features saves VTK with _after suffix)
+                tmp_png = os.path.join(OUT_DIR, f"{name}_feat.png")
+                render_gpu_features(fast_v, fast_f, fd, tmp_png,
+                                    f"GPU fast: {nv:,}V {nf:,}F")
+                shutil.copy2(tmp_png, png_path)
+                os.remove(edge_feat_path)
+                os.remove(vert_feat_path)
+            else:
+                m = pv.read(out_vtk)
+                render_mesh(m, png_path, f"GPU fast: {nv:,}V {nf:,}F")
 
             qw_all.append({
                 "name": name, "side": "gpu_fast",
@@ -456,198 +525,172 @@ def gen_quadwild(dragon_v, dragon_f, stop_after=None):
         return order.index(step_name) <= order.index(stop_after)
 
     # ── Pipeline 1: CPU original (QuadWild binary) ─────────────────────
-    print("\n  [1/4] Running CPU original (QuadWild binary)...")
-    qw_result = pyrxmesh.quadwild_pipeline(
-        os.path.join(RXMESH_INPUT, "dragon.obj"),
-        output_dir="/tmp/qw_demo_full",
-        steps=3,
-    )
-    ckpts = qw_result.get("checkpoints", {})
+    run_cpu = compare  # only run CPU pipelines in --compare mode
 
-    # Render all available checkpoints as cpu_orig demos
-    ckpt_steps = [
-        ("step_1_0_input", "Input"),
-        ("step_1_1a_features_raw", "Raw Features"),
-        ("step_1_1b_features_eroded", "Erode/Dilate"),
-        # QuadWild's remeshed = after both passes (iso+micro+adaptive)
-        ("step_1_2_remeshed", "Adaptive Remesh"),
-        ("step_1_3_cleaned", "Clean"),
-        ("step_1_4_refined", "Refine"),
-    ]
-    for ckpt_key, step_name in ckpt_steps:
-        if ckpt_key in ckpts:
-            label = "Full remesh (iso+micro+adaptive)" if ckpt_key == "step_1_2_remeshed" else ""
-            qw_all.append(make_demo_from_checkpoint(
-                f"qw_orig_{ckpt_key}", "cpu_orig", step_name,
-                ckpts[ckpt_key], label=label))
-            print(f"    {step_name}")
+    if not run_cpu:
+        print("\n  [GPU-only mode. Use --compare for all 4 pipelines]")
 
-    # Cross field, trace, quad (cpu_orig only — only if running full pipeline)
-    if stop_after is None:
-        if "step_1_4_refined" in ckpts and "step_1_5_field" in ckpts:
-            print("    Cross Field")
-            ac = ckpts["step_1_5_field"]
-            ac_mesh = pv.read(ac["obj"])
-            png_path = os.path.join(OUT_DIR, "qw_orig_field.png")
-            vtk_path = os.path.join(OUT_DIR, "qw_orig_field_after.vtk")
-            if ac.get("rosy"):
-                render_crossfield(ac["obj"], ac["rosy"], png_path,
-                                  f"Cross Field: {ac_mesh.n_points:,}V")
-            else:
-                render_with_features(ac["obj"], ac.get("sharp"), png_path,
-                                     f"Cross Field: {ac_mesh.n_points:,}V")
-            ac_mesh.save(vtk_path)
-            qw_all.append({
-                "name": "qw_orig_field", "side": "cpu_orig",
-                "step_name": "Cross Field", "elapsed": 0,
-                "after_label": f"Cross Field ({ac_mesh.n_points:,}V)",
-            })
+    if run_cpu:
+        print("\n  [1/4] Running CPU original (QuadWild binary)...")
+        qw_result = pyrxmesh.quadwild_pipeline(
+            os.path.join(RXMESH_INPUT, "dragon.obj"),
+            output_dir="/tmp/qw_demo_full",
+            steps=3,
+        )
+        ckpts = qw_result.get("checkpoints", {})
 
-        if qw_result.get("traced") and "step_1_5_field" in ckpts:
-            print("    Trace")
-            traced = pv.read(qw_result["traced"])
-            png_path = os.path.join(OUT_DIR, "qw_orig_traced.png")
-            vtk_path = os.path.join(OUT_DIR, "qw_orig_traced_after.vtk")
-            pl = pv.Plotter(off_screen=True, window_size=(800, 600))
-            pl.add_mesh(traced, color=MESH_COLOR_OUT,
-                        show_edges=True, edge_color=EDGE_COLOR, line_width=0.5,
-                        lighting=True, smooth_shading=True)
-            pl.add_text(f"Traced: {traced.n_points:,}V, {traced.n_cells:,}F",
-                        position="upper_left", font_size=12, color=TEXT_COLOR)
-            pl.set_background(BG_COLOR)
-            pl.camera_position = "iso"
-            pl.screenshot(png_path, transparent_background=False)
-            pl.close()
-            traced.save(vtk_path)
-            qw_all.append({
-                "name": "qw_orig_traced", "side": "cpu_orig",
-                "step_name": "Trace", "elapsed": 0,
-                "after_label": f"Traced: {traced.n_points:,}V {traced.n_cells:,}F",
-            })
+        # Render all available checkpoints as cpu_orig demos
+        ckpt_steps = [
+            ("step_1_0_input", "Input"),
+            ("step_1_1a_features_raw", "Raw Features"),
+            ("step_1_1b_features_eroded", "Erode/Dilate"),
+            # QuadWild's remeshed = after both passes (iso+micro+adaptive)
+            ("step_1_2_remeshed", "Adaptive Remesh"),
+            ("step_1_3_cleaned", "Clean"),
+            ("step_1_4_refined", "Refine"),
+        ]
+        for ckpt_key, step_name in ckpt_steps:
+            if ckpt_key in ckpts:
+                label = "Full remesh (iso+micro+adaptive)" if ckpt_key == "step_1_2_remeshed" else ""
+                qw_all.append(make_demo_from_checkpoint(
+                    f"qw_orig_{ckpt_key}", "cpu_orig", step_name,
+                    ckpts[ckpt_key], label=label))
+                print(f"    {step_name}")
 
-        if qw_result.get("quad_smooth"):
-            print("    Quad Output")
-            quad = pv.read(qw_result["quad_smooth"])
-            png_path = os.path.join(OUT_DIR, "qw_orig_quad.png")
-            vtk_path = os.path.join(OUT_DIR, "qw_orig_quad_after.vtk")
-            pl = pv.Plotter(off_screen=True, window_size=(800, 600))
-            pl.add_mesh(quad, color=MESH_COLOR_OUT,
-                        show_edges=True, edge_color=EDGE_COLOR, line_width=0.5,
-                        lighting=True, smooth_shading=True)
-            pl.add_text(f"Quad: {quad.n_points:,}V, {quad.n_cells:,} quads",
-                        position="upper_left", font_size=12, color=TEXT_COLOR)
-            pl.set_background(BG_COLOR)
-            pl.camera_position = "iso"
-            pl.screenshot(png_path, transparent_background=False)
-            pl.close()
-            quad.save(vtk_path)
-            qw_all.append({
-                "name": "qw_orig_quad", "side": "cpu_orig",
-                "step_name": "Quad Output", "elapsed": 0,
-                "after_label": f"Quad: {quad.n_points:,}V {quad.n_cells:,} quads",
-            })
+        # Cross field, trace, quad (cpu_orig only — only if running full pipeline)
+        if stop_after is None:
+            if "step_1_4_refined" in ckpts and "step_1_5_field" in ckpts:
+                print("    Cross Field")
+                ac = ckpts["step_1_5_field"]
+                ac_mesh = pv.read(ac["obj"])
+                png_path = os.path.join(OUT_DIR, "qw_orig_field.png")
+                vtk_path = os.path.join(OUT_DIR, "qw_orig_field_after.vtk")
+                if ac.get("rosy"):
+                    render_crossfield(ac["obj"], ac["rosy"], png_path,
+                                      f"Cross Field: {ac_mesh.n_points:,}V")
+                else:
+                    render_with_features(ac["obj"], ac.get("sharp"), png_path,
+                                         f"Cross Field: {ac_mesh.n_points:,}V")
+                ac_mesh.save(vtk_path)
+                qw_all.append({
+                    "name": "qw_orig_field", "side": "cpu_orig",
+                    "step_name": "Cross Field", "elapsed": 0,
+                    "after_label": f"Cross Field ({ac_mesh.n_points:,}V)",
+                })
+
+            if qw_result.get("traced") and "step_1_5_field" in ckpts:
+                print("    Trace")
+                traced = pv.read(qw_result["traced"])
+                png_path = os.path.join(OUT_DIR, "qw_orig_traced.png")
+                vtk_path = os.path.join(OUT_DIR, "qw_orig_traced_after.vtk")
+                pl = pv.Plotter(off_screen=True, window_size=(800, 600))
+                pl.add_mesh(traced, color=MESH_COLOR_OUT,
+                            show_edges=True, edge_color=EDGE_COLOR, line_width=0.5,
+                            lighting=True, smooth_shading=True)
+                pl.add_text(f"Traced: {traced.n_points:,}V, {traced.n_cells:,}F",
+                            position="upper_left", font_size=12, color=TEXT_COLOR)
+                pl.set_background(BG_COLOR)
+                pl.camera_position = "iso"
+                pl.screenshot(png_path, transparent_background=False)
+                pl.close()
+                traced.save(vtk_path)
+                qw_all.append({
+                    "name": "qw_orig_traced", "side": "cpu_orig",
+                    "step_name": "Trace", "elapsed": 0,
+                    "after_label": f"Traced: {traced.n_points:,}V {traced.n_cells:,}F",
+                })
+
+            if qw_result.get("quad_smooth"):
+                print("    Quad Output")
+                quad = pv.read(qw_result["quad_smooth"])
+                png_path = os.path.join(OUT_DIR, "qw_orig_quad.png")
+                vtk_path = os.path.join(OUT_DIR, "qw_orig_quad_after.vtk")
+                pl = pv.Plotter(off_screen=True, window_size=(800, 600))
+                pl.add_mesh(quad, color=MESH_COLOR_OUT,
+                            show_edges=True, edge_color=EDGE_COLOR, line_width=0.5,
+                            lighting=True, smooth_shading=True)
+                pl.add_text(f"Quad: {quad.n_points:,}V, {quad.n_cells:,} quads",
+                            position="upper_left", font_size=12, color=TEXT_COLOR)
+                pl.set_background(BG_COLOR)
+                pl.camera_position = "iso"
+                pl.screenshot(png_path, transparent_background=False)
+                pl.close()
+                quad.save(vtk_path)
+                qw_all.append({
+                    "name": "qw_orig_quad", "side": "cpu_orig",
+                    "step_name": "Quad Output", "elapsed": 0,
+                    "after_label": f"Quad: {quad.n_points:,}V {quad.n_cells:,} quads",
+                })
 
     # ── Pipeline 2: CPU ours ───────────────────────────────────────────
-    print("  [2/4] Running CPU ours...")
-    ours_v, ours_f = dragon_v.copy(), dragon_f.copy()
-
-    # Input
-    print("    input...", end="", flush=True)
-    qw_all.append(make_demo("qw_ours_input", "cpu_ours", "Input",
-                            ours_v, ours_f, label="Input"))
-
-    # Raw Features
-    if should_run("features"):
-        print(" features...", end="", flush=True)
-        t0 = time.time()
-        fd = pyrxmesh.detect_features(ours_v, ours_f,
-                                      crease_angle_deg=35.0,
-                                      erode_dilate_steps=0)
-        t_feat = time.time() - t0
-        qw_all.append(make_demo("qw_ours_features_raw", "cpu_ours",
-                                "Raw Features", ours_v, ours_f,
-                                elapsed=t_feat, feat_data=fd))
-
-    # Erode/Dilate
-    if should_run("erode"):
-        print(" erode...", end="", flush=True)
-        t0 = time.time()
-        fd = pyrxmesh.detect_features(ours_v, ours_f,
-                                      crease_angle_deg=35.0,
-                                      erode_dilate_steps=4)
-        t_erode = time.time() - t0
-        qw_all.append(make_demo("qw_ours_erode", "cpu_ours", "Erode/Dilate",
-                                ours_v, ours_f, elapsed=t_erode, feat_data=fd))
-
-    # Isotropic Remesh
-    if should_run("remesh_isotropic"):
-        print(" iso remesh...", end="", flush=True)
-        t0 = time.time()
-        ck = pyrxmesh.vcg_remesh_checkpoints(ours_v, ours_f,
-                                             target_faces=10000,
-                                             iterations=1, adaptive=False,
-                                             verbose=True)
-        ours_v, ours_f = ck["after_pass1"]
-        t_iso = time.time() - t0
-        qw_all.append(make_demo("qw_ours_iso", "cpu_ours", "Isotropic Remesh",
-                                ours_v, ours_f, elapsed=t_iso))
-
-    # Micro Collapse
-    if should_run("micro"):
-        print(" micro...", end="", flush=True)
-        t0 = time.time()
-        ours_v, ours_f = pyrxmesh.vcg_micro_collapse(ours_v, ours_f,
-                                                      verbose=True)
-        t_micro = time.time() - t0
-        qw_all.append(make_demo("qw_ours_micro", "cpu_ours", "Micro Collapse",
-                                ours_v, ours_f, elapsed=t_micro))
-
-    # Re-detect Features (part of micro step)
-    if should_run("micro"):
-        print(" re-detect...", end="", flush=True)
-        fd_re = pyrxmesh.detect_features(ours_v, ours_f,
-                                         crease_angle_deg=35.0,
-                                         erode_dilate_steps=0)
-        qw_all.append(make_demo("qw_ours_redetect", "cpu_ours",
-                                "Re-detect Features",
-                                ours_v, ours_f, feat_data=fd_re))
-
-    # Adaptive Remesh
-    if should_run("remesh_adaptive"):
-        print(" adaptive...", end="", flush=True)
-        t0 = time.time()
-        ours_v, ours_f = pyrxmesh.vcg_remesh(ours_v, ours_f,
-                                             target_faces=10000,
-                                             adaptive=True, verbose=True)
-        t_adapt = time.time() - t0
-        qw_all.append(make_demo("qw_ours_adaptive", "cpu_ours",
-                                "Adaptive Remesh", ours_v, ours_f,
-                                elapsed=t_adapt))
-
-    # Clean
-    if should_run("clean"):
-        print(" clean...", end="", flush=True)
-        t0 = time.time()
-        ours_v, ours_f = pyrxmesh.vcg_clean_mesh(ours_v, ours_f,
-                                                  verbose=True)
-        t_clean = time.time() - t0
-        qw_all.append(make_demo("qw_ours_clean", "cpu_ours", "Clean",
-                                ours_v, ours_f, elapsed=t_clean))
-
-    # Refine
-    if should_run("refine"):
-        print(" refine...", end="", flush=True)
-        t0 = time.time()
-        ours_v, ours_f = pyrxmesh.vcg_refine_if_needed(ours_v, ours_f,
-                                                        verbose=True)
-        t_refine = time.time() - t0
-        qw_all.append(make_demo("qw_ours_refine", "cpu_ours", "Refine",
-                                ours_v, ours_f, elapsed=t_refine))
-
-    print(" done.")
+    if run_cpu:
+        print("  [2/4] Running CPU ours...")
+        ours_v, ours_f = dragon_v.copy(), dragon_f.copy()
+        print("    input...", end="", flush=True)
+        qw_all.append(make_demo("qw_ours_input", "cpu_ours", "Input",
+                                ours_v, ours_f, label="Input"))
+        if should_run("features"):
+            print(" features...", end="", flush=True)
+            t0 = time.time()
+            fd = pyrxmesh.detect_features(ours_v, ours_f, crease_angle_deg=35.0, erode_dilate_steps=0)
+            t_feat = time.time() - t0
+            qw_all.append(make_demo("qw_ours_features_raw", "cpu_ours", "Raw Features",
+                                    ours_v, ours_f, elapsed=t_feat, feat_data=fd))
+        if should_run("erode"):
+            print(" erode...", end="", flush=True)
+            t0 = time.time()
+            fd = pyrxmesh.detect_features(ours_v, ours_f, crease_angle_deg=35.0, erode_dilate_steps=4)
+            t_erode = time.time() - t0
+            qw_all.append(make_demo("qw_ours_erode", "cpu_ours", "Erode/Dilate",
+                                    ours_v, ours_f, elapsed=t_erode, feat_data=fd))
+        if should_run("remesh_isotropic"):
+            print(" iso remesh...", end="", flush=True)
+            t0 = time.time()
+            ck = pyrxmesh.vcg_remesh_checkpoints(ours_v, ours_f, target_faces=10000,
+                                                 iterations=iterations, adaptive=False, verbose=True)
+            ours_v, ours_f = ck["after_pass1"]
+            t_iso = time.time() - t0
+            qw_all.append(make_demo("qw_ours_iso", "cpu_ours", "Isotropic Remesh",
+                                    ours_v, ours_f, elapsed=t_iso))
+        if should_run("micro"):
+            print(" micro...", end="", flush=True)
+            t0 = time.time()
+            ours_v, ours_f = pyrxmesh.vcg_micro_collapse(ours_v, ours_f, verbose=True)
+            t_micro = time.time() - t0
+            qw_all.append(make_demo("qw_ours_micro", "cpu_ours", "Micro Collapse",
+                                    ours_v, ours_f, elapsed=t_micro))
+        if should_run("micro"):
+            print(" re-detect...", end="", flush=True)
+            fd_re = pyrxmesh.detect_features(ours_v, ours_f, crease_angle_deg=35.0, erode_dilate_steps=0)
+            qw_all.append(make_demo("qw_ours_redetect", "cpu_ours", "Re-detect Features",
+                                    ours_v, ours_f, feat_data=fd_re))
+        if should_run("remesh_adaptive"):
+            print(" adaptive...", end="", flush=True)
+            t0 = time.time()
+            ours_v, ours_f = pyrxmesh.vcg_remesh_adaptive(ours_v, ours_f, target_faces=10000,
+                                                         iterations=iterations, verbose=True)
+            t_adapt = time.time() - t0
+            qw_all.append(make_demo("qw_ours_adaptive", "cpu_ours", "Adaptive Remesh",
+                                    ours_v, ours_f, elapsed=t_adapt))
+        if should_run("clean"):
+            print(" clean...", end="", flush=True)
+            t0 = time.time()
+            ours_v, ours_f = pyrxmesh.vcg_clean_mesh(ours_v, ours_f, verbose=True)
+            t_clean = time.time() - t0
+            qw_all.append(make_demo("qw_ours_clean", "cpu_ours", "Clean",
+                                    ours_v, ours_f, elapsed=t_clean))
+        if should_run("refine"):
+            print(" refine...", end="", flush=True)
+            t0 = time.time()
+            ours_v, ours_f = pyrxmesh.vcg_refine_if_needed(ours_v, ours_f, verbose=True)
+            t_refine = time.time() - t0
+            qw_all.append(make_demo("qw_ours_refine", "cpu_ours", "Refine",
+                                    ours_v, ours_f, elapsed=t_refine))
+        print(" done.")
 
     # ── Pipeline 3: GPU ────────────────────────────────────────────────
-    print("  [3/4] Running GPU...")
+    gpu_label = "[3/4]" if run_cpu else "[1/1]"
+    print(f"  {gpu_label} Running GPU...")
     gpu_v, gpu_f = dragon_v.copy(), dragon_f.copy()
     el_gpu = pyrxmesh.expected_edge_length(gpu_v, gpu_f, verbose=True)
 
@@ -684,22 +727,25 @@ def gen_quadwild(dragon_v, dragon_f, stop_after=None):
         t0 = time.time()
         gpu_v, gpu_f = pyrxmesh.feature_remesh(gpu_v, gpu_f,
             relative_len=el_gpu.target_edge_length / el_gpu.avg_edge_length,
-            iterations=1, crease_angle_deg=35.0, max_passes=1, verbose=True)
+            iterations=iterations, crease_angle_deg=35.0,
+            flip_normal_thr=flip_threshold, verbose=True)
         t_iso = time.time() - t0
         qw_all.append(make_demo("qw_gpu_iso", "gpu", "Isotropic Remesh",
                                 gpu_v, gpu_f, elapsed=t_iso))
 
-    # Micro Collapse
+    # Micro Collapse + Re-detect Features
+    # GPU: micro-cleanup already runs inside feature_remesh (1e-7 threshold).
+    # Skip separate CPU micro-collapse and GPU re-detect (which hangs due to
+    # CUDA context corruption after RXMeshDynamic destruction).
+    # Just re-render the isotropic output for these rows.
     if should_run("micro"):
         print(" micro...", end="", flush=True)
         t0 = time.time()
-        gpu_v, gpu_f = pyrxmesh.vcg_micro_collapse(gpu_v, gpu_f,
-                                                    verbose=True)
+        gpu_v, gpu_f = pyrxmesh.vcg_micro_collapse(gpu_v, gpu_f, verbose=True)
         t_micro = time.time() - t0
         qw_all.append(make_demo("qw_gpu_micro", "gpu", "Micro Collapse",
                                 gpu_v, gpu_f, elapsed=t_micro))
 
-    # Re-detect Features
     if should_run("micro"):
         print(" re-detect...", end="", flush=True)
         fd_re = pyrxmesh.detect_features(gpu_v, gpu_f,
@@ -731,7 +777,7 @@ def gen_quadwild(dragon_v, dragon_f, stop_after=None):
             t0 = time.time()
             rv, rf = pyrxmesh.feature_remesh(v, f,
                 relative_len=el.target_edge_length / el.avg_edge_length,
-                iterations=1, crease_angle_deg=35.0, max_passes=1, verbose=True)
+                iterations={iterations}, crease_angle_deg=35.0, flip_normal_thr={flip_threshold}, verbose=True)
             elapsed = time.time() - t0
             n = len(rf)
             pv_f = np.column_stack([np.full(n, 3, dtype=np.int32), rf]).ravel()
@@ -795,7 +841,7 @@ def gen_quadwild(dragon_v, dragon_f, stop_after=None):
                 None: "refine"}
     fast_up_to = fast_map.get(stop_after, stop_after or "refine")
 
-    return make_result("", fast_up_to=fast_up_to)
+    return make_result("", fast_up_to=fast_up_to if compare else None)
 
 
 
@@ -818,8 +864,18 @@ def main():
              "  erode   — features + erode/dilate only\n"
              "  remesh  — up to non-adaptive remesh\n"
              "  all     — full pipeline")
+    parser.add_argument("--iterations", type=int, default=15,
+        help="Number of isotropic remeshing iterations (default: 15, QuadWild default)")
+    parser.add_argument("--flip-threshold", type=float, default=0.996, dest="flip_threshold",
+        help="Flip normal cosine threshold (0.996=5°strict, 0.866=30°, 0.0=no check)")
     parser.add_argument("--list", action="store_true",
         help="List available steps and exit.")
+    parser.add_argument("--cs", action="store_true",
+        help="Run GPU-only pipeline under compute-sanitizer (no CPU steps, no rendering).")
+    parser.add_argument("--gdb", action="store_true",
+        help="Run GPU-only pipeline under cuda-gdb (no CPU steps, no rendering).")
+    parser.add_argument("--compare", action="store_true",
+        help="Run all 4 pipelines (cpu_orig, cpu_ours, gpu, gpu_fast). Default: GPU only.")
 
     args = parser.parse_args()
 
@@ -835,6 +891,129 @@ def main():
         print("\nError: specify --only {erode,remesh,all}")
         sys.exit(1)
 
+    if args.cs:
+        # GPU-only pipeline under compute-sanitizer — no CPU steps, no rendering
+        import subprocess, textwrap
+        iters = args.iterations
+        flip_threshold = args.flip_threshold
+        stop = args.only if args.only != "all" else None
+        steps = ["features", "erode", "remesh_isotropic", "micro",
+                 "remesh_adaptive", "clean", "refine"]
+        if stop and stop in steps:
+            steps = steps[:steps.index(stop) + 1]
+        script = textwrap.dedent(f"""\
+            import pyrxmesh, time
+            pyrxmesh.init()
+            v, f = pyrxmesh.load_obj("{os.path.join(RXMESH_INPUT, 'dragon.obj')}")
+            print(f"  loaded: {{len(v)}}V {{len(f)}}F")
+
+            steps = {repr(steps)}
+            print(f"  steps: {{steps}}")
+
+            fd = pyrxmesh.detect_features(v, f, crease_angle_deg=35.0, erode_dilate_steps=4)
+            el = pyrxmesh.expected_edge_length(v, f)
+            print(f"  features: {{fd.num_feature_edges}}, target_edge={{el.target_edge_length:.6f}}")
+
+            if "remesh_isotropic" in steps:
+                print("  running feature_remesh (isotropic)...")
+                v, f = pyrxmesh.feature_remesh(v, f,
+                    relative_len=el.target_edge_length / el.avg_edge_length,
+                    iterations={iters}, crease_angle_deg=35.0, flip_normal_thr={flip_threshold}, verbose=True)
+                print(f"  after iso: {{len(v)}}V {{len(f)}}F")
+
+            if "micro" in steps:
+                print("  running vcg_micro_collapse...")
+                v, f = pyrxmesh.vcg_micro_collapse(v, f, verbose=True)
+                print(f"  after micro: {{len(v)}}V {{len(f)}}F")
+                fd2 = pyrxmesh.detect_features(v, f, crease_angle_deg=35.0, erode_dilate_steps=0)
+                print(f"  re-detected: {{fd2.num_feature_edges}} features")
+
+            if "remesh_adaptive" in steps:
+                print("  running feature_remesh (adaptive)...")
+                v, f = pyrxmesh.feature_remesh(v, f,
+                    relative_len=el.target_edge_length / el.avg_edge_length,
+                    iterations={iters}, crease_angle_deg=35.0, flip_normal_thr={flip_threshold}, verbose=True)
+                print(f"  after adaptive: {{len(v)}}V {{len(f)}}F")
+
+            print("  done!")
+        """)
+        log_path = os.path.join(RUNS_DIR, f"cs_{args.only}_{iters}.log")
+        os.makedirs(RUNS_DIR, exist_ok=True)
+        print(f"Running compute-sanitizer (steps={steps}, iterations={iters})...")
+        print(f"  log → {log_path}")
+        with open(log_path, "w") as log:
+            proc = subprocess.run(
+                ["compute-sanitizer", "--tool", "memcheck",
+                 sys.executable, "-c", script],
+                stdout=log, stderr=subprocess.STDOUT,
+                text=True, timeout=600)
+        print(f"  exit code: {proc.returncode}")
+        # Print summary from log
+        with open(log_path) as f:
+            for line in f:
+                if "ERROR SUMMARY" in line or "Invalid" in line or "error" in line.lower():
+                    print(f"  {line.rstrip()}")
+        print(f"  full log: {log_path}")
+        sys.exit(proc.returncode)
+
+    if args.gdb:
+        # GPU-only pipeline under cuda-gdb
+        import subprocess, textwrap
+        iters = args.iterations
+        flip_threshold = args.flip_threshold
+        stop = args.only if args.only != "all" else None
+        steps = ["features", "erode", "remesh_isotropic", "micro",
+                 "remesh_adaptive", "clean", "refine"]
+        if stop and stop in steps:
+            steps = steps[:steps.index(stop) + 1]
+        script_path = os.path.join(RUNS_DIR, "gdb_gpu_only.py")
+        os.makedirs(RUNS_DIR, exist_ok=True)
+        script = textwrap.dedent(f"""\
+            import pyrxmesh, time
+            pyrxmesh.init()
+            v, f = pyrxmesh.load_obj("{os.path.join(RXMESH_INPUT, 'dragon.obj')}")
+            print(f"  loaded: {{len(v)}}V {{len(f)}}F")
+
+            steps = {repr(steps)}
+            print(f"  steps: {{steps}}")
+
+            fd = pyrxmesh.detect_features(v, f, crease_angle_deg=35.0, erode_dilate_steps=4)
+            el = pyrxmesh.expected_edge_length(v, f)
+            print(f"  features: {{fd.num_feature_edges}}, target_edge={{el.target_edge_length:.6f}}")
+
+            if "remesh_isotropic" in steps:
+                print("  running feature_remesh (isotropic)...")
+                v, f = pyrxmesh.feature_remesh(v, f,
+                    relative_len=el.target_edge_length / el.avg_edge_length,
+                    iterations={iters}, crease_angle_deg=35.0, flip_normal_thr={flip_threshold}, verbose=True)
+                print(f"  after iso: {{len(v)}}V {{len(f)}}F")
+
+            if "micro" in steps:
+                print("  running vcg_micro_collapse...")
+                v, f = pyrxmesh.vcg_micro_collapse(v, f, verbose=True)
+                print(f"  after micro: {{len(v)}}V {{len(f)}}F")
+                fd2 = pyrxmesh.detect_features(v, f, crease_angle_deg=35.0, erode_dilate_steps=0)
+                print(f"  re-detected: {{fd2.num_feature_edges}} features")
+
+            if "remesh_adaptive" in steps:
+                print("  running feature_remesh (adaptive)...")
+                v, f = pyrxmesh.feature_remesh(v, f,
+                    relative_len=el.target_edge_length / el.avg_edge_length,
+                    iterations={iters}, crease_angle_deg=35.0, flip_normal_thr={flip_threshold}, verbose=True)
+                print(f"  after adaptive: {{len(v)}}V {{len(f)}}F")
+
+            print("  done!")
+        """)
+        with open(script_path, "w") as f:
+            f.write(script)
+        print(f"Running cuda-gdb (steps={steps}, iterations={iters})...")
+        print(f"  script: {script_path}")
+        print(f"  When it hangs, press Ctrl+C in gdb, then type:")
+        print(f"    info cuda threads")
+        print(f"    bt")
+        print()
+        os.execvp("cuda-gdb", ["cuda-gdb", "--args", sys.executable, script_path])
+
     tee = setup_logging()
 
     if os.path.exists(OUT_DIR):
@@ -849,8 +1028,10 @@ def main():
 
     stop = None if args.only == "all" else args.only
 
-    print(f"\n=== Generating: QuadWild Pipeline (stop_after={stop}) ===")
-    section = gen_quadwild(dragon_v, dragon_f, stop_after=stop)
+    mode = "compare" if args.compare else "gpu-only"
+    print(f"\n=== Generating: QuadWild Pipeline (stop_after={stop}, iterations={args.iterations}, mode={mode}) ===")
+    section = gen_quadwild(dragon_v, dragon_f, stop_after=stop, iterations=args.iterations,
+                           flip_threshold=args.flip_threshold, compare=args.compare)
 
     if section:
         print("\n=== Writing HTML ===")
@@ -863,7 +1044,7 @@ def main():
             print("\n=== Quality Summary ===")
             hdr = (f"{'Step':<25} {'Side':<10} {'V':>7} {'F':>7} "
                    f"{'Q avg':>7} {'Q max':>10} {'edge std':>10} "
-                   f"{'%val6':>6} {'dist':>8} {'time':>8}")
+                   f"{'%val6':>6} {'dist_avg':>9} {'dist_max':>9} {'time':>8}")
             sep = "-" * len(hdr)
             print(hdr)
             print(sep)
@@ -901,11 +1082,12 @@ def main():
                         continue
                     t = d.get("elapsed", 0)
                     t_str = f"{t*1000:.0f}ms" if t > 0 else ""
-                    dist = f"{m['dist_avg']:.4f}" if "dist_avg" in m else ""
+                    d_avg = f"{m['dist_avg']:.2e}" if "dist_avg" in m else ""
+                    d_max = f"{m['dist_max']:.2e}" if "dist_max" in m else ""
                     print(f"{step:<25} {side:<10} {m['V']:>7,} {m['F']:>7,} "
                           f"{m['quality_avg']:>7.2f} {m['quality_max']:>10.0f} "
                           f"{m['edge_std']:>10.4f} {m['pct_val6']:>5.0f}% "
-                          f"{dist:>8} {t_str:>8}")
+                          f"{d_avg:>9} {d_max:>9} {t_str:>8}")
                 prev_printed = True
 
         import glob

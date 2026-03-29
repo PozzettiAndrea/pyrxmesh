@@ -88,6 +88,9 @@ def setup_logging():
     sys.stderr = Tee(terminal_err, log_file)
 
     print(f"Logging to {log_path}")
+    # Log the command that was used to invoke this script
+    import sys as _sys
+    print(f"Command: {' '.join(_sys.argv)}")
     return tee
 
 BG_COLOR = "#1a1a2e"
@@ -295,7 +298,7 @@ def _fmt_metrics(m):
     parts.append(f"edge std: {m['edge_std']:.4f}")
     parts.append(f"val6: {m['pct_val6']:.0f}%")
     if "dist_avg" in m:
-        parts.append(f"dist: {m['dist_avg']:.4f}")
+        parts.append(f"dist: avg={m['dist_avg']:.4f} max={m['dist_max']:.4f}")
     return "<br>".join(parts)
 
 

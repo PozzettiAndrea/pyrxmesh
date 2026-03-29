@@ -703,6 +703,120 @@ VcgRemeshCheckpoints vcg_remesh_with_checkpoints(
 }
 
 // =========================================================================
+// vcg_remesh_adaptive — ONLY the adaptive pass (pass 2)
+// No isotropic pass 1, no micro-collapse, no feature re-detection.
+// =========================================================================
+
+VcgRemeshResult vcg_remesh_adaptive(
+    const double* vertices, int num_vertices,
+    const int* faces, int num_faces,
+    float target_edge_length,
+    int target_faces,
+    int iterations,
+    float crease_angle_deg,
+    bool verbose)
+{
+    auto t0 = std::chrono::high_resolution_clock::now();
+    auto ms_since = [](auto t0) {
+        return std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - t0).count();
+    };
+
+    // Build VCG mesh
+    QwMesh mesh;
+    mesh.LimitConcave = -0.99;
+    vcg::tri::Allocator<QwMesh>::AddVertices(mesh, num_vertices);
+    for (int i = 0; i < num_vertices; ++i)
+        mesh.vert[i].P() = CoordType(vertices[i*3], vertices[i*3+1], vertices[i*3+2]);
+    vcg::tri::Allocator<QwMesh>::AddFaces(mesh, num_faces);
+    for (int i = 0; i < num_faces; ++i) {
+        mesh.face[i].V(0) = &mesh.vert[faces[i*3]];
+        mesh.face[i].V(1) = &mesh.vert[faces[i*3+1]];
+        mesh.face[i].V(2) = &mesh.vert[faces[i*3+2]];
+    }
+    mesh.UpdateDataStructures();
+
+    // Mark sharp features (needed for adaptive remesh to respect creases)
+    ScalarType crease_deg = crease_angle_deg;
+    mesh.InitSharpFeatures(crease_deg);
+
+    // Compute target edge length
+    ScalarType target_edge = target_edge_length;
+    size_t min_faces_val = target_faces > 0 ? target_faces : 10000;
+    if (target_edge <= 0)
+        target_edge = expected_edge_length(mesh, 2000, min_faces_val);
+
+    int in_v = mesh.VN(), in_f = mesh.FN();
+
+    // Set up params — adaptive only
+    typename vcg::tri::IsotropicRemeshing<QwMesh>::Params para;
+    int iters = iterations > 0 ? iterations : 15;
+    para.iter = iters;
+    para.SetTargetLen(target_edge);
+
+    para.splitFlag    = true;
+    para.swapFlag     = true;
+    para.collapseFlag = true;
+    para.smoothFlag   = true;
+    para.projectFlag  = true;
+    para.selectedOnly = false;
+    para.adapt        = true;  // THE key difference
+    para.aspectRatioThr = 0.3;
+    para.cleanFlag    = true;
+    para.maxSurfDist  = mesh.bbox.Diag() / 2500.0;
+    para.surfDistCheck = mesh.FN() < 400000;
+    para.userSelectedCreases = true;
+    para.minAdaptiveMult = 0.3;
+    para.maxAdaptiveMult = 3.0;
+
+    if (verbose)
+        fprintf(stderr, "[pyrxmesh] vcg_remesh_adaptive: %d verts, %d faces, "
+                "target=%.6f, %d iters, adapt_mult=[0.3, 3.0]\n",
+                in_v, in_f, target_edge, iters);
+
+    auto tp = std::chrono::high_resolution_clock::now();
+    if (verbose) {
+        para.iter = 1;
+        for (int i = 0; i < iters; i++) {
+            auto t_it = std::chrono::high_resolution_clock::now();
+            vcg::tri::IsotropicRemeshing<QwMesh>::Do(mesh, para);
+            fprintf(stderr, "  [cpu adaptive iter %d] V=%d F=%d (%.1f ms)\n",
+                    i, mesh.VN(), mesh.FN(), ms_since(t_it));
+        }
+    } else {
+        vcg::tri::IsotropicRemeshing<QwMesh>::Do(mesh, para);
+    }
+    double t_remesh = ms_since(tp);
+
+    mesh.UpdateDataStructures();
+    vcg::tri::Allocator<QwMesh>::CompactEveryVector(mesh);
+
+    // Extract result
+    VcgRemeshResult result;
+    result.num_vertices = mesh.VN();
+    result.num_faces = mesh.FN();
+    result.vertices.resize(result.num_vertices * 3);
+    result.faces.resize(result.num_faces * 3);
+    for (int i = 0; i < result.num_vertices; ++i) {
+        result.vertices[i*3+0] = mesh.vert[i].P()[0];
+        result.vertices[i*3+1] = mesh.vert[i].P()[1];
+        result.vertices[i*3+2] = mesh.vert[i].P()[2];
+    }
+    for (int i = 0; i < result.num_faces; ++i) {
+        result.faces[i*3+0] = vcg::tri::Index(mesh, mesh.face[i].V(0));
+        result.faces[i*3+1] = vcg::tri::Index(mesh, mesh.face[i].V(1));
+        result.faces[i*3+2] = vcg::tri::Index(mesh, mesh.face[i].V(2));
+    }
+
+    if (verbose) {
+        fprintf(stderr, "[pyrxmesh] vcg_remesh_adaptive: %d→%d verts, %d→%d faces, %.1f ms\n",
+                in_v, result.num_vertices, in_f, result.num_faces, t_remesh);
+    }
+
+    return result;
+}
+
+// =========================================================================
 // vcg_clean_mesh — SolveGeometricArtifacts from QuadWild
 // =========================================================================
 

@@ -46,6 +46,18 @@ VcgRemeshResult vcg_micro_collapse(
     int max_iter = 2,
     bool verbose = false);
 
+// Run ONLY the adaptive remesh pass (pass 2) on an already-remeshed mesh.
+// Does NOT run isotropic pass 1, micro-collapse, or feature re-detection.
+// Matches QuadWild's second call to IsotropicRemeshing::Do with adapt=true.
+VcgRemeshResult vcg_remesh_adaptive(
+    const double* vertices, int num_vertices,
+    const int* faces, int num_faces,
+    float target_edge_length = 0,
+    int target_faces = 10000,
+    int iterations = 15,
+    float crease_angle_deg = 35.0f,
+    bool verbose = false);
+
 // Refine faces that have 3 sharp edges by splitting at centroid.
 // Matches QuadWild's RefineInternalFacesStepFromEdgeSel (simplified — no cross field).
 VcgRemeshResult vcg_refine_if_needed(

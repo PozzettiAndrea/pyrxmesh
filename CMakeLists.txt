@@ -68,6 +68,20 @@ add_library(rxmesh_pipeline STATIC
 
 target_link_libraries(rxmesh_pipeline PUBLIC RXMesh)
 
+# Penner optimization — standalone CUDA + cuSolver, no RXMesh dependency
+find_package(CUDAToolkit REQUIRED)
+add_library(penner_opt STATIC
+  src/penner/op_penner.cu
+)
+target_link_libraries(penner_opt PUBLIC CUDA::cusolver CUDA::cusparse CUDA::cudart)
+set_target_properties(penner_opt PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON
+  CUDA_RESOLVE_DEVICE_SYMBOLS ON
+  POSITION_INDEPENDENT_CODE ON
+)
+target_include_directories(penner_opt PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(penner_opt PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>)
+
 set_target_properties(rxmesh_pipeline PROPERTIES
   CUDA_SEPARABLE_COMPILATION ON
   CUDA_RESOLVE_DEVICE_SYMBOLS ON
@@ -128,7 +142,7 @@ nanobind_add_module(
 )
 
 # Link the pipeline library — only pipeline.h is included, no CUDA leaks
-target_link_libraries(_pyrxmesh PRIVATE rxmesh_pipeline vcg_remesh)
+target_link_libraries(_pyrxmesh PRIVATE rxmesh_pipeline vcg_remesh penner_opt)
 
 # Prevent CMake from adding a redundant device link step to _pyrxmesh.
 # Device symbols are already resolved in rxmesh_pipeline.

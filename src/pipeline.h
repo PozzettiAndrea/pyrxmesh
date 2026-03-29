@@ -217,7 +217,27 @@ MeshResult pipeline_feature_remesh(
     int iterations,
     int smooth_iterations,
     float crease_angle_deg = 35.0f,
-    int max_passes = 2,
+    float flip_normal_thr = 0.996f,
+    bool verbose = false);
+
+// Full QuadWild GPU remesh pipeline on a single RXMeshDynamic:
+// isotropic (N iters) → micro-collapse → re-detect features → adaptive (N iters) → export
+// Set adaptive_iterations=0 to skip the adaptive pass.
+struct QuadwildRemeshResult {
+    MeshResult after_isotropic;   // after isotropic pass (before micro)
+    MeshResult after_micro;       // after micro-collapse
+    MeshResult final_mesh;        // after adaptive (or after micro if adaptive_iterations=0)
+};
+
+QuadwildRemeshResult pipeline_quadwild_remesh(
+    const double* vertices, int num_vertices,
+    const int* faces, int num_faces,
+    double relative_len,
+    int isotropic_iterations,
+    int adaptive_iterations = 0,
+    int smooth_iterations = 5,
+    float crease_angle_deg = 35.0f,
+    float micro_quality_thr = 0.01f,
     bool verbose = false);
 
 // =========================================================================

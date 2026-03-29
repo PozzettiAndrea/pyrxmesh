@@ -12,6 +12,13 @@
 
 #include "array_support.h"
 #include "pipeline.h"
+#include "penner/penner_types.h"
+
+// Forward declaration — defined in op_penner.cu
+PennerResult pipeline_penner_conformal(
+    const double* vertices, int num_vertices,
+    const int* faces, int num_faces,
+    const PennerConformalParams& params);
 
 namespace nb = nanobind;
 
@@ -371,6 +378,20 @@ static nb::tuple py_vcg_micro_collapse(
     return nb::make_tuple(v, f);
 }
 
+static nb::tuple py_vcg_remesh_adaptive(
+    const NDArray<const double, 2> vertices,
+    const NDArray<const int, 2> faces,
+    float target_edge_length, int target_faces, int iterations,
+    float crease_angle_deg, bool verbose)
+{
+    validate_mesh(vertices, faces);
+    return mesh_result_to_np(vcg_remesh_adaptive(
+        vertices.data(), static_cast<int>(vertices.shape(0)),
+        faces.data(), static_cast<int>(faces.shape(0)),
+        target_edge_length, target_faces, iterations,
+        crease_angle_deg, verbose));
+}
+
 static nb::tuple py_vcg_clean_mesh(
     const NDArray<const double, 2> vertices,
     const NDArray<const int, 2> faces,
@@ -395,20 +416,41 @@ static nb::tuple py_vcg_refine_if_needed(
         crease_angle_deg, verbose));
 }
 
+static nb::dict py_quadwild_remesh(
+    const NDArray<const double, 2> vertices,
+    const NDArray<const int, 2> faces,
+    double relative_len, int isotropic_iterations, int adaptive_iterations,
+    int smooth_iterations, float crease_angle_deg, float micro_quality_thr,
+    bool verbose)
+{
+    validate_mesh(vertices, faces);
+    auto r = pipeline_quadwild_remesh(
+        vertices.data(), static_cast<int>(vertices.shape(0)),
+        faces.data(), static_cast<int>(faces.shape(0)),
+        relative_len, isotropic_iterations, adaptive_iterations,
+        smooth_iterations, crease_angle_deg, micro_quality_thr, verbose);
+
+    nb::dict d;
+    d["after_isotropic"] = mesh_result_to_tuple(r.after_isotropic);
+    d["after_micro"] = mesh_result_to_tuple(r.after_micro);
+    d["final"] = mesh_result_to_tuple(r.final_mesh);
+    return d;
+}
+
 // --- Feature-aware GPU remesh ---
 
 static nb::tuple py_feature_remesh(
     const NDArray<const double, 2> vertices,
     const NDArray<const int, 2> faces,
     double relative_len, int iterations, int smooth_iterations,
-    float crease_angle_deg, int max_passes, bool verbose)
+    float crease_angle_deg, float flip_normal_thr, bool verbose)
 {
     validate_mesh(vertices, faces);
     return mesh_result_to_tuple(pipeline_feature_remesh(
         vertices.data(), static_cast<int>(vertices.shape(0)),
         faces.data(), static_cast<int>(faces.shape(0)),
         relative_len, iterations, smooth_iterations,
-        crease_angle_deg, max_passes, verbose));
+        crease_angle_deg, flip_normal_thr, verbose));
 }
 
 // --- QuadWild preprocessing ---
@@ -707,6 +749,15 @@ NB_MODULE(_pyrxmesh, m) {
         nb::arg("max_iter") = 2,
         nb::arg("verbose") = false);
 
+    m.def("vcg_remesh_adaptive", &py_vcg_remesh_adaptive,
+        "Adaptive-only remesh pass (pass 2 only, no isotropic pass 1).",
+        nb::arg("vertices"), nb::arg("faces"),
+        nb::arg("target_edge_length") = 0.0f,
+        nb::arg("target_faces") = 10000,
+        nb::arg("iterations") = 15,
+        nb::arg("crease_angle_deg") = 35.0f,
+        nb::arg("verbose") = false);
+
     m.def("vcg_clean_mesh", &py_vcg_clean_mesh,
         "SolveGeometricArtifacts: remove zero-area faces, non-manifold, small components (CPU).",
         nb::arg("vertices"), nb::arg("faces"),
@@ -718,14 +769,25 @@ NB_MODULE(_pyrxmesh, m) {
         nb::arg("crease_angle_deg") = 35.0f,
         nb::arg("verbose") = false);
 
+    m.def("quadwild_remesh", &py_quadwild_remesh,
+        "Full QuadWild GPU pipeline: isotropic → micro-collapse → re-detect → adaptive.",
+        nb::arg("vertices"), nb::arg("faces"),
+        nb::arg("relative_len") = 1.0,
+        nb::arg("isotropic_iterations") = 15,
+        nb::arg("adaptive_iterations") = 0,
+        nb::arg("smooth_iterations") = 5,
+        nb::arg("crease_angle_deg") = 35.0f,
+        nb::arg("micro_quality_thr") = 0.01f,
+        nb::arg("verbose") = false);
+
     m.def("feature_remesh", &py_feature_remesh,
-        "Feature-aware GPU remeshing (skips feature edges during split/collapse/flip).",
+        "Feature-aware GPU remeshing (split/collapse/flip/smooth/project).",
         nb::arg("vertices"), nb::arg("faces"),
         nb::arg("relative_len") = 1.0,
         nb::arg("iterations") = 15,
         nb::arg("smooth_iterations") = 5,
         nb::arg("crease_angle_deg") = 35.0f,
-        nb::arg("max_passes") = 2,
+        nb::arg("flip_normal_thr") = 0.996f,
         nb::arg("verbose") = false);
 
     m.def("quadwild_preprocess", &py_quadwild_preprocess,
@@ -758,6 +820,41 @@ NB_MODULE(_pyrxmesh, m) {
         "Flip edges to equalize vertex valences (target = 6).",
         nb::arg("vertices"), nb::arg("faces"),
         nb::arg("iterations") = 1,
+        nb::arg("verbose") = false);
+
+    // ── Penner conformal optimization ──
+    m.def("penner_conformal",
+        [](const NDArray<const double, 2> vertices,
+           const NDArray<const int, 2> faces,
+           double error_eps, int max_iterations,
+           double min_angle_deg, bool verbose) -> nb::dict {
+            validate_mesh(vertices, faces);
+            PennerConformalParams params;
+            params.error_eps = error_eps;
+            params.max_iterations = max_iterations;
+            params.min_angle_deg = min_angle_deg;
+            params.verbose = verbose;
+            auto r = pipeline_penner_conformal(
+                vertices.data(), static_cast<int>(vertices.shape(0)),
+                faces.data(), static_cast<int>(faces.shape(0)),
+                params);
+            nb::dict d;
+            d["newton_iterations"] = r.newton_iterations;
+            d["final_error"] = r.final_error;
+            d["total_time_ms"] = r.total_time_ms;
+            d["num_vertices"] = r.num_vertices;
+            d["num_edges"] = r.num_edges;
+            // Log-lengths as numpy array
+            NDArray<double, 1> ll = MakeNDArray<double, 1>({(size_t)r.num_edges});
+            std::memcpy(ll.data(), r.log_lengths.data(), r.num_edges * sizeof(double));
+            d["log_lengths"] = ll;
+            return d;
+        },
+        "Penner conformal metric optimization (GPU). Returns optimized log edge lengths.",
+        nb::arg("vertices"), nb::arg("faces"),
+        nb::arg("error_eps") = 1e-10,
+        nb::arg("max_iterations") = 100,
+        nb::arg("min_angle_deg") = 25.0,
         nb::arg("verbose") = false);
 
     // ── Persistent Mesh class ──

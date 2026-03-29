@@ -27,10 +27,13 @@ from pyrxmesh._pyrxmesh import (
     detect_features as _detect_features,
     expected_edge_length as _expected_edge_length,
     feature_remesh as _feature_remesh,
+    penner_conformal as _penner_conformal,
     quadwild_preprocess as _quadwild_preprocess,
+    quadwild_remesh as _quadwild_remesh,
     vcg_remesh as _vcg_remesh,
     vcg_remesh_checkpoints as _vcg_remesh_checkpoints,
     vcg_micro_collapse as _vcg_micro_collapse,
+    vcg_remesh_adaptive as _vcg_remesh_adaptive,
     vcg_clean_mesh as _vcg_clean_mesh,
     vcg_refine_if_needed as _vcg_refine_if_needed,
 )
@@ -403,6 +406,21 @@ def vcg_micro_collapse(
     return _vcg_micro_collapse(v, f, quality_thr, max_iter, verbose)
 
 
+def vcg_remesh_adaptive(
+    vertices: NDArray[np.float64],
+    faces: NDArray[np.int32],
+    target_edge_length: float = 0,
+    target_faces: int = 10000,
+    iterations: int = 15,
+    crease_angle_deg: float = 35.0,
+    verbose: bool = False,
+) -> tuple[NDArray[np.float64], NDArray[np.int32]]:
+    """Adaptive-only remesh (pass 2 only). No isotropic pass 1, no micro-collapse."""
+    v, f = _validate_mesh(vertices, faces)
+    return _vcg_remesh_adaptive(v, f, target_edge_length, target_faces,
+                                iterations, crease_angle_deg, verbose)
+
+
 def vcg_clean_mesh(
     vertices: NDArray[np.float64],
     faces: NDArray[np.int32],
@@ -424,6 +442,49 @@ def vcg_refine_if_needed(
     return _vcg_refine_if_needed(v, f, crease_angle_deg, verbose)
 
 
+def penner_conformal(
+    vertices: NDArray[np.float64],
+    faces: NDArray[np.int32],
+    error_eps: float = 1e-10,
+    max_iterations: int = 100,
+    min_angle_deg: float = 25.0,
+    verbose: bool = False,
+) -> dict:
+    """Penner conformal metric optimization on GPU.
+
+    Finds a discrete conformal metric satisfying target cone angles (2π at interior
+    vertices). Uses Newton's method in Penner coordinates with metric interpolation
+    preprocessing for robustness.
+
+    Returns dict with: newton_iterations, final_error, total_time_ms, log_lengths.
+    """
+    v, f = _validate_mesh(vertices, faces)
+    return _penner_conformal(v, f, error_eps, max_iterations, min_angle_deg, verbose)
+
+
+def quadwild_remesh(
+    vertices: NDArray[np.float64],
+    faces: NDArray[np.int32],
+    relative_len: float = 1.0,
+    isotropic_iterations: int = 15,
+    adaptive_iterations: int = 0,
+    smooth_iterations: int = 5,
+    crease_angle_deg: float = 35.0,
+    micro_quality_thr: float = 0.01,
+    verbose: bool = False,
+) -> dict:
+    """Full QuadWild GPU pipeline on a single RXMeshDynamic.
+
+    isotropic (N iters) → micro-collapse → re-detect → adaptive (N iters).
+    Returns dict with 'after_isotropic', 'after_micro', 'final' — each (v, f) tuple.
+    Set adaptive_iterations=0 to skip adaptive pass.
+    """
+    v, f = _validate_mesh(vertices, faces)
+    return _quadwild_remesh(v, f, relative_len, isotropic_iterations,
+                            adaptive_iterations, smooth_iterations,
+                            crease_angle_deg, micro_quality_thr, verbose)
+
+
 def feature_remesh(
     vertices: NDArray[np.float64],
     faces: NDArray[np.int32],
@@ -431,22 +492,17 @@ def feature_remesh(
     iterations: int = 15,
     smooth_iterations: int = 5,
     crease_angle_deg: float = 35.0,
-    max_passes: int = 2,
+    flip_normal_thr: float = 0.996,
     verbose: bool = False,
 ) -> tuple[NDArray[np.float64], NDArray[np.int32]]:
     """Feature-aware GPU isotropic remeshing.
 
-    Like remesh() but detects feature edges (dihedral angle > crease_angle_deg)
-    and skips them during split/collapse/flip operations, preserving sharp edges.
-
-    Parameters
-    ----------
-    max_passes : int
-        1 = non-adaptive pass only, 2 = non-adaptive + adaptive (default).
+    flip_normal_thr: cosine threshold for flip normal check.
+    0.996 = 5° (strict), 0.866 = 30° (loose), 0.0 = no check.
     """
     v, f = _validate_mesh(vertices, faces)
     return _feature_remesh(v, f, relative_len, iterations, smooth_iterations,
-                           crease_angle_deg, max_passes, verbose)
+                           crease_angle_deg, flip_normal_thr, verbose)
 
 
 # ── QuadWild preprocessing ──────────────────────────────────────────────────
