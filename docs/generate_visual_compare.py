@@ -22,14 +22,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 warnings.filterwarnings("ignore")
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = "/home/work/quadwild_data/300"
+DATA_DIR = os.environ.get("QUADWILD_DATA", "/home/work/quadwild_data/300")
 OUT_DIR = os.path.join(SCRIPT_DIR, "_site", "visual")
 WORK_DIR = os.path.join(SCRIPT_DIR, "_site", "visual", "_work")
 
 PENNERQUAD_BIN = os.path.join(SCRIPT_DIR, "..", "tools", "pennerquad", "build", "pennerquad")
-QUADWILD_BIN = "/home/work/pyrxmesh/quadwild/build/Build/bin/quadwild"
-QUADWILD_LIB = "/home/work/pyrxmesh/quadwild/build/Build/lib"
-QUADWILD_CFG = "/home/work/pyrxmesh/quadwild/quadwild"
+QUADWILD_BIN = os.path.join(SCRIPT_DIR, "..", "build", "extern", "quadwild", "Build", "bin", "quadwild")
+QUADWILD_LIB = os.path.join(SCRIPT_DIR, "..", "build", "extern", "quadwild", "Build", "lib")
+QUADWILD_CFG = os.path.join(SCRIPT_DIR, "..", "extern", "quadwild", "quadwild")
 
 BG_COLOR = "#0d1117"
 TEXT_COLOR = "#c9d1d9"

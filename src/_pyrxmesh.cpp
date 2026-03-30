@@ -26,13 +26,8 @@ PennerFullResult pipeline_penner_with_targets(
     const double* target_cone_angles,
     const PennerConformalParams& params);
 
-// Forward declaration — defined in penner_real.cpp
-// Runs the actual Penner library (same code as parameterize_aligned binary)
-#include <Eigen/Core>
-PennerFullResult run_real_penner(
-    const Eigen::MatrixXd& V,
-    const Eigen::MatrixXi& F,
-    bool verbose);
+// NOTE: penner_real (direct library linkage) disabled due to ABI issues.
+// The pipeline uses subprocess calls to parameterize_aligned instead.
 
 namespace nb = nanobind;
 
@@ -934,35 +929,8 @@ NB_MODULE(_pyrxmesh, m) {
         nb::arg("verbose") = false,
         nb::arg("debug_dir") = "");
 
-    // ── Real Penner library (same code as parameterize_aligned) ──
-    m.def("penner_real",
-        [](const NDArray<const double, 2> vertices,
-           const NDArray<const int, 2> faces,
-           bool verbose) -> nb::dict {
-            validate_mesh(vertices, faces);
-            int nV = static_cast<int>(vertices.shape(0));
-            int nF = static_cast<int>(faces.shape(0));
-
-            // Convert to Eigen
-            Eigen::MatrixXd V(nV, 3);
-            for (int i = 0; i < nV; i++)
-                for (int j = 0; j < 3; j++)
-                    V(i, j) = vertices(i, j);
-            Eigen::MatrixXi F(nF, 3);
-            for (int i = 0; i < nF; i++)
-                for (int j = 0; j < 3; j++)
-                    F(i, j) = faces(i, j);
-
-            auto r = run_real_penner(V, F, verbose);
-
-            nb::dict d;
-            d["total_time_ms"] = r.total_time_ms;
-            d["newton_iterations"] = r.newton_iterations;
-            return d;
-        },
-        "Run the real Penner feature-aligned pipeline (same as parameterize_aligned binary).",
-        nb::arg("vertices"), nb::arg("faces"),
-        nb::arg("verbose") = false);
+    // NOTE: penner_real binding removed — ABI issues with linked Penner library.
+    // Use subprocess calls to parameterize_aligned binary instead.
 
     // ── Persistent Mesh class ──
     nb::class_<PyMesh>(m, "Mesh",

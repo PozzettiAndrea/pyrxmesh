@@ -23,8 +23,10 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 RXMESH_INPUT = os.path.join(SCRIPT_DIR, "..", "RXMesh", "input")
-METRIKO_DIR = "/home/work/metriko/example/build"
-PENNER_BIN = "/home/work/feature-aligned-penner/build/bin/parameterize_aligned"
+PENNER_BIN = os.path.join(SCRIPT_DIR, "..", "build", "extern", "penner", "bin", "parameterize_aligned")
+# Fallback: old in-source build location
+if not os.path.exists(PENNER_BIN):
+    PENNER_BIN = os.path.join(SCRIPT_DIR, "..", "extern", "feature-aligned-penner", "build", "bin", "parameterize_aligned")
 OUT_DIR = os.path.join(SCRIPT_DIR, "_site", "penner")
 
 BG_COLOR = "#0d1117"
@@ -509,9 +511,9 @@ def main():
     }
 
     # ── QuadWild pipeline ────────────────────────────────────────────
-    QUADWILD_BIN = "/home/work/pyrxmesh/quadwild/build/Build/bin/quadwild"
-    QUADWILD_LIB = "/home/work/pyrxmesh/quadwild/build/Build/lib"
-    QUADWILD_CFG = "/home/work/pyrxmesh/quadwild/quadwild"
+    QUADWILD_BIN = os.path.join(SCRIPT_DIR, "..", "build", "extern", "quadwild", "Build", "bin", "quadwild")
+    QUADWILD_LIB = os.path.join(SCRIPT_DIR, "..", "build", "extern", "quadwild", "Build", "lib")
+    QUADWILD_CFG = os.path.join(SCRIPT_DIR, "..", "extern", "quadwild", "quadwild")
     qw_quad_path = os.path.join(os.path.dirname(mesh_path),
                                 args.mesh + "_rem_quadrangulation_smooth.obj")
 
@@ -696,8 +698,8 @@ def main():
         }
 
     # ── Penner pipeline: No-T-Mesh Quantization + libQEx ─────────────
-    QUANT_BIN = "/home/work/RectangularSurfaceParameterization/QuantizationYoann/build/Quantization"
-    QEX_BIN = "/home/work/libQEx/build/extract_quads"
+    QUANT_BIN = os.path.join(SCRIPT_DIR, "..", "build", "extern", "quantization", "Quantization")
+    QEX_BIN = os.path.join(SCRIPT_DIR, "..", "build", "extern", "libqex", "extract_quads")
     penner_reembed_path = "/tmp/penner_reembed.obj"
     penner_quad_path = "/tmp/penner_final_quads.obj"
 

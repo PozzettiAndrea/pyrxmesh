@@ -82,43 +82,9 @@ set_target_properties(penner_opt PROPERTIES
 target_include_directories(penner_opt PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_options(penner_opt PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>)
 
-# Real Penner library (links against feature-aligned-penner .so files)
-set(PENNER_ROOT "/home/work/feature-aligned-penner")
-set(PENNER_BUILD "${PENNER_ROOT}/build")
-add_library(penner_real STATIC src/penner/penner_real.cpp)
-target_include_directories(penner_real PUBLIC
-  ${CMAKE_CURRENT_SOURCE_DIR}/src
-  ${PENNER_ROOT}/ext/penner-optimization/include/feature
-  ${PENNER_ROOT}/ext/penner-optimization/include/holonomy
-  ${PENNER_ROOT}/ext/penner-optimization/include/optimization
-  ${PENNER_ROOT}/ext/penner-optimization/include/util
-  ${PENNER_ROOT}/ext/penner-optimization/include
-  ${PENNER_BUILD}/_deps/conformal_ideal_delaunay-src/src
-  ${PENNER_BUILD}/_deps/geometry-central-src/include
-  ${PENNER_BUILD}/_deps/spdlog-src/include
-  ${PENNER_BUILD}/_deps/eigen-src
-  ${PENNER_BUILD}/_deps/libigl-src/include
-)
-target_link_libraries(penner_real PUBLIC
-  ${PENNER_BUILD}/ext/penner-optimization/src/feature/libPennerFeatureLib.so
-  ${PENNER_BUILD}/ext/penner-optimization/src/holonomy/libPennerHolonomyLib.so
-  ${PENNER_BUILD}/ext/penner-optimization/src/optimization/libPennerOptimizationLib.so
-  ${PENNER_BUILD}/ext/penner-optimization/src/util/libPennerUtilLib.so
-  ${PENNER_BUILD}/_deps/conformal_ideal_delaunay-build/libconformal_cpp.so
-  ${PENNER_BUILD}/lib/libpredicates.so
-)
-set_target_properties(penner_real PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_link_options(penner_real PUBLIC
-  "LINKER:-rpath,${PENNER_BUILD}/ext/penner-optimization/src/feature"
-  "LINKER:-rpath,${PENNER_BUILD}/ext/penner-optimization/src/holonomy"
-  "LINKER:-rpath,${PENNER_BUILD}/ext/penner-optimization/src/optimization"
-  "LINKER:-rpath,${PENNER_BUILD}/ext/penner-optimization/src/util"
-  "LINKER:-rpath,${PENNER_BUILD}/_deps/conformal_ideal_delaunay-build"
-  "LINKER:-rpath,${PENNER_BUILD}/lib"
-  "LINKER:-rpath,${PENNER_BUILD}/_deps/spdlog-build"
-  "LINKER:-rpath,${PENNER_BUILD}/_deps/geometry-central-build/src"
-  "LINKER:-rpath,${PENNER_BUILD}/_deps/suitesparse-build/CHOLMOD"
-)
+# NOTE: penner_real library (direct linkage to Penner .so files) is disabled.
+# It had ABI mismatch issues (bad_alloc). The pipeline uses subprocess calls instead.
+# TODO: Fix the ABI issue and re-enable for GPU acceleration.
 
 set_target_properties(rxmesh_pipeline PROPERTIES
   CUDA_SEPARABLE_COMPILATION ON
@@ -145,8 +111,8 @@ endif()
 add_library(vcg_remesh STATIC src/vcg_remesh.cpp)
 target_include_directories(vcg_remesh PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/src
-  ${CMAKE_CURRENT_SOURCE_DIR}/vcglib
-  ${CMAKE_CURRENT_SOURCE_DIR}/vcglib/eigenlib
+  ${CMAKE_CURRENT_SOURCE_DIR}/extern/vcglib
+  ${CMAKE_CURRENT_SOURCE_DIR}/extern/vcglib/eigenlib
 )
 target_compile_features(vcg_remesh PUBLIC cxx_std_17)
 set_target_properties(vcg_remesh PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -180,7 +146,7 @@ nanobind_add_module(
 )
 
 # Link the pipeline library — only pipeline.h is included, no CUDA leaks
-target_link_libraries(_pyrxmesh PRIVATE rxmesh_pipeline vcg_remesh penner_opt penner_real)
+target_link_libraries(_pyrxmesh PRIVATE rxmesh_pipeline vcg_remesh penner_opt)
 
 # Prevent CMake from adding a redundant device link step to _pyrxmesh.
 # Device symbols are already resolved in rxmesh_pipeline.
