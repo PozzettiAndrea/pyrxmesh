@@ -14,11 +14,25 @@
 #include "pipeline.h"
 #include "penner/penner_types.h"
 
-// Forward declaration — defined in op_penner.cu
+// Forward declarations — defined in op_penner.cu
 PennerResult pipeline_penner_conformal(
     const double* vertices, int num_vertices,
     const int* faces, int num_faces,
     const PennerConformalParams& params);
+
+PennerFullResult pipeline_penner_with_targets(
+    const double* vertices, int num_vertices,
+    const int* faces, int num_faces,
+    const double* target_cone_angles,
+    const PennerConformalParams& params);
+
+// Forward declaration — defined in penner_real.cpp
+// Runs the actual Penner library (same code as parameterize_aligned binary)
+#include <Eigen/Core>
+PennerFullResult run_real_penner(
+    const Eigen::MatrixXd& V,
+    const Eigen::MatrixXi& F,
+    bool verbose);
 
 namespace nb = nanobind;
 
@@ -855,6 +869,99 @@ NB_MODULE(_pyrxmesh, m) {
         nb::arg("error_eps") = 1e-10,
         nb::arg("max_iterations") = 100,
         nb::arg("min_angle_deg") = 25.0,
+        nb::arg("verbose") = false);
+
+    // ── Penner with external target cone angles ──
+    m.def("penner_with_targets",
+        [](const NDArray<const double, 2> vertices,
+           const NDArray<const int, 2> faces,
+           const NDArray<const double, 1> target_cone_angles,
+           double error_eps, int max_iterations,
+           double min_angle_deg, bool verbose,
+           const std::string& debug_dir) -> nb::dict {
+            validate_mesh(vertices, faces);
+            int nV = static_cast<int>(vertices.shape(0));
+            if ((int)target_cone_angles.shape(0) != nV)
+                throw std::runtime_error("target_cone_angles size must match vertex count");
+            PennerConformalParams params;
+            params.error_eps = error_eps;
+            params.max_iterations = max_iterations;
+            params.min_angle_deg = min_angle_deg;
+            params.verbose = verbose;
+            params.debug_dir = debug_dir;
+            auto r = pipeline_penner_with_targets(
+                vertices.data(), nV,
+                faces.data(), static_cast<int>(faces.shape(0)),
+                target_cone_angles.data(), params);
+            nb::dict d;
+            d["newton_iterations"] = r.newton_iterations;
+            d["final_error"] = r.final_error;
+            d["total_time_ms"] = r.total_time_ms;
+            // Export halfedge mesh connectivity for layout
+            int nHE = r.mesh.num_halfedges;
+            int nF = r.mesh.num_faces;
+            NDArray<double, 1> he_len = MakeNDArray<double, 1>({(size_t)nHE});
+            std::memcpy(he_len.data(), r.he_length.data(), nHE * sizeof(double));
+            d["he_length"] = he_len;
+            NDArray<double, 1> scale = MakeNDArray<double, 1>({(size_t)nV});
+            std::memcpy(scale.data(), r.scale_factors.data(), nV * sizeof(double));
+            d["scale_factors"] = scale;
+            // Mesh connectivity
+            NDArray<int, 1> he_next = MakeNDArray<int, 1>({(size_t)nHE});
+            std::memcpy(he_next.data(), r.mesh.next.data(), nHE * sizeof(int));
+            d["he_next"] = he_next;
+            NDArray<int, 1> he_to = MakeNDArray<int, 1>({(size_t)nHE});
+            std::memcpy(he_to.data(), r.mesh.to.data(), nHE * sizeof(int));
+            d["he_to"] = he_to;
+            NDArray<int, 1> he_twin = MakeNDArray<int, 1>({(size_t)nHE});
+            std::memcpy(he_twin.data(), r.mesh.twin.data(), nHE * sizeof(int));
+            d["he_twin"] = he_twin;
+            NDArray<int, 1> fhe = MakeNDArray<int, 1>({(size_t)nF});
+            std::memcpy(fhe.data(), r.mesh.fhe.data(), nF * sizeof(int));
+            d["fhe"] = fhe;
+            d["num_vertices"] = r.mesh.num_vertices;
+            d["num_halfedges"] = nHE;
+            d["num_faces"] = nF;
+            return d;
+        },
+        "Penner optimization with external target cone angles.\n"
+        "Returns optimized halfedge mesh + edge lengths for layout.",
+        nb::arg("vertices"), nb::arg("faces"),
+        nb::arg("target_cone_angles"),
+        nb::arg("error_eps") = 1e-10,
+        nb::arg("max_iterations") = 100,
+        nb::arg("min_angle_deg") = 25.0,
+        nb::arg("verbose") = false,
+        nb::arg("debug_dir") = "");
+
+    // ── Real Penner library (same code as parameterize_aligned) ──
+    m.def("penner_real",
+        [](const NDArray<const double, 2> vertices,
+           const NDArray<const int, 2> faces,
+           bool verbose) -> nb::dict {
+            validate_mesh(vertices, faces);
+            int nV = static_cast<int>(vertices.shape(0));
+            int nF = static_cast<int>(faces.shape(0));
+
+            // Convert to Eigen
+            Eigen::MatrixXd V(nV, 3);
+            for (int i = 0; i < nV; i++)
+                for (int j = 0; j < 3; j++)
+                    V(i, j) = vertices(i, j);
+            Eigen::MatrixXi F(nF, 3);
+            for (int i = 0; i < nF; i++)
+                for (int j = 0; j < 3; j++)
+                    F(i, j) = faces(i, j);
+
+            auto r = run_real_penner(V, F, verbose);
+
+            nb::dict d;
+            d["total_time_ms"] = r.total_time_ms;
+            d["newton_iterations"] = r.newton_iterations;
+            return d;
+        },
+        "Run the real Penner feature-aligned pipeline (same as parameterize_aligned binary).",
+        nb::arg("vertices"), nb::arg("faces"),
         nb::arg("verbose") = false);
 
     // ── Persistent Mesh class ──

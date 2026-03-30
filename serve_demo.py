@@ -53,5 +53,12 @@ async def app(scope, receive, send):
 
 if __name__ == "__main__":
     kill_existing()
+    # Install tabbed index
+    import shutil
+    tab_src = Path(__file__).parent / "docs" / "_site_index.html"
+    if tab_src.exists():
+        SITE_DIR.mkdir(parents=True, exist_ok=True)
+        shutil.copy(tab_src, SITE_DIR / "index.html")
+        print(f"Installed tabbed index")
     print(f"Serving {SITE_DIR} at http://localhost:8001")
     uvicorn.run("serve_demo:app", host="0.0.0.0", port=8001)

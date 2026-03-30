@@ -17,6 +17,8 @@ compile_commands.json
 *.pyc
 .pytest_cache/
 docs/_site/
+docs/demo_metriko/
+tools/
 RXMesh.log
 .ipynb_checkpoints/
 docs/runs/

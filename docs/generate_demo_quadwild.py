@@ -26,11 +26,15 @@ import pyrxmesh
 
 # Import shared utilities from generate_demo
 from generate_demo import (
-    OUT_DIR, RXMESH_INPUT, RUNS_DIR,
+    OUT_DIR as _BASE_OUT_DIR, RXMESH_INPUT, RUNS_DIR,
     BG_COLOR, MESH_COLOR_IN, MESH_COLOR_OUT, EDGE_COLOR, TEXT_COLOR,
     pv_mesh_from_numpy, render_mesh, run_before_after,
     setup_logging, generate_html,
 )
+import generate_demo
+# Override OUT_DIR so QuadWild outputs to its own subdir
+OUT_DIR = os.path.join(os.path.dirname(__file__), "_site", "quadwild")
+generate_demo.OUT_DIR = OUT_DIR
 
 def compute_mesh_quality(mesh, input_mesh=None, label=""):
     """Compute quality metrics for a triangle mesh. Returns dict of metrics."""

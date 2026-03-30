@@ -6,6 +6,7 @@
 #pragma once
 
 #include <vector>
+#include <string>
 #include <cstdint>
 
 // Halfedge mesh connectivity (host-side, copied to device for kernels)
@@ -76,4 +77,15 @@ struct PennerConformalParams {
     double min_angle_deg = 25.0;       // min angle for metric interpolation
     double line_search_alpha = 0.5;    // backtracking parameter
     bool verbose = false;
+    std::string debug_dir = "";        // if set, dump per-step data here
+};
+
+// Extended result including the halfedge mesh for layout
+struct PennerFullResult {
+    HalfedgeMesh mesh;                // intrinsic mesh after Ptolemy flips
+    std::vector<double> he_length;    // edge lengths after optimization
+    std::vector<double> scale_factors;// per-vertex conformal scale factors
+    int newton_iterations;
+    double final_error;
+    double total_time_ms;
 };

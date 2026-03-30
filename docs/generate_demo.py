@@ -23,7 +23,7 @@ pv.OFF_SCREEN = True
 
 import pyrxmesh
 
-OUT_DIR = os.path.join(os.path.dirname(__file__), "_site")
+OUT_DIR = os.path.join(os.path.dirname(__file__), "_site", "pyrxmesh")
 RUNS_DIR = os.path.join(os.path.dirname(__file__), "runs")
 RXMESH_INPUT = os.path.join(os.path.dirname(__file__), "..", "RXMesh", "input")
 
@@ -716,7 +716,6 @@ SECTIONS = [
     ("parameterization", gen_parameterization, ["bunny_v", "bunny_f"]),
     ("decimation", gen_decimation, ["dragon_v", "dragon_f"]),
     ("remeshing", gen_remeshing, ["bunny_v", "bunny_f", "dragon_v", "dragon_f"]),
-    ("quadwild", "generate_demo_quadwild.gen_quadwild", ["dragon_v", "dragon_f"]),
     ("edge_ops", gen_edge_ops, ["bunny_v", "bunny_f"]),
     ("patches", gen_patches, ["bunny_v", "bunny_f", "dragon_v", "dragon_f"]),
 ]
@@ -760,30 +759,16 @@ def main():
 
     sections = []
     for name, func_or_path, arg_names in SECTIONS:
-        # Resolve lazy imports (strings like "module.func")
-        if isinstance(func_or_path, str):
-            mod_name, func_name = func_or_path.rsplit(".", 1)
-            import importlib
-            mod = importlib.import_module(mod_name)
-            func = getattr(mod, func_name)
-        else:
-            func = func_or_path
+        func = func_or_path
 
         # Check if should run
         if only:
-            # Handle quadwild sub-sections
-            if only.startswith("quadwild") and name == "quadwild":
-                pass  # run it
-            elif name != only:
+            if name != only:
                 print(f"\n  [SKIPPED] {name}")
                 continue
 
         print(f"\n=== Generating: {name} ===")
         kwargs = {k: all_args[k] for k in arg_names}
-
-        # Pass stop_after to quadwild for sub-section control
-        if name == "quadwild" and only and only.startswith("quadwild_"):
-            kwargs["stop_after"] = only.replace("quadwild_", "")
 
         result = func(**kwargs)
         if result:
@@ -809,40 +794,16 @@ if __name__ == "__main__":
     import argparse
 
     section_names = [name for name, _, _ in SECTIONS]
-    quadwild_subs = ["quadwild_erode", "quadwild_remesh_isotropic", "quadwild_micro", "quadwild_remesh_adaptive"]
 
     parser = argparse.ArgumentParser(
         description="Generate pyrxmesh demo site.",
         formatter_class=argparse.RawTextHelpFormatter)
-    parser.add_argument("--only", choices=section_names + quadwild_subs,
-        help="Run ONLY this section. Choices:\n" +
-             "\n".join(f"  {n}" for n in section_names + quadwild_subs))
+    parser.add_argument("--only", choices=section_names,
+        help="Run ONLY this section.")
     parser.add_argument("--stop-after", choices=section_names,
         help="Run sections in order, stop after this one.")
-    parser.add_argument("--all", action="store_true",
-        help="Run all sections.")
-    parser.add_argument("--list", action="store_true",
-        help="List available sections and exit.")
 
     args = parser.parse_args()
-
-    if args.list:
-        print("Available sections:")
-        for name, _, arg_names in SECTIONS:
-            print(f"  {name:20s}  (needs: {', '.join(arg_names)})")
-        print("\nQuadWild sub-sections:")
-        for sub in quadwild_subs:
-            print(f"  {sub}")
-        print("\nExamples:")
-        print("  python docs/generate_demo.py --only quadwild_erode")
-        print("  python docs/generate_demo.py --stop-after decimation")
-        print("  python docs/generate_demo.py  # run everything")
-        sys.exit(0)
-
-    if not args.list and not args.only and not args.stop_after and not args.all:
-        parser.print_help()
-        print("\nError: specify --only, --stop-after, or --all")
-        sys.exit(1)
 
     if args.only:
         os.environ["PYRXMESH_DEMO_ONLY"] = args.only
