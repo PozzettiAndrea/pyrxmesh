@@ -32,6 +32,12 @@ cmake --build . --target quantization -j$JOBS 2>&1 || echo "!!! quantization FAI
 echo ""
 echo "--- Building libqex ---"
 cmake --build . --target libqex -j$JOBS 2>&1 || echo "!!! libqex FAILED"
+# Build extract_quads tool (links against libQExStatic)
+g++ -std=c++17 -O2 \
+    -I "$ROOT/extern/libQEx/interfaces/c" -I "$ROOT/extern/libQEx/src" \
+    "$ROOT/extern/libQEx/extract_quads.cpp" \
+    -L "$ROOT/build/extern/libqex" -lQExStatic -lOpenMeshCore -lOpenMeshTools \
+    -o "$ROOT/build/extern/libqex/extract_quads" 2>&1 || echo "!!! extract_quads FAILED"
 echo ""
 echo "--- Building quadwild ---"
 cmake --build . --target quadwild -j$JOBS 2>&1 || echo "!!! quadwild FAILED"

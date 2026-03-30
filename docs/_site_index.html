@@ -4,20 +4,22 @@
 <title>pyrxmesh demos</title>
 <style>
 body { background: #0d1117; color: #c9d1d9; font-family: -apple-system, monospace; margin: 0; padding: 0; }
-.tabs { display: flex; background: #161b22; border-bottom: 1px solid #30363d; padding: 0 20px; }
-.tab { padding: 12px 20px; cursor: pointer; color: #8b949e; border-bottom: 2px solid transparent; }
+.tabs { display: flex; flex-wrap: wrap; background: #161b22; border-bottom: 1px solid #30363d; padding: 0 20px; }
+.tab { padding: 12px 20px; cursor: pointer; color: #8b949e; border-bottom: 2px solid transparent; white-space: nowrap; }
 .tab:hover { color: #c9d1d9; }
 .tab.active { color: #58a6ff; border-bottom-color: #58a6ff; }
 iframe { width: 100%; border: none; height: calc(100vh - 50px); }
 </style>
 </head><body>
 <div class="tabs" id="tabs">
-  <div class="tab active" data-src="pyrxmesh/index.html">pyrxmesh</div>
-  <div class="tab" data-src="quadwild/index.html">QuadWild Remesh</div>
-  <div class="tab" data-src="penner/index.html">Penner vs QuadWild</div>
-  <div class="tab" data-src="visual/index.html">Visual Compare</div>
+  <div class="tab active" data-src="demo_pyrxmesh/index.html">demo_pyrxmesh</div>
+  <div class="tab" data-src="pyrxmesh_vs_quadwild/index.html">pyrxmesh_vs_quadwild</div>
+  <div class="tab" data-src="demo_quadwild/index.html">demo_quadwild</div>
+  <div class="tab" data-src="demo_penner/index.html">demo_penner</div>
+  <div class="tab" data-src="penner_vs_quadwild/index.html">penner_vs_quadwild</div>
+  <div class="tab" data-src="penner_vs_quadwild_dataset/index.html">penner_vs_quadwild_dataset</div>
 </div>
-<iframe id="content" src="pyrxmesh/index.html"></iframe>
+<iframe id="content" src="demo_pyrxmesh/index.html"></iframe>
 <script>
 document.querySelectorAll('.tab').forEach(tab => {
   tab.addEventListener('click', () => {

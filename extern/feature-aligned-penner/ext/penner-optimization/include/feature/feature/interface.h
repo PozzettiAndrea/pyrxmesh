@@ -187,7 +187,8 @@ public:
     std::tuple<Eigen::MatrixXd, Eigen::MatrixXi, Eigen::MatrixXd, Eigen::MatrixXi>
     get_intrinsic_mesh();
 
-private:
+// Made public for intermediate data dumps (vendored code)
+public:
     bool parameterized;
 
     // input

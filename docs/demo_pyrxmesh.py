@@ -23,7 +23,7 @@ pv.OFF_SCREEN = True
 
 import pyrxmesh
 
-OUT_DIR = os.path.join(os.path.dirname(__file__), "_site", "pyrxmesh")
+OUT_DIR = os.path.join(os.path.dirname(__file__), "_site", "demo_pyrxmesh")
 RUNS_DIR = os.path.join(os.path.dirname(__file__), "runs")
 RXMESH_INPUT = os.path.join(os.path.dirname(__file__), "..", "RXMesh", "input")
 

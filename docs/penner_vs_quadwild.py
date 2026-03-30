@@ -27,7 +27,7 @@ PENNER_BIN = os.path.join(SCRIPT_DIR, "..", "build", "extern", "penner", "bin", 
 # Fallback: old in-source build location
 if not os.path.exists(PENNER_BIN):
     PENNER_BIN = os.path.join(SCRIPT_DIR, "..", "extern", "feature-aligned-penner", "build", "bin", "parameterize_aligned")
-OUT_DIR = os.path.join(SCRIPT_DIR, "_site", "penner")
+OUT_DIR = os.path.join(SCRIPT_DIR, "_site", "penner_vs_quadwild")
 
 BG_COLOR = "#0d1117"
 TEXT_COLOR = "#c9d1d9"

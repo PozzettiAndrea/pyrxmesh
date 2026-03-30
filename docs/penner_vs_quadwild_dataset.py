@@ -23,8 +23,8 @@ warnings.filterwarnings("ignore")
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("QUADWILD_DATA", "/home/work/quadwild_data/300")
-OUT_DIR = os.path.join(SCRIPT_DIR, "_site", "visual")
-WORK_DIR = os.path.join(SCRIPT_DIR, "_site", "visual", "_work")
+OUT_DIR = os.path.join(SCRIPT_DIR, "_site", "penner_vs_quadwild_dataset")
+WORK_DIR = os.path.join(SCRIPT_DIR, "_site", "penner_vs_quadwild_dataset", "_work")
 
 PENNERQUAD_BIN = os.path.join(SCRIPT_DIR, "..", "tools", "pennerquad", "build", "pennerquad")
 QUADWILD_BIN = os.path.join(SCRIPT_DIR, "..", "build", "extern", "quadwild", "Build", "bin", "quadwild")
