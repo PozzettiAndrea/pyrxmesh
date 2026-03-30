@@ -10,7 +10,7 @@ namespace rxmesh {
 __host__ PatchStash::PatchStash(bool on_device) : m_is_on_device(on_device)
 {
     if (m_is_on_device) {
-        CUDA_ERROR(cudaMalloc((void**)&m_stash, stash_size * sizeof(uint32_t)));
+        GPU_ALLOC_ASYNC(m_stash, stash_size * sizeof(uint32_t));
         CUDA_ERROR(
             cudaMemset(m_stash, INVALID8, stash_size * sizeof(uint32_t)));
     } else {
@@ -80,7 +80,7 @@ __host__ __device__ uint8_t PatchStash::find_patch_index(uint32_t patch) const
 __host__ void PatchStash::free()
 {
     if (m_is_on_device) {
-        GPU_FREE(m_stash);
+        GPU_FREE_ASYNC(m_stash);
 
     } else {
         ::free(m_stash);

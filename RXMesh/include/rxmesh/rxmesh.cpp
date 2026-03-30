@@ -88,6 +88,17 @@ void RXMesh::init(const std::vector<std::vector<uint32_t>>& fv,
             "RXMesh::init hashtable load factor should be less than 1");
     }
 
+    // Enable CUDA memory pool caching for async allocations.
+    // This makes cudaMallocAsync reuse freed memory instead of
+    // returning it to the OS, dramatically reducing allocation overhead.
+    {
+        cudaMemPool_t pool;
+        CUDA_ERROR(cudaDeviceGetDefaultMemPool(&pool, 0));
+        uint64_t threshold = UINT64_MAX;
+        CUDA_ERROR(cudaMemPoolSetAttribute(
+            pool, cudaMemPoolAttrReleaseThreshold, &threshold));
+    }
+
     m_timers.add("LPHashTable");
     m_timers.add("ht.insert");
     m_timers.add("lower_bound");
@@ -1196,7 +1207,7 @@ void RXMesh::build_device_single_patch(const uint32_t patch_id,
     uint16_t* d_counts;
 
     m_timers.start("cudaMalloc");
-    CUDA_ERROR(cudaMalloc((void**)&d_counts, 6 * sizeof(uint16_t)));
+    GPU_ALLOC_ASYNC(d_counts, 6 * sizeof(uint16_t));
     m_timers.stop("cudaMalloc");
 
 
@@ -1239,8 +1250,7 @@ void RXMesh::build_device_single_patch(const uint32_t patch_id,
     // we realloc the host h_patch_info EV and FE to ensure that both host and
     // device has the same capacity
     m_timers.start("cudaMalloc");
-    CUDA_ERROR(cudaMalloc((void**)&d_patch.ev,
-                          p_edges_capacity * 2 * sizeof(LocalVertexT)));
+    GPU_ALLOC_ASYNC(d_patch.ev, p_edges_capacity * 2 * sizeof(LocalVertexT));
     m_timers.stop("cudaMalloc");
 
 
@@ -1259,8 +1269,7 @@ void RXMesh::build_device_single_patch(const uint32_t patch_id,
     }
 
     m_timers.start("cudaMalloc");
-    CUDA_ERROR(cudaMalloc((void**)&d_patch.fe,
-                          p_faces_capacity * 3 * sizeof(LocalEdgeT)));
+    GPU_ALLOC_ASYNC(d_patch.fe, p_faces_capacity * 3 * sizeof(LocalEdgeT));
     m_timers.stop("cudaMalloc");
 
 
@@ -1279,7 +1288,7 @@ void RXMesh::build_device_single_patch(const uint32_t patch_id,
     }
 
     m_timers.start("cudaMalloc");
-    CUDA_ERROR(cudaMalloc((void**)&d_patch.dirty, sizeof(int)));
+    GPU_ALLOC_ASYNC(d_patch.dirty, sizeof(int));
     m_timers.stop("cudaMalloc");
 
 
@@ -1301,7 +1310,7 @@ void RXMesh::build_device_single_patch(const uint32_t patch_id,
         m_timers.stop("malloc");
 
         m_timers.start("cudaMalloc");
-        CUDA_ERROR(cudaMalloc((void**)&d_mask, num_bytes));
+        GPU_ALLOC_ASYNC(d_mask, num_bytes);
         m_timers.stop("cudaMalloc");
 
 

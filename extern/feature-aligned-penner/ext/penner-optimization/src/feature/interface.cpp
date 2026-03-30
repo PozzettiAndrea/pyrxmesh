@@ -275,6 +275,17 @@ AlignedMetricGenerator::AlignedMetricGenerator(
     CutMetricGenerator cut_metric_generator(V_cut, F_cut, marked_metric_params, relaxed_corners);
     cut_metric_generator.set_fields(F_cut, reference_field, theta, kappa, period_jump);
 
+    // Log Newton component decomposition
+    {
+        const auto& comps = cut_metric_generator.get_components();
+        int nc = comps.maxCoeff() + 1;
+        spdlog::info("AlignedMetricGenerator: {} Newton components from {} cut faces", nc, F_cut.rows());
+        for (int c = 0; c < nc; c++) {
+            int count = (comps.array() == c).count();
+            spdlog::info("  Newton component {}: {} faces", c, count);
+        }
+    }
+
     // get the metric from the generator
     std::tie(embedding_metric, vtx_reindex, face_reindex, rotation_form, Th_hat) = cut_metric_generator.get_fixed_aligned_metric(V_map, marked_metric_params);
 

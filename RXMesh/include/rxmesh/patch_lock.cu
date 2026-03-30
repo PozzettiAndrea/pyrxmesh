@@ -48,8 +48,8 @@ __device__ bool PatchLock::is_locked() const
 
 __host__ void PatchLock::init()
 {
-    CUDA_ERROR(cudaMalloc((void**)&lock, sizeof(uint32_t)));
-    CUDA_ERROR(cudaMalloc((void**)&spin, sizeof(uint32_t)));
+    GPU_ALLOC_ASYNC(lock, sizeof(uint32_t));
+    GPU_ALLOC_ASYNC(spin, sizeof(uint32_t));
     uint32_t h_lock = FREE, h_spin = INVALID32;
     CUDA_ERROR(cudaMemcpy(
         lock, &h_lock, sizeof(uint32_t), cudaMemcpyHostToDevice));
@@ -59,8 +59,8 @@ __host__ void PatchLock::init()
 
 __host__ void PatchLock::free()
 {
-    GPU_FREE(lock);
-    GPU_FREE(spin);
+    GPU_FREE_ASYNC(lock);
+    GPU_FREE_ASYNC(spin);
 }
 
 }  // namespace rxmesh

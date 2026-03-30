@@ -202,6 +202,30 @@ int main(int argc, char* argv[])
         spdlog::info("Step 9 — Field: {} theta, {} kappa rows, {} period_jump rows",
                      theta.size(), kappa.rows(), period_jump.rows());
 
+        // Dump per-face component IDs (field computation decomposition)
+        {
+            const auto& comps = cut_metric_generator.get_components();
+            int nc = comps.maxCoeff() + 1;
+            std::string comp_file = join_path(output_dir, mesh + "_step09_components.txt");
+            std::ofstream cout(comp_file);
+            cout << comps.size() << " " << nc << "\n";
+            for (int i = 0; i < comps.size(); i++) cout << comps[i] << "\n";
+            spdlog::info("Wrote {} face component IDs ({} components) -> {}", comps.size(), nc, comp_file);
+            // Log component sizes
+            for (int c = 0; c < nc; c++) {
+                int count = (comps.array() == c).count();
+                if (nc <= 50 || count < 100)
+                    spdlog::info("  Field component {}: {} faces", c, count);
+            }
+        }
+        // Dump V_map (cut vertex → original vertex)
+        {
+            std::string vmap_file = join_path(output_dir, mesh + "_step07_vmap.txt");
+            std::ofstream vout(vmap_file);
+            vout << V_map.size() << "\n";
+            for (int i = 0; i < V_map.size(); i++) vout << V_map[i] << "\n";
+        }
+
         // Dump theta (per-face rotation from reference direction)
         {
             std::string theta_file = join_path(output_dir, mesh + "_step09_theta.txt");

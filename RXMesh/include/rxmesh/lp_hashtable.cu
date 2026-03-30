@@ -26,8 +26,8 @@ LPHashTable::LPHashTable(const uint16_t capacity, bool is_on_device)
 {
     m_capacity = find_next_prime_number(m_capacity);
     if (m_is_on_device) {
-        CUDA_ERROR(cudaMalloc((void**)&m_table, num_bytes()));
-        CUDA_ERROR(cudaMalloc((void**)&m_stash, stash_size * sizeof(LPPair)));
+        GPU_ALLOC_ASYNC(m_table, num_bytes());
+        GPU_ALLOC_ASYNC(m_stash, stash_size * sizeof(LPPair));
 
     } else {
         m_table = (LPPair*)malloc(num_bytes());
@@ -79,8 +79,8 @@ __device__ void LPHashTable::clear()
 __host__ void LPHashTable::free()
 {
     if (m_is_on_device) {
-        GPU_FREE(m_table);
-        GPU_FREE(m_stash);
+        GPU_FREE_ASYNC(m_table);
+        GPU_FREE_ASYNC(m_stash);
     } else {
         ::free(m_table);
         ::free(m_stash);

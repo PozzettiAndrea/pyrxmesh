@@ -210,6 +210,17 @@ inline void cudssHandleError(cudssStatus_t status,
         ptr = nullptr;             \
     }
 
+// Async variants for pooled allocation (CUDA 12.2+)
+// Uses stream 0 — synchronous semantics but pools internally.
+#define GPU_ALLOC_ASYNC(ptr, size)                          \
+    CUDA_ERROR(cudaMallocAsync((void**)&(ptr), (size), 0))
+
+#define GPU_FREE_ASYNC(ptr)                    \
+    if (ptr != nullptr) {                      \
+        CUDA_ERROR(cudaFreeAsync(ptr, 0));     \
+        ptr = nullptr;                         \
+    }
+
 // Taken from https://stackoverflow.com/a/12779757/1608232
 #if defined(__CUDACC__)  // NVCC
 #define ALIGN(n) __align__(n)

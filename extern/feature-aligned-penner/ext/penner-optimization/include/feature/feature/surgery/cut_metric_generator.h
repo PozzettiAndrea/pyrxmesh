@@ -142,6 +142,8 @@ public:
      */
     std::vector<bool> get_fixed_faces() const;
 
+    const Eigen::VectorXi& get_components() const { return components; }
+
 private:
     // VF data
     Eigen::MatrixXi F_mask;
