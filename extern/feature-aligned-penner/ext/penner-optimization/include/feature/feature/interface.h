@@ -25,7 +25,9 @@ namespace Feature {
 std::tuple<Eigen::MatrixXd, Eigen::MatrixXi, std::vector<VertexEdge>, std::vector<VertexEdge>> generate_refined_feature_mesh(
     const Eigen::MatrixXd& V,
     const Eigen::MatrixXi& F,
-    bool use_minimal_forest=false);
+    bool use_minimal_forest=false,
+    bool use_erode_dilate=false,
+    double dihedral_angle=35.0);
 
 /**
  * @brief Generate a parameterization aligned to features and the given cross field.

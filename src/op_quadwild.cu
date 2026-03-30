@@ -36,12 +36,27 @@ static std::string write_temp_obj_qw(
 {
     auto tmp = std::filesystem::temp_directory_path() / "pyrxmesh_qw_in.obj";
     FILE* f = fopen(tmp.string().c_str(), "w");
-    for (int i = 0; i < nv; ++i)
-        fprintf(f, "v %.15g %.15g %.15g\n",
-                vertices[i*3], vertices[i*3+1], vertices[i*3+2]);
-    for (int i = 0; i < nf; ++i)
-        fprintf(f, "f %d %d %d\n",
-                faces[i*3]+1, faces[i*3+1]+1, faces[i*3+2]+1);
+    constexpr size_t BUF_CAP = 8 * 1024 * 1024;
+    constexpr size_t OBJ_LINE_MAX = 128;  // %.15g can be longer
+    std::vector<char> buf(BUF_CAP);
+    size_t pos = 0;
+
+    auto flush_buf = [&]() {
+        fwrite(buf.data(), 1, pos, f);
+        pos = 0;
+    };
+
+    for (int i = 0; i < nv; ++i) {
+        if (pos + OBJ_LINE_MAX > BUF_CAP) flush_buf();
+        pos += snprintf(buf.data() + pos, OBJ_LINE_MAX, "v %.15g %.15g %.15g\n",
+                        vertices[i*3], vertices[i*3+1], vertices[i*3+2]);
+    }
+    for (int i = 0; i < nf; ++i) {
+        if (pos + OBJ_LINE_MAX > BUF_CAP) flush_buf();
+        pos += snprintf(buf.data() + pos, OBJ_LINE_MAX, "f %d %d %d\n",
+                        faces[i*3]+1, faces[i*3+1]+1, faces[i*3+2]+1);
+    }
+    if (pos > 0) flush_buf();
     fclose(f);
     return tmp.string();
 }
@@ -127,17 +142,19 @@ MeshResult pipeline_quadwild_preprocess(
                 num_vertices, num_faces, total_area, vol, Sphericity, target_edge, relative_len);
 
     auto tp = clk::now();
-    auto in_path = write_temp_obj_qw(vertices, num_vertices, faces, num_faces);
+    auto fv = flat_faces_to_fv(faces, num_faces);
+    auto vv = flat_verts_to_vv_float(vertices, num_vertices);
     auto out_path = (std::filesystem::temp_directory_path() / "pyrxmesh_qw_out.obj").string();
-    double t_write = ms_since(tp);
+    double t_prep = ms_since(tp);
 
-    Arg.obj_file_name = in_path;
+    Arg.obj_file_name = "pyrxmesh_qw";
     Arg.relative_len = relative_len;
     Arg.num_iter = static_cast<uint32_t>(params.num_iterations > 0 ? params.num_iterations : 3);
     Arg.num_smooth_iters = params.num_smooth_iters > 0 ? params.num_smooth_iters : 5;
 
     tp = clk::now();
-    RXMeshDynamic rx(in_path, "", 512, 2.0f, 2);
+    RXMeshDynamic rx(fv, "", 512, 2.0f, 2);
+    rx.add_vertex_coordinates(vv);
     double t_build = ms_since(tp);
 
     if (!rx.is_edge_manifold())
@@ -154,13 +171,12 @@ MeshResult pipeline_quadwild_preprocess(
     auto result = read_obj_qw(out_path);
     double t_readback = ms_since(tp);
 
-    std::filesystem::remove(in_path);
     std::filesystem::remove(out_path);
 
     if (verbose) {
-        fprintf(stderr, "[pyrxmesh] quadwild_preprocess: obj_write=%.1fms, mesh_build=%.1fms, "
+        fprintf(stderr, "[pyrxmesh] quadwild_preprocess: prep=%.1fms, mesh_build=%.1fms, "
                 "gpu=%.1fms, readback=%.1fms\n",
-                t_write, t_build, t_gpu, t_readback);
+                t_prep, t_build, t_gpu, t_readback);
         fprintf(stderr, "[pyrxmesh] quadwild_preprocess: output %d verts, %d faces, total %.1f ms\n",
                 result.num_vertices, result.num_faces, ms_since(t0));
     }

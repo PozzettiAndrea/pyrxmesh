@@ -185,6 +185,73 @@ void FeatureFinder::prune_small_features(int min_feature_size)
     }
 }
 
+void FeatureFinder::erode_dilate(int steps)
+{
+    const auto& m = m_mesh;
+    int num_halfedges = m.n_halfedges();
+
+    // Compute feature valence per vertex
+    auto compute_feature_valence = [&]() -> std::vector<int> {
+        std::vector<int> valence(m.n_vertices(), 0);
+        for (int hij = 0; hij < num_halfedges; hij++) {
+            if (!is_feature_halfedge(hij)) continue;
+            int hji = m.opp[hij];
+            if (hij > hji) continue;
+            valence[m.v_rep[m.to[hij]]]++;
+            valence[m.v_rep[m.to[hji]]]++;
+        }
+        return valence;
+    };
+
+    // Mark junction vertices (feature valence > 2)
+    auto init_valence = compute_feature_valence();
+    std::vector<bool> is_junction(m.n_vertices(), false);
+    for (size_t i = 0; i < is_junction.size(); i++) {
+        if (init_valence[i] > 2) is_junction[i] = true;
+    }
+
+    // Save original features for dilate
+    std::vector<int> orig_features;
+    for (int hij = 0; hij < num_halfedges; hij++) {
+        if (is_feature_halfedge(hij)) orig_features.push_back(hij);
+    }
+
+    // Erode: remove feature edges at chain endpoints
+    for (int s = 0; s < steps; s++) {
+        auto val = compute_feature_valence();
+        for (int hij = 0; hij < num_halfedges; hij++) {
+            if (!is_feature_halfedge(hij)) continue;
+            int hji = m.opp[hij];
+            if (hij > hji) continue;
+            int v0 = m.v_rep[m.to[hij]];
+            int v1 = m.v_rep[m.to[hji]];
+            if ((val[v0] <= 2 && !is_junction[v0]) ||
+                (val[v1] <= 2 && !is_junction[v1])) {
+                set_feature_edge(hij, false);
+            }
+        }
+    }
+
+    // Dilate: re-add original features at chain endpoints
+    for (int s = 0; s < steps; s++) {
+        auto val = compute_feature_valence();
+        for (int hij : orig_features) {
+            if (is_feature_halfedge(hij)) continue;
+            int v0 = m.v_rep[m.to[hij]];
+            int v1 = m.v_rep[m.to[m.opp[hij]]];
+            if ((val[v0] == 2 && !is_junction[v0]) ||
+                (val[v1] == 2 && !is_junction[v1])) {
+                set_feature_edge(hij, true);
+            }
+        }
+    }
+
+    int n_final = 0;
+    for (int hij = 0; hij < num_halfedges; hij++)
+        if (is_feature_halfedge(hij) && hij < m.opp[hij]) n_final++;
+    spdlog::info("erode_dilate({} steps): {} feature edges", steps, n_final);
+}
+
 
 void FeatureFinder::prune_cycles()
 {

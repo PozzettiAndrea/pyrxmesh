@@ -30,6 +30,7 @@ CutMetricGenerator::CutMetricGenerator(
     // Get components
     igl::facet_components(F_cut, components);
     int num_components = components.maxCoeff() + 1;
+    spdlog::info("CutMetricGenerator: {} facet components from {} faces", num_components, F_cut.rows());
 
     // Build each component
     for (int i = 0; i < num_components; ++i) {

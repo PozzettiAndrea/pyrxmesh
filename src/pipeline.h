@@ -6,8 +6,88 @@
 #define PYRXMESH_PIPELINE_H
 
 #include <cstdint>
+#include <cstdio>
+#include <filesystem>
 #include <string>
 #include <vector>
+
+// --- Fast OBJ writer (shared by all ops) ---
+// Uses snprintf into a large buffer + bulk fwrite to minimize syscalls.
+inline std::string write_temp_obj_fast(
+    const double* vertices, int nv, const int* faces, int nf,
+    const char* prefix)
+{
+    auto tmp = std::filesystem::temp_directory_path() / (std::string(prefix) + ".obj");
+    FILE* f = fopen(tmp.string().c_str(), "w");
+    constexpr size_t BUF_CAP = 8 * 1024 * 1024;  // 8MB
+    constexpr size_t OBJ_LINE_MAX = 80;
+    std::vector<char> buf(BUF_CAP);
+    size_t pos = 0;
+
+    auto flush_buf = [&]() {
+        fwrite(buf.data(), 1, pos, f);
+        pos = 0;
+    };
+
+    for (int i = 0; i < nv; ++i) {
+        if (pos + OBJ_LINE_MAX > BUF_CAP) flush_buf();
+        pos += snprintf(buf.data() + pos, OBJ_LINE_MAX, "v %f %f %f\n",
+                        vertices[i*3], vertices[i*3+1], vertices[i*3+2]);
+    }
+    for (int i = 0; i < nf; ++i) {
+        if (pos + OBJ_LINE_MAX > BUF_CAP) flush_buf();
+        pos += snprintf(buf.data() + pos, OBJ_LINE_MAX, "f %d %d %d\n",
+                        faces[i*3]+1, faces[i*3+1]+1, faces[i*3+2]+1);
+    }
+    if (pos > 0) flush_buf();
+    fclose(f);
+    return tmp.string();
+}
+
+// --- Helpers: convert flat arrays to RXMesh's vector-of-vectors format ---
+// Used to construct RXMeshStatic/RXMeshDynamic directly without OBJ files.
+
+inline std::vector<std::vector<uint32_t>> flat_faces_to_fv(
+    const int* faces, int num_faces)
+{
+    std::vector<std::vector<uint32_t>> fv(num_faces);
+    for (int i = 0; i < num_faces; ++i) {
+        fv[i] = {
+            static_cast<uint32_t>(faces[i * 3 + 0]),
+            static_cast<uint32_t>(faces[i * 3 + 1]),
+            static_cast<uint32_t>(faces[i * 3 + 2])
+        };
+    }
+    return fv;
+}
+
+inline std::vector<std::vector<float>> flat_verts_to_vv(
+    const double* vertices, int num_vertices)
+{
+    std::vector<std::vector<float>> vv(num_vertices);
+    for (int i = 0; i < num_vertices; ++i) {
+        vv[i] = {
+            static_cast<float>(vertices[i * 3 + 0]),
+            static_cast<float>(vertices[i * 3 + 1]),
+            static_cast<float>(vertices[i * 3 + 2])
+        };
+    }
+    return vv;
+}
+
+inline std::vector<std::vector<float>> flat_verts_to_vv_float(
+    const float* vertices, int num_vertices)
+{
+    std::vector<std::vector<float>> vv(num_vertices);
+    for (int i = 0; i < num_vertices; ++i) {
+        vv[i] = {
+            vertices[i * 3 + 0],
+            vertices[i * 3 + 1],
+            vertices[i * 3 + 2]
+        };
+    }
+    return vv;
+}
 
 // --- Mesh info result ---
 struct MeshInfo {

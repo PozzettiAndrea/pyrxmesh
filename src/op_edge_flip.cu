@@ -29,18 +29,7 @@ static struct arg {
 
 #include "Remesh/flip.cuh"
 
-static std::string write_temp_obj_ef(
-    const double* vertices, int nv, const int* faces, int nf)
-{
-    auto tmp = std::filesystem::temp_directory_path() / "pyrxmesh_eflip_in.obj";
-    FILE* f = fopen(tmp.string().c_str(), "w");
-    for (int i = 0; i < nv; ++i)
-        fprintf(f, "v %f %f %f\n", vertices[i*3], vertices[i*3+1], vertices[i*3+2]);
-    for (int i = 0; i < nf; ++i)
-        fprintf(f, "f %d %d %d\n", faces[i*3]+1, faces[i*3+1]+1, faces[i*3+2]+1);
-    fclose(f);
-    return tmp.string();
-}
+// Uses write_temp_obj_fast from pipeline.h
 
 static MeshResult read_obj_ef(const std::string& path)
 {
@@ -78,14 +67,16 @@ MeshResult pipeline_edge_flip(
                 num_vertices, num_faces);
 
     auto tp = clk::now();
-    auto in_path = write_temp_obj_ef(vertices, num_vertices, faces, num_faces);
+    auto fv = flat_faces_to_fv(faces, num_faces);
+    auto vv = flat_verts_to_vv(vertices, num_vertices);
     auto out_path = (std::filesystem::temp_directory_path() / "pyrxmesh_eflip_out.obj").string();
-    double t_write = ms_since(tp);
+    double t_prep = ms_since(tp);
 
-    Arg.obj_file_name = in_path;
+    Arg.obj_file_name = "pyrxmesh_eflip";
 
     tp = clk::now();
-    RXMeshDynamic rx(in_path, "", 512, 2.0f, 2);
+    RXMeshDynamic rx(fv, "", 512, 2.0f, 2);
+    rx.add_vertex_coordinates(vv);
     double t_build = ms_since(tp);
 
     if (!rx.is_edge_manifold())
@@ -122,13 +113,12 @@ MeshResult pipeline_edge_flip(
     auto result = read_obj_ef(out_path);
     double t_readback = ms_since(tp);
 
-    std::filesystem::remove(in_path);
     std::filesystem::remove(out_path);
     CUDA_ERROR(cudaFree(d_buffer));
 
     if (verbose) {
-        fprintf(stderr, "[pyrxmesh] edge_flip: obj_write=%.1fms, mesh_build=%.1fms, gpu=%.1fms, readback=%.1fms\n",
-                t_write, t_build, t_gpu, t_readback);
+        fprintf(stderr, "[pyrxmesh] edge_flip: prep=%.1fms, mesh_build=%.1fms, gpu=%.1fms, readback=%.1fms\n",
+                t_prep, t_build, t_gpu, t_readback);
         fprintf(stderr, "[pyrxmesh] edge_flip: output %d verts, %d faces, total %.1f ms\n",
                 result.num_vertices, result.num_faces, ms_since(t0));
     }

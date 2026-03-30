@@ -27,8 +27,12 @@ OUT_DIR = os.path.join(SCRIPT_DIR, "_site", "penner_vs_quadwild_dataset")
 WORK_DIR = os.path.join(SCRIPT_DIR, "_site", "penner_vs_quadwild_dataset", "_work")
 
 PENNERQUAD_BIN = os.path.join(SCRIPT_DIR, "..", "tools", "pennerquad", "build", "pennerquad")
+PENNER_BIN_DIR = os.path.join(SCRIPT_DIR, "..", "build", "extern", "penner", "bin")
 QUADWILD_BIN = os.path.join(SCRIPT_DIR, "..", "build", "extern", "quadwild", "Build", "bin", "quadwild")
 QUADWILD_LIB = os.path.join(SCRIPT_DIR, "..", "build", "extern", "quadwild", "Build", "lib")
+
+# Ensure pennerquad finds our rebuilt parameterize_aligned
+os.environ["PATH"] = os.path.abspath(PENNER_BIN_DIR) + ":" + os.environ.get("PATH", "")
 QUADWILD_CFG = os.path.join(SCRIPT_DIR, "..", "extern", "quadwild", "quadwild")
 
 BG_COLOR = "#0d1117"

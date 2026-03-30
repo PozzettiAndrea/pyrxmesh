@@ -539,9 +539,12 @@ class RXMesh
     void build(const std::vector<std::vector<uint32_t>>& fv,
                const std::string                         patcher_file);
 
-    void build_single_patch_ltog(const std::vector<std::vector<uint32_t>>& fv,
-                                 const std::vector<std::vector<uint32_t>>& ev,
-                                 const uint32_t patch_id);
+    void build_single_patch_ltog(
+        const std::vector<std::vector<uint32_t>>& fv,
+        const std::vector<std::vector<uint32_t>>& ev,
+        const uint32_t                            patch_id,
+        const std::vector<uint32_t>&              patch_edges,
+        const std::vector<uint32_t>&              patch_verts);
 
     void build_single_patch_topology(
         const std::vector<std::vector<uint32_t>>& fv,

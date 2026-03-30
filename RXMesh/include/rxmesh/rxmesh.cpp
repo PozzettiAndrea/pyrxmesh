@@ -6,6 +6,7 @@
 #include <numeric>
 #include <queue>
 #include <set>
+#include <unordered_set>
 
 #include "patcher/patcher.h"
 #include "rxmesh/context.h"
@@ -353,9 +354,25 @@ void RXMesh::build(const std::vector<std::vector<uint32_t>>& fv,
     m_h_num_owned_v.resize(get_max_num_patches(), 0);
     m_h_num_owned_e.resize(get_max_num_patches(), 0);
 
+    // Pre-build per-patch edge and vertex lists (O(E+V) total)
+    // so each patch only iterates its own elements, not all 10M+.
+    std::vector<std::vector<uint32_t>> edges_by_patch(get_num_patches());
+    std::vector<std::vector<uint32_t>> verts_by_patch(get_num_patches());
+    for (uint32_t e = 0; e < m_num_edges; ++e) {
+        uint32_t pid = m_patcher->get_edge_patch_id(e);
+        if (pid < get_num_patches())
+            edges_by_patch[pid].push_back(e);
+    }
+    for (uint32_t v = 0; v < m_num_vertices; ++v) {
+        uint32_t pid = m_patcher->get_vertex_patch_id(v);
+        if (pid < get_num_patches())
+            verts_by_patch[pid].push_back(v);
+    }
+
 #pragma omp parallel for
     for (int p = 0; p < static_cast<int>(get_num_patches()); ++p) {
-        build_single_patch_ltog(fv, ev, p);
+        build_single_patch_ltog(fv, ev, p,
+                                edges_by_patch[p], verts_by_patch[p]);
     }
 
     // calc max elements for use in build_device (which populates
@@ -703,7 +720,9 @@ void RXMesh::calc_max_elements()
 void RXMesh::build_single_patch_ltog(
     const std::vector<std::vector<uint32_t>>& fv,
     const std::vector<std::vector<uint32_t>>& ev,
-    const uint32_t                            patch_id)
+    const uint32_t                            patch_id,
+    const std::vector<uint32_t>&              patch_edges,
+    const std::vector<uint32_t>&              patch_verts)
 {
     // patch start and end
     const uint32_t p_start =
@@ -723,8 +742,12 @@ void RXMesh::build_single_patch_ltog(
     m_h_patches_ltog_v[patch_id].reserve(3 * total_patch_num_faces);
     m_h_patches_ltog_e[patch_id].reserve(3 * total_patch_num_faces);
 
-    std::vector<bool> is_vertex_added(m_num_vertices, false);
-    std::vector<bool> is_edge_added(m_num_edges, false);
+    // Use local sets instead of global-sized vector<bool> — each patch
+    // only touches ~500 edges and ~300 vertices, not 10M+.
+    std::unordered_set<uint32_t> added_verts;
+    std::unordered_set<uint32_t> added_edges;
+    added_verts.reserve(3 * total_patch_num_faces);
+    added_edges.reserve(3 * total_patch_num_faces);
 
     // add faces owned by this patch
     auto add_new_face = [&](uint32_t global_face_id, uint16_t local_face_id) {
@@ -736,15 +759,11 @@ void RXMesh::build_single_patch_ltog(
 
             uint32_t edge_id = get_edge_id(v0, v1);
 
-            if (!is_vertex_added[v0]) {
-                is_vertex_added[v0] = true;
-
+            if (added_verts.insert(v0).second) {
                 m_h_patches_ltog_v[patch_id].push_back(v0);
             }
 
-            if (!is_edge_added[edge_id]) {
-                is_edge_added[edge_id] = true;
-
+            if (added_edges.insert(edge_id).second) {
                 m_h_patches_ltog_e[patch_id].push_back(edge_id);
             }
         }
@@ -761,32 +780,22 @@ void RXMesh::build_single_patch_ltog(
         add_new_face(face_id, local_face_id++);
     }
 
-    // The previous loop over faces should already insert all owned edges and
-    // vertices into `ltog`. However, we still iterate over owned edges and
-    // owned vertices as a safeguard, in case the patcher behavior changes
-    // in the future. At the moment, the patcher marks an edge as owned by
-    // patch P only if at least one of its incident faces is owned by P. Same
-    // thing for vertices
-
-    // add edges owned by this patch
-    for (uint32_t e = 0; e < m_num_edges; ++e) {
-        // if the edge is owned by this patch but it was not added yet
-        if (m_patcher->get_edge_patch_id(e) == patch_id && !is_edge_added[e]) {
+    // Safeguard: add any owned edges/vertices not already found via faces.
+    // Uses pre-built per-patch lists instead of scanning all edges/vertices.
+    for (uint32_t e : patch_edges) {
+        if (added_edges.insert(e).second) {
             m_h_patches_ltog_e[patch_id].push_back(e);
             for (uint32_t i = 0; i < 2; ++i) {
                 uint32_t v = ev[e][i];
-                if (!is_vertex_added[v]) {
+                if (added_verts.insert(v).second) {
                     m_h_patches_ltog_v[patch_id].push_back(v);
                 }
             }
         }
     }
 
-    // add vertices owned by this patch
-    for (uint32_t v = 0; v < m_num_vertices; ++v) {
-        // if the edge is owned by this patch but it was not added yet
-        if (m_patcher->get_vertex_patch_id(v) == patch_id &&
-            !is_vertex_added[v]) {
+    for (uint32_t v : patch_verts) {
+        if (added_verts.insert(v).second) {
             m_h_patches_ltog_v[patch_id].push_back(v);
         }
     }

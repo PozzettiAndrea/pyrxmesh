@@ -68,6 +68,15 @@ public:
     void prune_cycles();
 
     /**
+     * @brief Erode/dilate feature edges (matching QuadWild's morphological cleanup).
+     * Erode: remove short feature edges at chain endpoints.
+     * Dilate: re-add original feature edges at chain endpoints.
+     *
+     * @param steps: number of erode+dilate iterations (default: 4)
+     */
+    void erode_dilate(int steps = 4);
+
+    /**
      * @brief Greedily attempt to prune halfedges without producing isolated vertices.
      * 
      */

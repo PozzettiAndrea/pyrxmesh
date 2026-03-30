@@ -79,10 +79,10 @@ public:
 
         // iterate line search with constraint projection until converged
         while (true) {
-            spdlog::info("Beginning iteration {}: {} solves so far", log.num_iter, num_solves);
+            log.max_error = constraint.cwiseAbs().maxCoeff();
+            spdlog::info("itr({}) solves({}) max_error({}) lambda({})", log.num_iter, num_solves, log.max_error, lambda);
 
             // Check termination conditions
-            log.max_error = constraint.cwiseAbs().maxCoeff();
             write_data_log_entry();
             if (is_converged()) break;
 

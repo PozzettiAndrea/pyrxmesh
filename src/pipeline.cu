@@ -24,60 +24,9 @@
 
 using namespace rxmesh;
 
-// ---------------------------------------------------------------------------
-// Helpers: convert between flat arrays and RXMesh's vector-of-vectors format
-// ---------------------------------------------------------------------------
+// Helpers (flat_faces_to_fv, flat_verts_to_vv) now in pipeline.h
 
-static std::vector<std::vector<uint32_t>> flat_faces_to_fv(
-    const int* faces, int num_faces)
-{
-    std::vector<std::vector<uint32_t>> fv(num_faces);
-    for (int i = 0; i < num_faces; ++i) {
-        fv[i] = {
-            static_cast<uint32_t>(faces[i * 3 + 0]),
-            static_cast<uint32_t>(faces[i * 3 + 1]),
-            static_cast<uint32_t>(faces[i * 3 + 2])
-        };
-    }
-    return fv;
-}
-
-static std::vector<std::vector<float>> flat_verts_to_vv(
-    const double* vertices, int num_vertices)
-{
-    std::vector<std::vector<float>> vv(num_vertices);
-    for (int i = 0; i < num_vertices; ++i) {
-        vv[i] = {
-            static_cast<float>(vertices[i * 3 + 0]),
-            static_cast<float>(vertices[i * 3 + 1]),
-            static_cast<float>(vertices[i * 3 + 2])
-        };
-    }
-    return vv;
-}
-
-// Write a mesh to a temp OBJ file, returning the path
-static std::string write_temp_obj(
-    const double* vertices, int num_vertices,
-    const int* faces, int num_faces,
-    const std::string& prefix = "pyrxmesh_in")
-{
-    auto tmp = std::filesystem::temp_directory_path() / (prefix + ".obj");
-    std::string path = tmp.string();
-    FILE* f = fopen(path.c_str(), "w");
-    if (!f) throw std::runtime_error("Cannot create temp OBJ: " + path);
-
-    for (int i = 0; i < num_vertices; ++i) {
-        fprintf(f, "v %f %f %f\n",
-            vertices[i*3+0], vertices[i*3+1], vertices[i*3+2]);
-    }
-    for (int i = 0; i < num_faces; ++i) {
-        fprintf(f, "f %d %d %d\n",
-            faces[i*3+0]+1, faces[i*3+1]+1, faces[i*3+2]+1);
-    }
-    fclose(f);
-    return path;
-}
+// Uses write_temp_obj_fast from pipeline.h
 
 // Read a mesh result from an OBJ file
 static MeshResult read_obj_result(const std::string& path)
@@ -721,7 +670,7 @@ MeshResult pipeline_mcf(
     constexpr uint32_t blockThreads = 256;
 
     // Use temp OBJ for construction (MCF needs file-based init for patches)
-    auto in_path = write_temp_obj(vertices, num_vertices, faces, num_faces, "pyrxmesh_mcf_in");
+    auto in_path = write_temp_obj_fast(vertices, num_vertices, faces, num_faces, "pyrxmesh_mcf_in");
     RXMeshStatic rx(in_path, "", 256);
 
     auto coords = rx.get_input_vertex_coordinates();

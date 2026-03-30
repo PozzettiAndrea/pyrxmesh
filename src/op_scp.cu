@@ -107,17 +107,12 @@ AttributeResult pipeline_scp(
     bool verbose)
 {
     auto t0 = std::chrono::high_resolution_clock::now();
-    // Write to temp OBJ for file-based construction
-    auto tmp = std::filesystem::temp_directory_path() / "pyrxmesh_scp_in.obj";
-    FILE* fp = fopen(tmp.string().c_str(), "w");
-    for (int i = 0; i < num_vertices; ++i)
-        fprintf(fp, "v %f %f %f\n", vertices[i*3], vertices[i*3+1], vertices[i*3+2]);
-    for (int i = 0; i < num_faces; ++i)
-        fprintf(fp, "f %d %d %d\n", faces[i*3]+1, faces[i*3+1]+1, faces[i*3+2]+1);
-    fclose(fp);
+    // Build RXMeshStatic directly from arrays
+    auto fv = flat_faces_to_fv(faces, num_faces);
+    auto vv = flat_verts_to_vv(vertices, num_vertices);
 
-    RXMeshStatic rx(tmp.string());
-    std::filesystem::remove(tmp);
+    RXMeshStatic rx(fv);
+    rx.add_vertex_coordinates(vv);
 
     if (rx.is_closed())
         throw std::runtime_error("SCP requires a mesh with boundaries (not closed).");

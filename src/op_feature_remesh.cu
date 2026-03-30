@@ -263,18 +263,7 @@ __global__ static void detect_features_dynamic_kernel(
     query.dispatch<Op::EVDiamond>(block, shrd_alloc, compute);
 }
 
-static std::string write_temp_obj_fr(
-    const double* vertices, int nv, const int* faces, int nf)
-{
-    auto tmp = std::filesystem::temp_directory_path() / "pyrxmesh_fremesh_in.obj";
-    FILE* f = fopen(tmp.string().c_str(), "w");
-    for (int i = 0; i < nv; ++i)
-        fprintf(f, "v %f %f %f\n", vertices[i*3], vertices[i*3+1], vertices[i*3+2]);
-    for (int i = 0; i < nf; ++i)
-        fprintf(f, "f %d %d %d\n", faces[i*3]+1, faces[i*3+1]+1, faces[i*3+2]+1);
-    fclose(f);
-    return tmp.string();
-}
+// Uses write_temp_obj_fast from pipeline.h
 
 static MeshResult read_obj_fr(const std::string& path)
 {
@@ -318,17 +307,19 @@ MeshResult pipeline_feature_remesh(
                 num_vertices, num_faces, relative_len, crease_angle_deg);
 
     auto tp = clk::now();
-    auto in_path = write_temp_obj_fr(vertices, num_vertices, faces, num_faces);
+    auto fv = flat_faces_to_fv(faces, num_faces);
+    auto vv = flat_verts_to_vv(vertices, num_vertices);
     auto out_path = (std::filesystem::temp_directory_path() / "pyrxmesh_fremesh_out.obj").string();
     double t_write = ms_since(tp);
 
-    Arg.obj_file_name = in_path;
+    Arg.obj_file_name = "pyrxmesh_fremesh";
     Arg.relative_len = static_cast<float>(relative_len);
     Arg.num_iter = static_cast<uint32_t>(iterations);
     Arg.num_smooth_iters = smooth_iterations;
 
     tp = clk::now();
-    RXMeshDynamic rx(in_path, "", 512, 2.0f, 2);
+    RXMeshDynamic rx(fv, "", 512, 2.0f, 2);
+    rx.add_vertex_coordinates(vv);
     double t_build = ms_since(tp);
 
     if (!rx.is_edge_manifold())
@@ -695,7 +686,7 @@ MeshResult pipeline_feature_remesh(
                 "checkpoint %.1f ms\n",
                 mid_result.num_vertices, mid_result.num_faces, t_checkpoint);
 
-    std::filesystem::remove(in_path);
+    // no input file to clean up (direct array construction)
     std::filesystem::remove(mid_path);
 
     // Ensure all GPU work is complete before returning.
@@ -745,16 +736,18 @@ QuadwildRemeshResult pipeline_quadwild_remesh(
                 num_vertices, num_faces, isotropic_iterations,
                 adaptive_iterations, relative_len);
 
-    // ── Write temp OBJ + build RXMeshDynamic ──────────────────────────
+    // ── Build RXMeshDynamic directly from arrays ──────────────────────
     auto tp = clk::now();
-    auto in_path = write_temp_obj_fr(vertices, num_vertices, faces, num_faces);
+    auto fv = flat_faces_to_fv(faces, num_faces);
+    auto vv = flat_verts_to_vv(vertices, num_vertices);
     auto out_path = (std::filesystem::temp_directory_path() / "pyrxmesh_qw_out.obj").string();
 
-    Arg.obj_file_name = in_path;
+    Arg.obj_file_name = "pyrxmesh_fremesh";
     Arg.relative_len = static_cast<float>(relative_len);
     Arg.num_smooth_iters = smooth_iterations;
 
-    RXMeshDynamic rx(in_path, "", 512, 2.0f, 2);
+    RXMeshDynamic rx(fv, "", 512, 2.0f, 2);
+    rx.add_vertex_coordinates(vv);
     double t_build = ms_since(tp);
 
     if (!rx.is_edge_manifold())
@@ -1050,7 +1043,7 @@ QuadwildRemeshResult pipeline_quadwild_remesh(
     CUDA_ERROR(cudaFree(d_ref_V));
     CUDA_ERROR(cudaFree(d_ref_F));
     CUDA_ERROR(cudaFree(d_buffer));
-    std::filesystem::remove(in_path);
+    // no input file to clean up (direct array construction)
     CUDA_ERROR(cudaDeviceSynchronize());
 
     if (verbose)

@@ -613,6 +613,71 @@ def gen_edge_ops(bunny_v, bunny_f):
     }
 
 
+def gen_asian_dragon_remesh(asian_dragon_v, asian_dragon_f):
+    """Generate isotropic remeshing demo on the Stanford Asian Dragon (3.6M verts)."""
+    remesh_demos = []
+
+    print("  Rendering: asian_dragon_remesh")
+    print(f"    Input: {len(asian_dragon_v):,} verts, {len(asian_dragon_f):,} faces")
+
+    t_total = time.perf_counter()
+
+    t0 = time.perf_counter()
+    print("    [1/3] Writing temp OBJ + RXMesh construction...", flush=True)
+    # Time the actual remesh call which includes OBJ I/O + construction + GPU work
+    verts_out, faces_out = pyrxmesh.remesh(asian_dragon_v, asian_dragon_f,
+                                            relative_len=1.0, iterations=2, verbose=True)
+    t_remesh = time.perf_counter() - t0
+    print(f"    Remesh total: {fmt_time(t_remesh)}")
+    print(f"    Output: {len(verts_out):,} verts, {len(faces_out):,} faces")
+
+    t0 = time.perf_counter()
+    mesh_in = pv_mesh_from_numpy(asian_dragon_v, asian_dragon_f)
+    mesh_out = pv_mesh_from_numpy(verts_out, faces_out)
+    t_pv = time.perf_counter() - t0
+    print(f"    PyVista mesh build: {fmt_time(t_pv)}")
+
+    prefix = os.path.join(OUT_DIR, "asian_dragon_remesh")
+
+    t0 = time.perf_counter()
+    render_mesh(mesh_in, f"{prefix}_before.png",
+                f"Input: {len(asian_dragon_v):,} verts, {len(asian_dragon_f):,} tris",
+                show_edges=False)
+    t_r1 = time.perf_counter() - t0
+    print(f"    Render input: {fmt_time(t_r1)}")
+
+    t0 = time.perf_counter()
+    render_mesh(mesh_out, f"{prefix}_after.png",
+                f"Isotropic Remeshed: {len(verts_out):,} verts, {len(faces_out):,} tris  ({fmt_time(t_remesh)})",
+                color=MESH_COLOR_OUT, show_edges=False)
+    t_r2 = time.perf_counter() - t0
+    print(f"    Render output: {fmt_time(t_r2)}")
+
+    t_all = time.perf_counter() - t_total
+    print(f"    Total section time: {fmt_time(t_all)}")
+
+    remesh_demos.append({
+        "name": "asian_dragon_remesh", "type": "before_after",
+        "verts_in": len(asian_dragon_v), "faces_in": len(asian_dragon_f),
+        "verts_out": len(verts_out), "faces_out": len(faces_out),
+        "elapsed": t_remesh, "after_label": "Isotropic Remeshed",
+        "code": textwrap.dedent("""\
+            v, f = pyrxmesh.load_obj("xyzrgb_dragon.obj")
+            # 3.6M verts, 7.2M faces
+            v_re, f_re = pyrxmesh.remesh(
+                v, f, relative_len=1.0,
+                iterations=2,
+            )"""),
+        "verbose": "",
+    })
+
+    return {
+        "title": "Isotropic Remeshing of Asian Dragon",
+        "subtitle": "GPU-accelerated remeshing on 3.6M vertex mesh (Stanford Asian Dragon)",
+        "demos": remesh_demos,
+    }
+
+
 def gen_patches(bunny_v, bunny_f, dragon_v, dragon_f):
     """Generate patch decomposition demos."""
     patch_demos = []
@@ -717,6 +782,7 @@ SECTIONS = [
     ("decimation", gen_decimation, ["dragon_v", "dragon_f"]),
     ("remeshing", gen_remeshing, ["bunny_v", "bunny_f", "dragon_v", "dragon_f"]),
     ("edge_ops", gen_edge_ops, ["bunny_v", "bunny_f"]),
+    ("asian_dragon_remesh", gen_asian_dragon_remesh, ["asian_dragon_v", "asian_dragon_f"]),
     ("patches", gen_patches, ["bunny_v", "bunny_f", "dragon_v", "dragon_f"]),
 ]
 
@@ -744,6 +810,15 @@ def main():
     print(f"  bunny: {len(bunny_v)} verts, {len(bunny_f)} faces")
     print(f"  dragon: {len(dragon_v)} verts, {len(dragon_f)} faces")
 
+    asian_dragon_path = os.path.join(RXMESH_INPUT, "xyzrgb_dragon.obj")
+    if os.path.exists(asian_dragon_path):
+        print("Loading Asian Dragon (3.6M verts)...")
+        asian_dragon_v, asian_dragon_f = pyrxmesh.load_obj(asian_dragon_path)
+        print(f"  asian dragon: {len(asian_dragon_v)} verts, {len(asian_dragon_f)} faces")
+    else:
+        print("  asian dragon: not found, skipping")
+        asian_dragon_v = asian_dragon_f = None
+
     # Only build persistent meshes if needed
     needs_persistent = only in (None, "analysis", "smoothing")
     bunny_mesh = dragon_mesh = None
@@ -755,6 +830,7 @@ def main():
     all_args = {
         "bunny_v": bunny_v, "bunny_f": bunny_f, "bunny_mesh": bunny_mesh,
         "dragon_v": dragon_v, "dragon_f": dragon_f, "dragon_mesh": dragon_mesh,
+        "asian_dragon_v": asian_dragon_v, "asian_dragon_f": asian_dragon_f,
     }
 
     sections = []

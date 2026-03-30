@@ -29,36 +29,36 @@ static struct arg {
 
 #include "Remesh/remesh_rxmesh.cuh"
 
-static std::string write_temp_obj_rm(
-    const double* vertices, int nv, const int* faces, int nf)
-{
-    auto tmp = std::filesystem::temp_directory_path() / "pyrxmesh_remesh_in.obj";
-    FILE* f = fopen(tmp.string().c_str(), "w");
-    for (int i = 0; i < nv; ++i)
-        fprintf(f, "v %f %f %f\n", vertices[i*3], vertices[i*3+1], vertices[i*3+2]);
-    for (int i = 0; i < nf; ++i)
-        fprintf(f, "f %d %d %d\n", faces[i*3]+1, faces[i*3+1]+1, faces[i*3+2]+1);
-    fclose(f);
-    return tmp.string();
-}
+// Uses write_temp_obj_fast from pipeline.h
 
-static MeshResult read_obj_rm(const std::string& path)
+// Extract mesh directly from RXMeshDynamic — no OBJ round-trip.
+static MeshResult extract_mesh_direct(RXMeshDynamic& rx)
 {
-    std::vector<std::vector<float>>    verts;
-    std::vector<std::vector<uint32_t>> faces;
-    import_obj(path, verts, faces);
+    rx.update_host();
+    auto coords = rx.get_input_vertex_coordinates();
+    coords->move(DEVICE, HOST);
+
+    std::vector<glm::vec3> v_list;
+    rx.create_vertex_list(v_list, *coords);
+
+    std::vector<glm::uvec3> f_list;
+    rx.create_face_list(f_list);
 
     MeshResult r;
-    r.num_vertices = verts.size();
-    r.num_faces = faces.size();
+    r.num_vertices = static_cast<int>(v_list.size());
+    r.num_faces = static_cast<int>(f_list.size());
     r.vertices.resize(r.num_vertices * 3);
     r.faces.resize(r.num_faces * 3);
-    for (int i = 0; i < r.num_vertices; ++i)
-        for (int j = 0; j < 3; ++j)
-            r.vertices[i*3+j] = verts[i][j];
-    for (int i = 0; i < r.num_faces; ++i)
-        for (int j = 0; j < 3; ++j)
-            r.faces[i*3+j] = faces[i][j];
+    for (int i = 0; i < r.num_vertices; ++i) {
+        r.vertices[i*3+0] = v_list[i][0];
+        r.vertices[i*3+1] = v_list[i][1];
+        r.vertices[i*3+2] = v_list[i][2];
+    }
+    for (int i = 0; i < r.num_faces; ++i) {
+        r.faces[i*3+0] = f_list[i][0];
+        r.faces[i*3+1] = f_list[i][1];
+        r.faces[i*3+2] = f_list[i][2];
+    }
     return r;
 }
 
@@ -80,17 +80,18 @@ MeshResult pipeline_remesh(
                 num_vertices, num_faces, relative_len);
 
     auto tp = clk::now();
-    auto in_path = write_temp_obj_rm(vertices, num_vertices, faces, num_faces);
-    auto out_path = (std::filesystem::temp_directory_path() / "pyrxmesh_remesh_out.obj").string();
-    double t_write = ms_since(tp);
+    auto fv = flat_faces_to_fv(faces, num_faces);
+    auto vv = flat_verts_to_vv(vertices, num_vertices);
+    double t_prep = ms_since(tp);
 
-    Arg.obj_file_name = in_path;
+    Arg.obj_file_name = "pyrxmesh_remesh";
     Arg.relative_len = static_cast<float>(relative_len);
     Arg.num_iter = static_cast<uint32_t>(iterations);
     Arg.num_smooth_iters = smooth_iterations;
 
     tp = clk::now();
-    RXMeshDynamic rx(in_path, "", 512, 2.0f, 2);
+    RXMeshDynamic rx(fv, "", 512, 2.0f, 2);
+    rx.add_vertex_coordinates(vv);
     double t_build = ms_since(tp);
 
     if (!rx.is_edge_manifold())
@@ -102,16 +103,11 @@ MeshResult pipeline_remesh(
     double t_gpu = ms_since(tp);
 
     tp = clk::now();
-    auto coords = rx.get_input_vertex_coordinates();
-    rx.export_obj(out_path, *coords);
-    auto result = read_obj_rm(out_path);
+    auto result = extract_mesh_direct(rx);
     double t_readback = ms_since(tp);
-
-    std::filesystem::remove(in_path);
-    std::filesystem::remove(out_path);
     if (verbose) {
-        fprintf(stderr, "[pyrxmesh] remesh: obj_write=%.1fms, mesh_build=%.1fms, gpu=%.1fms, readback=%.1fms\n",
-                t_write, t_build, t_gpu, t_readback);
+        fprintf(stderr, "[pyrxmesh] remesh: prep=%.1fms, mesh_build=%.1fms, gpu=%.1fms, readback=%.1fms\n",
+                t_prep, t_build, t_gpu, t_readback);
         fprintf(stderr, "[pyrxmesh] remesh: output %d verts, %d faces, total %.1f ms\n",
                 result.num_vertices, result.num_faces, ms_since(t0));
     }

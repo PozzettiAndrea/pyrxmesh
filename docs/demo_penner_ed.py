@@ -1,10 +1,10 @@
 """
-Penner pipeline step-by-step visualization.
-Shows each intermediate stage from input mesh to final quad mesh.
+Penner pipeline with erode/dilate — step-by-step visualization.
+Same as demo_penner but always uses --erode_dilate for feature cleanup.
 
 Usage:
-    python docs/generate_penner_only.py
-    python docs/generate_penner_only.py --mesh dragon
+    python docs/demo_penner_ed.py
+    python docs/demo_penner_ed.py --mesh dragon
 """
 
 import os
@@ -22,7 +22,7 @@ RXMESH_INPUT = os.path.join(SCRIPT_DIR, "..", "RXMesh", "input")
 PENNER_BIN = os.path.join(SCRIPT_DIR, "..", "build", "extern", "penner", "bin", "parameterize_aligned")
 QUANT_BIN = os.path.join(SCRIPT_DIR, "..", "build", "extern", "quantization", "Quantization")
 QEX_BIN = os.path.join(SCRIPT_DIR, "..", "build", "extern", "libqex", "extract_quads")
-OUT_DIR = os.path.join(SCRIPT_DIR, "_site", "demo_penner")
+OUT_DIR = os.path.join(SCRIPT_DIR, "_site", "demo_penner_ed")
 
 BG_COLOR = "#0d1117"
 TEXT_COLOR = "#c9d1d9"
@@ -249,7 +249,6 @@ def main():
     parser = argparse.ArgumentParser(description="Penner pipeline step-by-step")
     parser.add_argument("--mesh", default="dragon")
     parser.add_argument("--sa", default="3", help="Quantization auto-scale multiplier")
-    parser.add_argument("--no-ed", action="store_true", help="Disable erode/dilate feature cleanup")
     args = parser.parse_args()
 
     import pyvista as pv
@@ -271,125 +270,68 @@ def main():
 
     # ── Step 1: Run Penner (produces all intermediate dumps) ──────
     print("\n=== Running Penner pipeline ===")
-    penner_cmd = [PENNER_BIN, "--name", args.mesh, "-i", RXMESH_INPUT, "-o", work_dir]
-    if args.no_ed:
-        penner_cmd.append("--no_erode_dilate")
-    stdout, stderr, rc, t_penner = run_cmd(penner_cmd,
+    penner_cmd = [PENNER_BIN, "--name", args.mesh, "-i", RXMESH_INPUT, "-o", work_dir, "--erode_dilate"]
+    _, stderr, rc, t_penner = run_cmd(penner_cmd,
         "Penner parameterize_aligned", timeout_s=300)
-    # Parse step timings from spdlog timestamps
-    import re
-    from datetime import datetime
-    step_times = {}  # step_num → seconds since previous step
-    prev_time = None
-    all_output = stdout + stderr
-    for line in all_output.split("\n"):
-        if any(k in line for k in ["Step ", "itr(", "Stopping", "Wrote"]):
+    for line in stderr.split("\n"):
+        if any(k in line for k in ["Refined", "Cut mesh", "Wrote", "Singular", "itr(", "Stopping",
+                                    "Feature edge", "erode_dilate", "prune_small", "Pruned"]):
             print(f"    {line.strip()}")
-        m = re.match(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)\].*Step (\d+)', line)
-        if m:
-            t = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S.%f")
-            step_num = m.group(2)
-            if prev_time is not None:
-                step_times[step_num] = (t - prev_time).total_seconds()
-            prev_time = t
 
-    # ── Render all step dumps ────────────────────────────────────
+    # ── Step 2: Render refined mesh with features ─────────────────
     print("\n=== Rendering steps ===")
-    display_step = 0
+    refined_path = os.path.join(work_dir, args.mesh + "_refined.obj")
+    if os.path.exists(refined_path):
+        v_ref, f_ref, lines_ref = load_obj(refined_path)
+        mesh_ref = pv_mesh(v_ref, f_ref)
+        img = os.path.join(OUT_DIR, "step1_features.png")
+        render(mesh_ref, img, "Step 1: Feature Detection + Mesh Refinement",
+               color="#404040", edge_lines=lines_ref)
+        rows.append(("Feature Detection", img, "", f"{len(v_ref)}V {len(f_ref)}F  |  {len(lines_ref)} features"))
 
-    # Steps 1-6: mesh + feature edges (OBJ with 'l' lines)
-    step_files = [
-        ("01", "Feature Detection ({}°)".format(35), "detect"),
-        ("02", "Prune Small Components", "prune_comp"),
-        ("03", "Prune Small Features", "prune_feat"),
-        ("04", "Erode / Dilate", "erode_dilate"),
-        ("05", "Refine Corner Faces", "refine_corners"),
-        ("06", "Refined Mesh + Spanning Tree", "refined"),
-    ]
-    for file_num, label, suffix in step_files:
-        path = os.path.join(work_dir, f"{args.mesh}_step{file_num}_{suffix}.obj")
-        if not os.path.exists(path):
-            continue
-        display_step += 1
-        v, f, lines = load_obj(path)
-        m = pv_mesh(v, f)
-        img = os.path.join(OUT_DIR, f"step{display_step:02d}_{suffix}.png")
-        title = f"Step {display_step}: {label}"
-        render(m, img, title, color="#404040", edge_lines=lines)
-        dt = step_times.get(file_num, 0)
-        timing = f"{dt:.2f}s" if dt > 0.01 else ""
-        rows.append((title, img, timing, f"{len(v)}V {len(f)}F | {len(lines)} features"))
-
-    # Cut mesh
-    cut_path = os.path.join(work_dir, f"{args.mesh}_step07_cut.obj")
+    # ── Step 3: Render cut mesh with boundary edges ───────────────
+    cut_path = os.path.join(work_dir, args.mesh + "_cut.obj")
     if os.path.exists(cut_path):
-        display_step += 1
         v_cut, f_cut, lines_cut = load_obj(cut_path)
         mesh_cut = pv_mesh(v_cut, f_cut)
-        img = os.path.join(OUT_DIR, f"step{display_step:02d}_cut.png")
-        title = f"Step {display_step}: Cut Mesh (seams opened)"
-        render(mesh_cut, img, title, color="#404040", edge_lines=lines_cut)
-        dt = step_times.get("7", 0)
-        timing = f"{dt:.2f}s" if dt > 0.01 else ""
-        rows.append((title, img, timing, f"{len(v_cut)}V {len(f_cut)}F | {len(lines_cut)} boundary edges"))
+        img = os.path.join(OUT_DIR, "step2_cut.png")
+        render(mesh_cut, img, "Step 2: Cut Mesh (seams opened)",
+               color="#404040", edge_lines=lines_cut)
+        rows.append(("Cut Mesh", img, "", f"{len(v_cut)}V {len(f_cut)}F  |  {len(lines_cut)} boundary edges"))
 
-    # Cross field + singularities
+    # ── Step 4: Cross field + singularities ───────────────────────
     cf_path = os.path.join(work_dir, args.mesh + "_crossfield.txt")
     sing_path = os.path.join(work_dir, args.mesh + "_singularities.txt")
     overlay_path = os.path.join(work_dir, args.mesh + "_opt.obj")
 
     if os.path.exists(cf_path) and os.path.exists(overlay_path):
-        display_step += 1
         v_ov, f_ov, _, _ = load_obj_with_uv(overlay_path)
         mesh_ov = pv_mesh(v_ov, f_ov)
         centers, dirs = load_crossfield(cf_path)
         sing_pos, sing_idx = (np.zeros((0,3)), np.array([]))
         if os.path.exists(sing_path):
             sing_pos, sing_idx = load_singularities(sing_path)
-        img = os.path.join(OUT_DIR, f"step{display_step:02d}_crossfield.png")
-        title = f"Step {display_step}: Cross Field + Singularities"
-        render_crossfield(mesh_ov, centers, dirs, sing_pos, sing_idx, img, title)
-        dt = step_times.get("8", 0) + step_times.get("9", 0)
-        timing = f"{dt:.2f}s" if dt > 0.01 else ""
-        rows.append((title, img, timing, f"{len(centers)}F | {len(sing_pos)} singularities"))
+        img = os.path.join(OUT_DIR, "step3_crossfield.png")
+        render_crossfield(mesh_ov, centers, dirs, sing_pos, sing_idx, img,
+                          "Step 3: Cross Field + Singularities")
+        rows.append(("Cross Field", img, "", f"{len(centers)}F  |  {len(sing_pos)} singularities"))
 
-    # Newton optimization (no image, just timing)
-    dt_newton = step_times.get("10", 0)
-    if "10a" in step_times:
-        dt_newton = step_times.get("10a", 0)
-    # Try to get Newton time from step 10 → 11
-    newton_lines = [l for l in all_output.split("\n") if "Step 10" in l or "Step 11" in l]
-    if len(newton_lines) >= 2:
-        m1 = re.match(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)\]', newton_lines[0])
-        m2 = re.match(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)\]', newton_lines[-1])
-        if m1 and m2:
-            t1 = datetime.strptime(m1.group(1), "%Y-%m-%d %H:%M:%S.%f")
-            t2 = datetime.strptime(m2.group(1), "%Y-%m-%d %H:%M:%S.%f")
-            dt_newton = (t2 - t1).total_seconds()
-
-    display_step += 1
-    rows.append((f"Step {display_step}: Newton Optimization", "", f"{dt_newton:.2f}s" if dt_newton > 0 else "",
-                 "Conformal metric → target cone angles"))
-
-    # UV (checkerboard + layout) from overlay mesh
+    # ── Step 5: UV (checkerboard + layout) ────────────────────────
     if os.path.exists(overlay_path):
         v_ov, f_ov, uv_ov, fuv_ov = load_obj_with_uv(overlay_path)
         if uv_ov is not None and fuv_ov:
-            display_step += 1
             mesh_ov = pv_mesh(v_ov, f_ov)
-            img = os.path.join(OUT_DIR, f"step{display_step:02d}_uv_checker.png")
-            title = f"Step {display_step}: Seamless UV"
-            render_uv_checker(mesh_ov, uv_ov, fuv_ov, img, title)
-            rows.append((title, img, f"{t_penner:.0f}s total",
-                         f"{len(v_ov)}V {len(f_ov)}F | {len(uv_ov)} UV"))
+            img = os.path.join(OUT_DIR, "step4_uv_checker.png")
+            render_uv_checker(mesh_ov, uv_ov, fuv_ov, img,
+                              "Step 4: Seamless UV (checkerboard)")
+            rows.append(("UV Parametrization", img, f"{t_penner:.0f}s",
+                         f"{len(v_ov)}V {len(f_ov)}F  |  {len(uv_ov)} UV"))
 
-            display_step += 1
-            img = os.path.join(OUT_DIR, f"step{display_step:02d}_uv_layout.png")
-            title = f"Step {display_step}: UV Layout (2D)"
-            render_uv_layout(uv_ov, fuv_ov, img, title)
-            rows.append((title, img, "", f"{len(uv_ov)} UV vertices"))
+            img = os.path.join(OUT_DIR, "step4_uv_layout.png")
+            render_uv_layout(uv_ov, fuv_ov, img, "Step 4: UV Layout (2D)")
+            rows.append(("UV Layout", img, "", f"{len(uv_ov)} UV vertices"))
 
-    # Quantization
+    # ── Step 6: Quantization ──────────────────────────────────────
     reembed_path = os.path.join(work_dir, "reembed.obj")
     if os.path.exists(overlay_path) and os.path.exists(QUANT_BIN):
         print("\n=== Quantization ===")
@@ -399,15 +341,14 @@ def main():
         if rc_q == 0 and os.path.exists(reembed_path):
             v_re, f_re, uv_re, fuv_re = load_obj_with_uv(reembed_path)
             if uv_re is not None and fuv_re:
-                display_step += 1
                 mesh_re = pv_mesh(v_re, f_re)
-                img = os.path.join(OUT_DIR, f"step{display_step:02d}_quantized.png")
-                title = f"Step {display_step}: Quantized UV (integer grid)"
-                render_uv_checker(mesh_re, uv_re, fuv_re, img, title)
-                rows.append((title, img, f"{t_quant:.0f}s",
+                img = os.path.join(OUT_DIR, "step5_quantized.png")
+                render_uv_checker(mesh_re, uv_re, fuv_re, img,
+                                  "Step 5: Quantized UV (integer grid)")
+                rows.append(("Quantization", img, f"{t_quant:.0f}s",
                              f"{len(v_re)}V {len(f_re)}F"))
 
-    # Quad extraction
+    # ── Step 7: Quad extraction ───────────────────────────────────
     quad_path = os.path.join(work_dir, "quads.obj")
     if os.path.exists(reembed_path) and os.path.exists(QEX_BIN):
         print("\n=== Quad Extraction ===")
@@ -415,20 +356,18 @@ def main():
             [QEX_BIN, reembed_path, quad_path],
             "libQEx", timeout_s=60)
         if rc_qex == 0 and os.path.exists(quad_path):
-            display_step += 1
             v_q, f_q, _ = load_obj(quad_path)
             mesh_q = pv_mesh(v_q, f_q)
-            img = os.path.join(OUT_DIR, f"step{display_step:02d}_quads.png")
-            title = f"Step {display_step}: Final Quad Mesh"
-            render(mesh_q, img, title, color="#3fb950")
-            rows.append((title, img, f"{t_qex:.0f}s",
+            img = os.path.join(OUT_DIR, "step6_quads.png")
+            render(mesh_q, img, "Step 6: Final Quad Mesh", color="#3fb950")
+            rows.append(("Quad Mesh", img, f"{t_qex:.0f}s",
                          f"{len(v_q)}V {len(f_q)} quads"))
 
     # ── Generate HTML ─────────────────────────────────────────────
     cache = int(time.time())
     html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
-<title>Penner Pipeline — Step by Step</title>
+<title>Penner Pipeline (Erode/Dilate) — Step by Step</title>
 <style>
 body {{ background: {BG_COLOR}; color: {TEXT_COLOR}; font-family: monospace; padding: 20px; max-width: 1400px; margin: 0 auto; }}
 h1 {{ color: #58a6ff; }}
@@ -442,24 +381,20 @@ td img {{ width: 100%; border-radius: 4px; cursor: pointer; }}
 .btn3d {{ display: inline-block; padding: 4px 10px; background: #238636; color: white; border-radius: 4px; text-decoration: none; font-size: 12px; margin-top: 4px; }}
 .btn3d:hover {{ background: #2ea043; }}
 </style></head><body>
-<h1>Penner Quad Pipeline — {args.mesh}</h1>
+<h1>Penner Quad Pipeline (Erode/Dilate) — {args.mesh}</h1>
 <p>Input → Feature Detection → Cut → Cross Field → UV → Quantization → Quads</p>
 <table>
 <tr><th>Step</th><th>Result</th><th>Time</th><th>Info</th></tr>
 """
     for step_name, img_path, timing, info in rows:
+        rel = os.path.relpath(img_path, OUT_DIR)
+        rel_3d = rel.replace(".png", "_3d.html")
+        has_3d = os.path.exists(os.path.join(OUT_DIR, rel_3d))
         t_html = f'<span class="timing">{timing}</span>' if timing else ""
-        if img_path:
-            rel = os.path.relpath(img_path, OUT_DIR)
-            rel_3d = rel.replace(".png", "_3d.html")
-            has_3d = os.path.exists(os.path.join(OUT_DIR, rel_3d))
-            btn_3d = f'<a class="btn3d" href="{rel_3d}" target="_blank">3D</a>' if has_3d else ""
-            img_html = f'<img src="{rel}?v={cache}" />{btn_3d}'
-        else:
-            img_html = '<span style="color:#8b949e;font-style:italic">(no visual output)</span>'
+        btn_3d = f'<a class="btn3d" href="{rel_3d}" target="_blank">3D</a>' if has_3d else ""
         html += f"""<tr>
 <td class="step">{step_name}</td>
-<td>{img_html}</td>
+<td><img src="{rel}?v={cache}" />{btn_3d}</td>
 <td>{t_html}</td>
 <td class="info">{info}</td>
 </tr>\n"""
