@@ -8,6 +8,8 @@
 #include "rxmesh/util/log.h"
 #include "rxmesh/util/macros.h"
 #include "rxmesh/util/util.h"
+#include "rxmesh/query.h"
+#include "rxmesh/launch_box.h"
 
 #include "glm_compat.h"
 
@@ -31,34 +33,122 @@ static struct arg {
 
 // Uses write_temp_obj_fast from pipeline.h
 
-// Extract mesh directly from RXMeshDynamic — no OBJ round-trip.
-static MeshResult extract_mesh_direct(RXMeshDynamic& rx)
+// GPU readback: extract verts + faces entirely on GPU, single cudaMemcpy back.
+
+template <uint32_t blockThreads>
+__global__ static void extract_vertices_kernel(
+    const Context                context,
+    const VertexAttribute<float> coords,
+    float*                       d_verts,
+    uint32_t*                    d_vert_count)
 {
+    auto extract = [&](const VertexHandle vh, const VertexIterator& iter) {
+        // iter gives VV neighbors but we just need the vertex itself
+        uint32_t vid = context.linear_id(vh);
+        d_verts[vid * 3 + 0] = coords(vh, 0);
+        d_verts[vid * 3 + 1] = coords(vh, 1);
+        d_verts[vid * 3 + 2] = coords(vh, 2);
+        atomicAdd(d_vert_count, 1u);
+    };
+    auto block = cooperative_groups::this_thread_block();
+    Query<blockThreads> query(context);
+    ShmemAllocator      shrd_alloc;
+    query.dispatch<Op::VV>(block, shrd_alloc, extract);
+}
+
+template <uint32_t blockThreads>
+__global__ static void extract_faces_kernel(
+    const Context context,
+    int*          d_faces,
+    uint32_t*     d_face_count)
+{
+    auto extract = [&](const FaceHandle fh, const VertexIterator& iter) {
+        uint32_t fid = atomicAdd(d_face_count, 1u);
+        d_faces[fid * 3 + 0] = static_cast<int>(context.linear_id(iter[0]));
+        d_faces[fid * 3 + 1] = static_cast<int>(context.linear_id(iter[1]));
+        d_faces[fid * 3 + 2] = static_cast<int>(context.linear_id(iter[2]));
+    };
+    auto block = cooperative_groups::this_thread_block();
+    Query<blockThreads> query(context);
+    ShmemAllocator      shrd_alloc;
+    query.dispatch<Op::FV>(block, shrd_alloc, extract);
+}
+
+static MeshResult extract_mesh_gpu(RXMeshDynamic& rx)
+{
+    constexpr uint32_t blockThreads = 256;
+
     rx.update_host();
     auto coords = rx.get_input_vertex_coordinates();
-    coords->move(DEVICE, HOST);
 
-    std::vector<glm::vec3> v_list;
-    rx.create_vertex_list(v_list, *coords);
+    uint32_t num_verts = rx.get_num_vertices();
+    uint32_t num_faces = rx.get_num_faces();
 
-    std::vector<glm::uvec3> f_list;
-    rx.create_face_list(f_list);
+    // Allocate device output arrays
+    float* d_verts;
+    int*   d_faces;
+    uint32_t* d_vert_count;
+    uint32_t* d_face_count;
+    CUDA_ERROR(cudaMalloc(&d_verts, num_verts * 3 * sizeof(float)));
+    CUDA_ERROR(cudaMalloc(&d_faces, num_faces * 3 * sizeof(int)));
+    CUDA_ERROR(cudaMalloc(&d_vert_count, sizeof(uint32_t)));
+    CUDA_ERROR(cudaMalloc(&d_face_count, sizeof(uint32_t)));
+    CUDA_ERROR(cudaMemset(d_vert_count, 0, sizeof(uint32_t)));
+    CUDA_ERROR(cudaMemset(d_face_count, 0, sizeof(uint32_t)));
 
+    // Launch vertex extraction
+    LaunchBox<blockThreads> lb_v;
+    rx.update_launch_box({Op::VV}, lb_v,
+                         (void*)extract_vertices_kernel<blockThreads>,
+                         false, false);
+    extract_vertices_kernel<blockThreads>
+        <<<lb_v.blocks, lb_v.num_threads, lb_v.smem_bytes_dyn>>>(
+            rx.get_context(), *coords, d_verts, d_vert_count);
+
+    // Launch face extraction
+    LaunchBox<blockThreads> lb_f;
+    rx.update_launch_box({Op::FV}, lb_f,
+                         (void*)extract_faces_kernel<blockThreads>,
+                         false, false);
+    extract_faces_kernel<blockThreads>
+        <<<lb_f.blocks, lb_f.num_threads, lb_f.smem_bytes_dyn>>>(
+            rx.get_context(), d_faces, d_face_count);
+
+    CUDA_ERROR(cudaDeviceSynchronize());
+
+    // Get actual counts
+    uint32_t h_nv, h_nf;
+    CUDA_ERROR(cudaMemcpy(&h_nv, d_vert_count, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    CUDA_ERROR(cudaMemcpy(&h_nf, d_face_count, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+
+    // Copy results back
     MeshResult r;
-    r.num_vertices = static_cast<int>(v_list.size());
-    r.num_faces = static_cast<int>(f_list.size());
-    r.vertices.resize(r.num_vertices * 3);
-    r.faces.resize(r.num_faces * 3);
-    for (int i = 0; i < r.num_vertices; ++i) {
-        r.vertices[i*3+0] = v_list[i][0];
-        r.vertices[i*3+1] = v_list[i][1];
-        r.vertices[i*3+2] = v_list[i][2];
+    r.num_vertices = static_cast<int>(h_nv);
+    r.num_faces = static_cast<int>(h_nf);
+
+    std::vector<float> h_verts(h_nv * 3);
+    std::vector<int>   h_faces(h_nf * 3);
+    CUDA_ERROR(cudaMemcpy(h_verts.data(), d_verts, h_nv * 3 * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_ERROR(cudaMemcpy(h_faces.data(), d_faces, h_nf * 3 * sizeof(int), cudaMemcpyDeviceToHost));
+
+    r.vertices.resize(h_nv * 3);
+    r.faces.resize(h_nf * 3);
+    for (uint32_t i = 0; i < h_nv; ++i) {
+        r.vertices[i*3+0] = h_verts[i*3+0];
+        r.vertices[i*3+1] = h_verts[i*3+1];
+        r.vertices[i*3+2] = h_verts[i*3+2];
     }
-    for (int i = 0; i < r.num_faces; ++i) {
-        r.faces[i*3+0] = f_list[i][0];
-        r.faces[i*3+1] = f_list[i][1];
-        r.faces[i*3+2] = f_list[i][2];
+    for (uint32_t i = 0; i < h_nf; ++i) {
+        r.faces[i*3+0] = h_faces[i*3+0];
+        r.faces[i*3+1] = h_faces[i*3+1];
+        r.faces[i*3+2] = h_faces[i*3+2];
     }
+
+    CUDA_ERROR(cudaFree(d_verts));
+    CUDA_ERROR(cudaFree(d_faces));
+    CUDA_ERROR(cudaFree(d_vert_count));
+    CUDA_ERROR(cudaFree(d_face_count));
+
     return r;
 }
 
@@ -103,7 +193,7 @@ MeshResult pipeline_remesh(
     double t_gpu = ms_since(tp);
 
     tp = clk::now();
-    auto result = extract_mesh_direct(rx);
+    auto result = extract_mesh_gpu(rx);
     double t_readback = ms_since(tp);
     if (verbose) {
         fprintf(stderr, "[pyrxmesh] remesh: prep=%.1fms, mesh_build=%.1fms, gpu=%.1fms, readback=%.1fms\n",

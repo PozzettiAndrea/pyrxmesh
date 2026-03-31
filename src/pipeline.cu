@@ -9,6 +9,11 @@
 #include <filesystem>
 #include <stdexcept>
 
+#include <thrust/device_ptr.h>
+#include <thrust/reduce.h>
+#include <thrust/copy.h>
+#include <thrust/sequence.h>
+
 #include "rxmesh/rxmesh_static.h"
 #include "rxmesh/attribute.h"
 #include "rxmesh/query.h"
@@ -134,6 +139,121 @@ MeshInfo pipeline_mesh_info(
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// GPU OBJ Parser — parse vertex/face lines in parallel on GPU
+// Ref: Possemiers & Lee, "Fast OBJ file importing and parsing in CUDA", 2015
+// ---------------------------------------------------------------------------
+
+// Kernel: each thread handles one byte, marks line starts (byte after '\n')
+__global__ static void find_line_starts_kernel(
+    const char* data, int n, int* is_line_start)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    // First byte is always a line start
+    if (idx == 0) { is_line_start[0] = 1; return; }
+    is_line_start[idx] = (data[idx - 1] == '\n') ? 1 : 0;
+}
+
+// Device helper: parse a float from text, advancing pos
+__device__ static float parse_float_gpu(const char* data, int n, int& pos)
+{
+    // Skip whitespace
+    while (pos < n && (data[pos] == ' ' || data[pos] == '\t')) pos++;
+
+    float sign = 1.0f;
+    if (pos < n && data[pos] == '-') { sign = -1.0f; pos++; }
+    else if (pos < n && data[pos] == '+') { pos++; }
+
+    float val = 0.0f;
+    while (pos < n && data[pos] >= '0' && data[pos] <= '9') {
+        val = val * 10.0f + (data[pos] - '0');
+        pos++;
+    }
+    if (pos < n && data[pos] == '.') {
+        pos++;
+        float frac = 0.1f;
+        while (pos < n && data[pos] >= '0' && data[pos] <= '9') {
+            val += (data[pos] - '0') * frac;
+            frac *= 0.1f;
+            pos++;
+        }
+    }
+    // Scientific notation
+    if (pos < n && (data[pos] == 'e' || data[pos] == 'E')) {
+        pos++;
+        float esign = 1.0f;
+        if (pos < n && data[pos] == '-') { esign = -1.0f; pos++; }
+        else if (pos < n && data[pos] == '+') { pos++; }
+        int exp = 0;
+        while (pos < n && data[pos] >= '0' && data[pos] <= '9') {
+            exp = exp * 10 + (data[pos] - '0');
+            pos++;
+        }
+        val *= powf(10.0f, esign * exp);
+    }
+    return sign * val;
+}
+
+// Device helper: parse an int from text, advancing pos
+__device__ static int parse_int_gpu(const char* data, int n, int& pos)
+{
+    while (pos < n && (data[pos] == ' ' || data[pos] == '\t')) pos++;
+    int sign = 1;
+    if (pos < n && data[pos] == '-') { sign = -1; pos++; }
+    int val = 0;
+    while (pos < n && data[pos] >= '0' && data[pos] <= '9') {
+        val = val * 10 + (data[pos] - '0');
+        pos++;
+    }
+    // Skip /texcoord/normal indices (e.g., "1/2/3" → just take 1)
+    while (pos < n && data[pos] != ' ' && data[pos] != '\t' &&
+           data[pos] != '\n' && data[pos] != '\r') pos++;
+    return sign * val;
+}
+
+// Kernel: classify and parse each line
+// line_type: 0=skip, 1=vertex, 2=face
+__global__ static void parse_lines_kernel(
+    const char* data, int n,
+    const int* line_starts, int num_lines,
+    int* line_type,
+    float* vert_data,    // 3 floats per vertex line
+    int* face_data)      // 3 ints per face line
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_lines) return;
+
+    int pos = line_starts[idx];
+    int end = (idx + 1 < num_lines) ? line_starts[idx + 1] : n;
+
+    // Skip whitespace at start of line
+    while (pos < end && (data[pos] == ' ' || data[pos] == '\t')) pos++;
+
+    if (pos >= end || data[pos] == '\n' || data[pos] == '\r' || data[pos] == '#') {
+        line_type[idx] = 0;
+        return;
+    }
+
+    if (data[pos] == 'v' && pos + 1 < end && data[pos + 1] == ' ') {
+        // Vertex line: "v x y z"
+        line_type[idx] = 1;
+        pos += 2; // skip "v "
+        vert_data[idx * 3 + 0] = parse_float_gpu(data, end, pos);
+        vert_data[idx * 3 + 1] = parse_float_gpu(data, end, pos);
+        vert_data[idx * 3 + 2] = parse_float_gpu(data, end, pos);
+    } else if (data[pos] == 'f' && pos + 1 < end && data[pos + 1] == ' ') {
+        // Face line: "f v1 v2 v3" or "f v1/vt1/vn1 v2/vt2/vn2 v3/vt3/vn3"
+        line_type[idx] = 2;
+        pos += 2; // skip "f "
+        face_data[idx * 3 + 0] = parse_int_gpu(data, end, pos) - 1; // OBJ is 1-indexed
+        face_data[idx * 3 + 1] = parse_int_gpu(data, end, pos) - 1;
+        face_data[idx * 3 + 2] = parse_int_gpu(data, end, pos) - 1;
+    } else {
+        line_type[idx] = 0; // vt, vn, comments, etc — skip
+    }
+}
+
 // pipeline_load_obj
 // ---------------------------------------------------------------------------
 
@@ -141,30 +261,146 @@ MeshResult pipeline_load_obj(const std::string& path)
 {
     ensure_init();
 
-    std::vector<std::vector<float>>    verts;
-    std::vector<std::vector<uint32_t>> faces;
+    using clk = std::chrono::high_resolution_clock;
+    auto ms_since = [](auto t0) {
+        return std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+    };
+    auto t0 = clk::now();
 
-    if (!import_obj(path, verts, faces)) {
-        throw std::runtime_error("Failed to load OBJ file: " + path);
+    // ── Step 1: Read entire file into host memory ────────────────────────
+    FILE* fp = fopen(path.c_str(), "rb");
+    if (!fp) throw std::runtime_error("Cannot open OBJ file: " + path);
+    fseek(fp, 0, SEEK_END);
+    long file_size = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    std::vector<char> h_data(file_size);
+    fread(h_data.data(), 1, file_size, fp);
+    fclose(fp);
+    double t_read = ms_since(t0);
+
+    // ── Step 2: Copy to GPU ──────────────────────────────────────────────
+    auto tp = clk::now();
+    char* d_data;
+    CUDA_ERROR(cudaMalloc(&d_data, file_size));
+    CUDA_ERROR(cudaMemcpy(d_data, h_data.data(), file_size, cudaMemcpyHostToDevice));
+    double t_copy = ms_since(tp);
+
+    // ── Step 3: Find line starts ─────────────────────────────────────────
+    tp = clk::now();
+    int* d_is_line_start;
+    CUDA_ERROR(cudaMalloc(&d_is_line_start, file_size * sizeof(int)));
+
+    int block = 256;
+    int grid = (file_size + block - 1) / block;
+    find_line_starts_kernel<<<grid, block>>>(d_data, file_size, d_is_line_start);
+
+    // Prefix sum to compact line start positions
+    // Count total lines
+    thrust::device_ptr<int> dp_is_start(d_is_line_start);
+    int num_lines = thrust::reduce(dp_is_start, dp_is_start + file_size);
+
+    // Get line start positions via stream compaction
+    int* d_line_starts;
+    CUDA_ERROR(cudaMalloc(&d_line_starts, num_lines * sizeof(int)));
+
+    // Create index sequence [0, 1, 2, ..., file_size-1]
+    int* d_indices;
+    CUDA_ERROR(cudaMalloc(&d_indices, file_size * sizeof(int)));
+    thrust::device_ptr<int> dp_indices(d_indices);
+    thrust::sequence(dp_indices, dp_indices + file_size);
+
+    // Copy only indices where is_line_start==1
+    thrust::device_ptr<int> dp_line_starts(d_line_starts);
+    thrust::copy_if(dp_indices, dp_indices + file_size,
+                    dp_is_start, dp_line_starts,
+                    [] __device__ (int x) { return x == 1; });
+
+    CUDA_ERROR(cudaFree(d_is_line_start));
+    CUDA_ERROR(cudaFree(d_indices));
+    double t_lines = ms_since(tp);
+
+    // ── Step 4: Classify and parse each line in parallel ─────────────────
+    tp = clk::now();
+    int* d_line_type;
+    float* d_vert_data;
+    int* d_face_data;
+    CUDA_ERROR(cudaMalloc(&d_line_type, num_lines * sizeof(int)));
+    CUDA_ERROR(cudaMalloc(&d_vert_data, num_lines * 3 * sizeof(float)));
+    CUDA_ERROR(cudaMalloc(&d_face_data, num_lines * 3 * sizeof(int)));
+    CUDA_ERROR(cudaMemset(d_vert_data, 0, num_lines * 3 * sizeof(float)));
+    CUDA_ERROR(cudaMemset(d_face_data, 0, num_lines * 3 * sizeof(int)));
+
+    grid = (num_lines + block - 1) / block;
+    parse_lines_kernel<<<grid, block>>>(
+        d_data, file_size, d_line_starts, num_lines,
+        d_line_type, d_vert_data, d_face_data);
+    CUDA_ERROR(cudaDeviceSynchronize());
+    double t_parse = ms_since(tp);
+
+    // ── Step 5: Compact results — extract only vertex and face lines ─────
+    tp = clk::now();
+    std::vector<int> h_line_type(num_lines);
+    CUDA_ERROR(cudaMemcpy(h_line_type.data(), d_line_type,
+                          num_lines * sizeof(int), cudaMemcpyDeviceToHost));
+
+    int num_verts = 0, num_faces = 0;
+    for (int i = 0; i < num_lines; ++i) {
+        if (h_line_type[i] == 1) num_verts++;
+        else if (h_line_type[i] == 2) num_faces++;
     }
 
+    // Build index maps: for each vertex/face line, what's its output index?
+    std::vector<int> vert_indices, face_indices;
+    vert_indices.reserve(num_verts);
+    face_indices.reserve(num_faces);
+    for (int i = 0; i < num_lines; ++i) {
+        if (h_line_type[i] == 1) vert_indices.push_back(i);
+        else if (h_line_type[i] == 2) face_indices.push_back(i);
+    }
+
+    // Copy parsed data back to host
+    std::vector<float> h_vert_data(num_lines * 3);
+    std::vector<int> h_face_data(num_lines * 3);
+    CUDA_ERROR(cudaMemcpy(h_vert_data.data(), d_vert_data,
+                          num_lines * 3 * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_ERROR(cudaMemcpy(h_face_data.data(), d_face_data,
+                          num_lines * 3 * sizeof(int), cudaMemcpyDeviceToHost));
+    double t_compact = ms_since(tp);
+
+    // ── Step 6: Build MeshResult ─────────────────────────────────────────
+    tp = clk::now();
     MeshResult result;
-    result.num_vertices = static_cast<int>(verts.size());
-    result.num_faces    = static_cast<int>(faces.size());
+    result.num_vertices = num_verts;
+    result.num_faces = num_faces;
+    result.vertices.resize(num_verts * 3);
+    result.faces.resize(num_faces * 3);
 
-    result.vertices.resize(result.num_vertices * 3);
-    for (int i = 0; i < result.num_vertices; ++i) {
-        result.vertices[i * 3 + 0] = static_cast<double>(verts[i][0]);
-        result.vertices[i * 3 + 1] = static_cast<double>(verts[i][1]);
-        result.vertices[i * 3 + 2] = static_cast<double>(verts[i][2]);
+    for (int i = 0; i < num_verts; ++i) {
+        int src = vert_indices[i];
+        result.vertices[i * 3 + 0] = static_cast<double>(h_vert_data[src * 3 + 0]);
+        result.vertices[i * 3 + 1] = static_cast<double>(h_vert_data[src * 3 + 1]);
+        result.vertices[i * 3 + 2] = static_cast<double>(h_vert_data[src * 3 + 2]);
     }
+    for (int i = 0; i < num_faces; ++i) {
+        int src = face_indices[i];
+        result.faces[i * 3 + 0] = h_face_data[src * 3 + 0];
+        result.faces[i * 3 + 1] = h_face_data[src * 3 + 1];
+        result.faces[i * 3 + 2] = h_face_data[src * 3 + 2];
+    }
+    double t_build = ms_since(tp);
 
-    result.faces.resize(result.num_faces * 3);
-    for (int i = 0; i < result.num_faces; ++i) {
-        result.faces[i * 3 + 0] = static_cast<int>(faces[i][0]);
-        result.faces[i * 3 + 1] = static_cast<int>(faces[i][1]);
-        result.faces[i * 3 + 2] = static_cast<int>(faces[i][2]);
-    }
+    // Cleanup
+    CUDA_ERROR(cudaFree(d_data));
+    CUDA_ERROR(cudaFree(d_line_starts));
+    CUDA_ERROR(cudaFree(d_line_type));
+    CUDA_ERROR(cudaFree(d_vert_data));
+    CUDA_ERROR(cudaFree(d_face_data));
+
+    fprintf(stderr, "[pyrxmesh] gpu_load_obj: read=%.0fms, copy=%.0fms, "
+            "find_lines=%.0fms, parse=%.0fms, compact=%.0fms, build=%.0fms, "
+            "total=%.0fms (%d verts, %d faces)\n",
+            t_read, t_copy, t_lines, t_parse, t_compact, t_build,
+            ms_since(t0), num_verts, num_faces);
 
     return result;
 }

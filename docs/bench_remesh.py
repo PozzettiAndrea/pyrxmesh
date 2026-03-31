@@ -1,7 +1,7 @@
-"""Standalone benchmark for remeshing the Asian Dragon (3.6M verts).
+"""Multi-mesh remesh benchmark.
 
-No fd redirection — all RXMesh spdlog output (construction timing, METIS,
-per-iteration split/collapse/flip/smooth) prints directly to terminal.
+Runs pyrxmesh.remesh() on Armadillo (172k), Happy Buddha (543k),
+and Asian Dragon (3.6M) to compare performance across scales.
 """
 
 import os
@@ -12,34 +12,39 @@ import numpy as np
 import pyrxmesh
 
 RXMESH_INPUT = os.path.join(os.path.dirname(__file__), "..", "RXMesh", "input")
-MESH = os.path.join(RXMESH_INPUT, "xyzrgb_dragon.obj")
 
-if not os.path.exists(MESH):
-    print(f"ERROR: {MESH} not found")
-    sys.exit(1)
+MESHES = [
+    ("Armadillo (172k)", "armadillo.obj"),
+    ("Happy Buddha (543k)", "happy_buddha.obj"),
+    ("Asian Dragon (3.6M)", "xyzrgb_dragon.obj"),
+]
 
 print("=== pyrxmesh remesh benchmark ===")
-print(f"Mesh: {MESH}")
 print()
 
 pyrxmesh.init()
 
-print("--- Loading OBJ ---")
-t0 = time.perf_counter()
-v, f = pyrxmesh.load_obj(MESH)
-t_load = time.perf_counter() - t0
-print(f"Loaded: {len(v):,} verts, {len(f):,} faces ({t_load:.2f}s)")
-print()
+for label, filename in MESHES:
+    path = os.path.join(RXMESH_INPUT, filename)
+    if not os.path.exists(path):
+        print(f"--- {label}: SKIPPED (not found) ---")
+        print()
+        continue
 
-print("--- Running remesh (relative_len=1.0, iterations=2) ---")
-sys.stdout.flush()
-sys.stderr.flush()
+    print(f"--- {label} ---")
 
-t0 = time.perf_counter()
-vo, fo = pyrxmesh.remesh(v, f, relative_len=1.0, iterations=2, verbose=True)
-t_remesh = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    v, f = pyrxmesh.load_obj(path)
+    t_load = time.perf_counter() - t0
+    print(f"  Load: {len(v):,} verts, {len(f):,} faces ({t_load:.2f}s)")
 
-print()
-print(f"--- Done ---")
-print(f"Output: {len(vo):,} verts, {len(fo):,} faces")
-print(f"Python wall clock: {t_remesh:.2f}s")
+    sys.stdout.flush()
+    sys.stderr.flush()
+
+    t0 = time.perf_counter()
+    vo, fo = pyrxmesh.remesh(v, f, relative_len=1.0, iterations=2, verbose=True)
+    t_remesh = time.perf_counter() - t0
+
+    print(f"  Output: {len(vo):,} verts, {len(fo):,} faces")
+    print(f"  Remesh wall clock: {t_remesh:.2f}s")
+    print()

@@ -613,6 +613,39 @@ def gen_edge_ops(bunny_v, bunny_f):
     }
 
 
+def _compute_mesh_metrics(mesh):
+    """Compute standard mesh quality metrics for display."""
+    import collections
+
+    # Triangle quality (aspect ratio)
+    clean = pv.PolyData(mesh.points.copy(), mesh.faces.copy())
+    qual = clean.compute_cell_quality(quality_measure='aspect_ratio')
+    q = qual['CellQuality']
+
+    # Edge lengths
+    edges = mesh.extract_all_edges()
+    pts = mesh.points
+    lines = edges.lines.reshape(-1, 3)
+    v0s, v1s = pts[lines[:, 1]], pts[lines[:, 2]]
+    edge_lens = np.linalg.norm(v1s - v0s, axis=1)
+
+    # Vertex valence
+    faces_arr = mesh.faces.reshape(-1, 4)[:, 1:]
+    val_count = np.zeros(mesh.n_points, dtype=int)
+    for face in faces_arr:
+        for vi in face:
+            val_count[vi] += 1
+    val_hist = collections.Counter(val_count.tolist())
+    pct_val6 = 100 * val_hist.get(6, 0) / max(mesh.n_points, 1)
+
+    return {
+        "V": mesh.n_points, "F": mesh.n_cells,
+        "quality_avg": float(q.mean()), "quality_max": float(q.max()),
+        "edge_avg": float(edge_lens.mean()), "edge_std": float(edge_lens.std()),
+        "pct_val6": pct_val6,
+    }
+
+
 def gen_asian_dragon_remesh(asian_dragon_v, asian_dragon_f):
     """Generate isotropic remeshing demo on the Stanford Asian Dragon (3.6M verts)."""
     remesh_demos = []
@@ -623,8 +656,7 @@ def gen_asian_dragon_remesh(asian_dragon_v, asian_dragon_f):
     t_total = time.perf_counter()
 
     t0 = time.perf_counter()
-    print("    [1/3] Writing temp OBJ + RXMesh construction...", flush=True)
-    # Time the actual remesh call which includes OBJ I/O + construction + GPU work
+    print("    [1/3] RXMesh construction + GPU remesh...", flush=True)
     verts_out, faces_out = pyrxmesh.remesh(asian_dragon_v, asian_dragon_f,
                                             relative_len=1.0, iterations=2, verbose=True)
     t_remesh = time.perf_counter() - t0
@@ -636,6 +668,13 @@ def gen_asian_dragon_remesh(asian_dragon_v, asian_dragon_f):
     mesh_out = pv_mesh_from_numpy(verts_out, faces_out)
     t_pv = time.perf_counter() - t0
     print(f"    PyVista mesh build: {fmt_time(t_pv)}")
+
+    # Compute mesh quality metrics
+    print("    Computing mesh metrics...")
+    metrics_in = _compute_mesh_metrics(mesh_in)
+    metrics_out = _compute_mesh_metrics(mesh_out)
+    print(f"    Input:  Q={metrics_in['quality_avg']:.2f} avg, val6={metrics_in['pct_val6']:.0f}%, edge_std={metrics_in['edge_std']:.4f}")
+    print(f"    Output: Q={metrics_out['quality_avg']:.2f} avg, val6={metrics_out['pct_val6']:.0f}%, edge_std={metrics_out['edge_std']:.4f}")
 
     prefix = os.path.join(OUT_DIR, "asian_dragon_remesh")
 
@@ -656,6 +695,14 @@ def gen_asian_dragon_remesh(asian_dragon_v, asian_dragon_f):
     t_all = time.perf_counter() - t_total
     print(f"    Total section time: {fmt_time(t_all)}")
 
+    # Build verbose metrics string for display
+    def _fmt(m):
+        return (f"{m['V']:,}V {m['F']:,}F | "
+                f"Q: {m['quality_avg']:.2f} avg, {m['quality_max']:.0f} max | "
+                f"edge std: {m['edge_std']:.4f} | val6: {m['pct_val6']:.0f}%")
+
+    verbose = f"Input:  {_fmt(metrics_in)}\nOutput: {_fmt(metrics_out)}"
+
     remesh_demos.append({
         "name": "asian_dragon_remesh", "type": "before_after",
         "verts_in": len(asian_dragon_v), "faces_in": len(asian_dragon_f),
@@ -668,12 +715,12 @@ def gen_asian_dragon_remesh(asian_dragon_v, asian_dragon_f):
                 v, f, relative_len=1.0,
                 iterations=2,
             )"""),
-        "verbose": "",
+        "verbose": verbose,
     })
 
     return {
-        "title": "Isotropic Remeshing of Asian Dragon",
-        "subtitle": "GPU-accelerated remeshing on 3.6M vertex mesh (Stanford Asian Dragon)",
+        "title": "Isotropic Remeshing — Stanford Asian Dragon (3.6M verts)",
+        "subtitle": "GPU-accelerated remeshing on 3.6M vertex mesh with mesh quality metrics",
         "demos": remesh_demos,
     }
 

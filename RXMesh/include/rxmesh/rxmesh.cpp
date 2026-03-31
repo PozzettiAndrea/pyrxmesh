@@ -9,6 +9,7 @@
 #include <unordered_set>
 
 #include "patcher/patcher.h"
+#include "rxmesh/gpu_build_topology.cuh"
 #include "rxmesh/context.h"
 #include "rxmesh/patch_scheduler.h"
 #include "rxmesh/rxmesh.h"
@@ -559,7 +560,202 @@ void RXMesh::create_handles()
                           sizeof(FaceHandle) * m_num_faces,
                           cudaMemcpyHostToDevice));
 }
+// ── GPU sort-scan topology construction ──────────────────────────────────
+// Builds edge/adjacency data on GPU using thrust sort + scan,
+// then populates m_edges_map on CPU (still needed by downstream).
+
 void RXMesh::build_supporting_structures(
+    const std::vector<std::vector<uint32_t>>& fv,
+    std::vector<std::vector<uint32_t>>&       ev,
+    std::vector<std::vector<uint32_t>>&       ef,
+    std::vector<uint32_t>&                    ff_offset,
+    std::vector<uint32_t>&                    ff_values)
+{
+    m_num_faces = static_cast<uint32_t>(fv.size());
+
+    // Validate + build flat face array for GPU
+    std::vector<uint32_t> flat_faces(m_num_faces * 3);
+    for (uint32_t f = 0; f < m_num_faces; ++f) {
+        if (fv[f].size() != 3) {
+            RXMESH_ERROR(
+                "rxmesh::build_supporting_structures() Face {} is not "
+                "triangle. Non-triangular faces are not supported", f);
+            exit(EXIT_FAILURE);
+        }
+        flat_faces[f * 3 + 0] = fv[f][0];
+        flat_faces[f * 3 + 1] = fv[f][1];
+        flat_faces[f * 3 + 2] = fv[f][2];
+    }
+
+    // ── GPU sort-scan topology build ─────────────────────────────────────
+    auto gpu = gpu_build_topology(flat_faces.data(), m_num_faces);
+
+    m_num_vertices = gpu.num_vertices;
+    m_num_edges    = gpu.num_edges;
+
+    // Convert to vector-of-vectors (downstream expects this format)
+    ev.resize(m_num_edges);
+    ef.resize(m_num_edges);
+    for (uint32_t e = 0; e < m_num_edges; ++e) {
+        ev[e] = {gpu.ev_flat[2 * e], gpu.ev_flat[2 * e + 1]};
+        if (gpu.ef_f1[e] == UINT32_MAX)
+            ef[e] = {gpu.ef_f0[e]};
+        else
+            ef[e] = {gpu.ef_f0[e], gpu.ef_f1[e]};
+    }
+
+    // Populate m_edges_map (needed by get_edge_id, patcher, etc.)
+    m_edges_map.clear();
+    m_edges_map.reserve(m_num_edges);
+    for (uint32_t e = 0; e < m_num_edges; ++e)
+        m_edges_map.insert(std::make_pair(
+            detail::edge_key(gpu.ev_flat[2*e], gpu.ev_flat[2*e+1]), e));
+
+    // Use GPU-computed face-face adjacency directly
+    ff_offset = std::move(gpu.ff_offset);
+    ff_values = std::move(gpu.ff_values);
+}
+
+#if 0  // Old validation + original hash-map implementation
+    {
+        fprintf(stderr, "[GPU_TOPO_VALIDATE] CPU: %u verts, %u edges | GPU: %u verts, %u edges\n",
+                m_num_vertices, m_num_edges, gpu.num_vertices, gpu.num_edges);
+
+        if (gpu.num_edges != m_num_edges) {
+            fprintf(stderr, "[GPU_TOPO_VALIDATE] ERROR: edge count mismatch!\n");
+        }
+        if (gpu.num_vertices != m_num_vertices) {
+            fprintf(stderr, "[GPU_TOPO_VALIDATE] ERROR: vertex count mismatch!\n");
+        }
+
+        // Check ff_offset sizes
+        fprintf(stderr, "[GPU_TOPO_VALIDATE] CPU ff_offset size=%zu, GPU ff_offset size=%zu\n",
+                ff_offset.size(), gpu.ff_offset.size());
+        fprintf(stderr, "[GPU_TOPO_VALIDATE] CPU ff_values size=%zu, GPU ff_values size=%zu\n",
+                ff_values.size(), gpu.ff_values.size());
+
+        // Check first few ff entries
+        int mismatches = 0;
+        for (uint32_t f = 0; f < std::min(m_num_faces, 20u); ++f) {
+            uint32_t cpu_start = ff_offset[f], cpu_end = ff_offset[f+1];
+            uint32_t gpu_start = (f < gpu.ff_offset.size()-1) ? gpu.ff_offset[f] : 0;
+            uint32_t gpu_end   = (f+1 < gpu.ff_offset.size()) ? gpu.ff_offset[f+1] : 0;
+
+            if ((cpu_end - cpu_start) != (gpu_end - gpu_start)) {
+                fprintf(stderr, "[GPU_TOPO_VALIDATE] face %u: CPU has %u neighbors, GPU has %u\n",
+                        f, cpu_end - cpu_start, gpu_end - gpu_start);
+                mismatches++;
+            }
+        }
+
+        // Check all faces for neighbor count mismatches
+        int total_mm = 0;
+        if (gpu.ff_offset.size() == ff_offset.size()) {
+            for (uint32_t f = 0; f < m_num_faces; ++f) {
+                uint32_t cn = ff_offset[f+1] - ff_offset[f];
+                uint32_t gn = gpu.ff_offset[f+1] - gpu.ff_offset[f];
+                if (cn != gn) total_mm++;
+            }
+            fprintf(stderr, "[GPU_TOPO_VALIDATE] total face neighbor mismatches: %d / %u\n",
+                    total_mm, m_num_faces);
+        }
+
+        // Count interior edges (ef_f1 != UINT32_MAX)
+        int cpu_interior = 0, gpu_interior = 0;
+        for (uint32_t e = 0; e < m_num_edges; ++e)
+            if (ef[e].size() >= 2) cpu_interior++;
+        for (uint32_t e = 0; e < gpu.num_edges; ++e)
+            if (gpu.ef_f1[e] != UINT32_MAX) gpu_interior++;
+        fprintf(stderr, "[GPU_TOPO_VALIDATE] interior edges: CPU=%d, GPU=%d (boundary: CPU=%d, GPU=%d)\n",
+                cpu_interior, gpu_interior,
+                (int)m_num_edges - cpu_interior,
+                (int)gpu.num_edges - gpu_interior);
+
+        // Check ef consistency: for each GPU edge, verify faces share vertices
+        int ef_bad = 0;
+        for (uint32_t e = 0; e < gpu.num_edges && e < 10; ++e) {
+            uint32_t v0 = gpu.ev_flat[2*e], v1 = gpu.ev_flat[2*e+1];
+            uint32_t f0 = gpu.ef_f0[e];
+            uint32_t f1 = gpu.ef_f1[e];
+            // Check f0 contains v0 or v1
+            bool f0_has_v0 = (fv[f0][0]==v0||fv[f0][1]==v0||fv[f0][2]==v0);
+            bool f0_has_v1 = (fv[f0][0]==v1||fv[f0][1]==v1||fv[f0][2]==v1);
+            if (!f0_has_v0 || !f0_has_v1) {
+                fprintf(stderr, "[GPU_TOPO_VALIDATE] BAD ef_f0: edge %u (%u,%u) face %u verts=(%u,%u,%u)\n",
+                        e, v0, v1, f0, fv[f0][0], fv[f0][1], fv[f0][2]);
+                ef_bad++;
+            }
+            if (f1 != UINT32_MAX) {
+                bool f1_has_v0 = (fv[f1][0]==v0||fv[f1][1]==v0||fv[f1][2]==v0);
+                bool f1_has_v1 = (fv[f1][0]==v1||fv[f1][1]==v1||fv[f1][2]==v1);
+                if (!f1_has_v0 || !f1_has_v1) {
+                    fprintf(stderr, "[GPU_TOPO_VALIDATE] BAD ef_f1: edge %u (%u,%u) face %u verts=(%u,%u,%u)\n",
+                            e, v0, v1, f1, fv[f1][0], fv[f1][1], fv[f1][2]);
+                    ef_bad++;
+                }
+            }
+        }
+        // Check ALL edges — separate f0 and f1 error counts
+        int ef_f0_bad = 0, ef_f1_bad = 0;
+        for (uint32_t e = 0; e < gpu.num_edges; ++e) {
+            uint32_t v0 = gpu.ev_flat[2*e], v1 = gpu.ev_flat[2*e+1];
+            uint32_t f0 = gpu.ef_f0[e];
+            bool f0_ok = (fv[f0][0]==v0||fv[f0][1]==v0||fv[f0][2]==v0) &&
+                         (fv[f0][0]==v1||fv[f0][1]==v1||fv[f0][2]==v1);
+            if (!f0_ok) ef_f0_bad++;
+            if (gpu.ef_f1[e] != UINT32_MAX) {
+                uint32_t f1 = gpu.ef_f1[e];
+                bool f1_ok = (fv[f1][0]==v0||fv[f1][1]==v0||fv[f1][2]==v0) &&
+                             (fv[f1][0]==v1||fv[f1][1]==v1||fv[f1][2]==v1);
+                if (!f1_ok) ef_f1_bad++;
+            }
+        }
+        fprintf(stderr, "[GPU_TOPO_VALIDATE] ef_f0 errors: %d, ef_f1 errors: %d\n",
+                ef_f0_bad, ef_f1_bad);
+
+        // For first few bad ef_f1: which face SHOULD it be?
+        for (uint32_t e = 0; e < std::min(gpu.num_edges, 10u); ++e) {
+            uint32_t v0 = gpu.ev_flat[2*e], v1 = gpu.ev_flat[2*e+1];
+            // Find which CPU edge has (v0,v1)
+            auto cpu_eid_it = m_edges_map.find(detail::edge_key(v0, v1));
+            if (cpu_eid_it != m_edges_map.end()) {
+                uint32_t cpu_eid = cpu_eid_it->second;
+                fprintf(stderr, "[GPU_TOPO_VALIDATE] edge %u (%u,%u): gpu_f0=%u gpu_f1=%u | cpu_f0=%u cpu_f1=%s\n",
+                        e, v0, v1, gpu.ef_f0[e],
+                        gpu.ef_f1[e] == UINT32_MAX ? 99999 : gpu.ef_f1[e],
+                        ef[cpu_eid][0],
+                        ef[cpu_eid].size() >= 2 ? std::to_string(ef[cpu_eid][1]).c_str() : "boundary");
+            }
+        }
+
+        // Debug face 1: dump its CPU and GPU neighbors
+        for (uint32_t dbg_f : {1u, 12u, 19u}) {
+            uint32_t cs = ff_offset[dbg_f], ce = ff_offset[dbg_f+1];
+            uint32_t gs = gpu.ff_offset[dbg_f], ge = gpu.ff_offset[dbg_f+1];
+            fprintf(stderr, "[GPU_TOPO_VALIDATE] face %u CPU neighbors:", dbg_f);
+            for (uint32_t i = cs; i < ce; ++i) fprintf(stderr, " %u", ff_values[i]);
+            fprintf(stderr, "\n[GPU_TOPO_VALIDATE] face %u GPU neighbors:", dbg_f);
+            for (uint32_t i = gs; i < ge; ++i) fprintf(stderr, " %u", gpu.ff_values[i]);
+            fprintf(stderr, "\n");
+        }
+
+        // Spot check ev
+        int ev_mm = 0;
+        for (uint32_t e = 0; e < std::min(m_num_edges, gpu.num_edges); ++e) {
+            // GPU edges are in different order, so can't compare directly
+            // Just check that each GPU edge exists in CPU edges_map
+            uint32_t gv0 = gpu.ev_flat[2*e], gv1 = gpu.ev_flat[2*e+1];
+            auto key = detail::edge_key(gv0, gv1);
+            if (m_edges_map.find(key) == m_edges_map.end()) ev_mm++;
+        }
+        fprintf(stderr, "[GPU_TOPO_VALIDATE] GPU edges not found in CPU map: %d / %u\n",
+                ev_mm, gpu.num_edges);
+    }
+}
+
+#if 0
+// ── Original hash-map-based implementation (kept for reference) ──────────
+void RXMesh::build_supporting_structures_original(
     const std::vector<std::vector<uint32_t>>& fv,
     std::vector<std::vector<uint32_t>>&       ev,
     std::vector<std::vector<uint32_t>>&       ef,
@@ -571,7 +767,6 @@ void RXMesh::build_supporting_structures(
     m_num_edges    = 0;
     m_edges_map.clear();
 
-    // assuming manifold mesh i.e., #E = 1.5#F
     ef.clear();
     uint32_t reserve_size =
         static_cast<size_t>(1.5f * static_cast<float>(m_num_faces));
@@ -656,6 +851,8 @@ void RXMesh::build_supporting_structures(
         }
     }
 }
+#endif  // inner #if 0 (original hash-map)
+#endif  // outer #if 0 (old validation + original)
 
 void RXMesh::calc_input_statistics(const std::vector<std::vector<uint32_t>>& fv,
                                    const std::vector<std::vector<uint32_t>>& ef)
