@@ -594,6 +594,7 @@ class RXMesh
     // Retained GPU topology data for GPU patch construction
     uint64_t* m_d_edge_key = nullptr;  // [num_edges] sorted packed keys
     uint32_t* m_d_ev = nullptr;        // [num_edges * 2] on device
+    uint32_t* m_d_ef_f0 = nullptr;     // [num_edges] first face per edge
 
     // GPU K1+K2 results (when GPU path is used)
     bool m_gpu_k1k2_used = false;

@@ -227,8 +227,8 @@ GpuTopoResult gpu_build_topology(const uint32_t* h_faces, uint32_t num_faces)
     // Retain device arrays for downstream GPU kernels
     result.d_edge_key = d_edge_key;
     result.d_ev = d_ev_flat;
+    result.d_ef_f0 = d_ef_f0;
 
-    CUDA_ERROR(cudaFree(d_ef_f0));
     CUDA_ERROR(cudaFree(d_ef_f1));
     CUDA_ERROR(cudaFree(d_ff_count));
     CUDA_ERROR(cudaFree(d_ff_offset));

@@ -381,51 +381,48 @@ __global__ static void k1_build_ltog(
     // Thread 0 does the partition (small arrays)
     __shared__ uint16_t s_num_owned_f, s_num_owned_e, s_num_owned_v;
 
+    // Use s_all_verts/s_all_edges as temp buffers for partition (reuse memory)
+    // They're no longer needed after sort+dedup above.
     if (threadIdx.x == 0) {
-        // Partition faces: owned (face_patch[f] == p) first
-        // Since s_faces is sorted, and owned faces are a subset, we can
-        // stable_partition by swapping sections. Simpler: two-pass copy.
-        uint32_t temp[K1_MAX_FACES];
-        uint16_t owned = 0, notowned_start = 0;
+        uint32_t* temp_f = s_all_verts;  // reuse, enough space for K1_MAX_FACES
+        uint32_t* temp_e = s_all_edges;  // reuse, enough space for K1_MAX_EDGES
 
-        // Count owned faces
-        for (uint16_t i = 0; i < nf; ++i)
+        // Partition faces: owned first
+        uint16_t owned = 0;
+        for (uint32_t i = 0; i < nf; ++i)
             if (d_face_patch[s_faces[i]] == p) owned++;
         s_num_owned_f = owned;
-
-        // Copy owned first, then not-owned (maintaining sort within each)
         uint16_t wi = 0;
-        for (uint16_t i = 0; i < nf; ++i)
-            if (d_face_patch[s_faces[i]] == p) temp[wi++] = s_faces[i];
-        for (uint16_t i = 0; i < nf; ++i)
-            if (d_face_patch[s_faces[i]] != p) temp[wi++] = s_faces[i];
-        for (uint16_t i = 0; i < nf; ++i) s_faces[i] = temp[i];
+        for (uint32_t i = 0; i < nf; ++i)
+            if (d_face_patch[s_faces[i]] == p) temp_f[wi++] = s_faces[i];
+        for (uint32_t i = 0; i < nf; ++i)
+            if (d_face_patch[s_faces[i]] != p) temp_f[wi++] = s_faces[i];
+        for (uint32_t i = 0; i < nf; ++i) s_faces[i] = temp_f[i];
 
         // Partition edges
-        uint32_t temp_e[K1_MAX_EDGES];
         owned = 0;
-        for (uint16_t i = 0; i < ne; ++i)
+        for (uint32_t i = 0; i < ne; ++i)
             if (d_edge_patch[s_edges[i]] == p) owned++;
         s_num_owned_e = owned;
         wi = 0;
-        for (uint16_t i = 0; i < ne; ++i)
+        for (uint32_t i = 0; i < ne; ++i)
             if (d_edge_patch[s_edges[i]] == p) temp_e[wi++] = s_edges[i];
-        for (uint16_t i = 0; i < ne; ++i)
+        for (uint32_t i = 0; i < ne; ++i)
             if (d_edge_patch[s_edges[i]] != p) temp_e[wi++] = s_edges[i];
-        for (uint16_t i = 0; i < ne; ++i) s_edges[i] = temp_e[i];
+        for (uint32_t i = 0; i < ne; ++i) s_edges[i] = temp_e[i];
 
-        // Partition vertices
-        uint32_t temp_v[K1_MAX_VERTS];
+        // Partition vertices — reuse temp_f (already done with faces)
+        uint32_t* temp_v = temp_f;
         owned = 0;
-        for (uint16_t i = 0; i < nv; ++i)
+        for (uint32_t i = 0; i < nv; ++i)
             if (d_vertex_patch[s_verts[i]] == p) owned++;
         s_num_owned_v = owned;
         wi = 0;
-        for (uint16_t i = 0; i < nv; ++i)
+        for (uint32_t i = 0; i < nv; ++i)
             if (d_vertex_patch[s_verts[i]] == p) temp_v[wi++] = s_verts[i];
-        for (uint16_t i = 0; i < nv; ++i)
+        for (uint32_t i = 0; i < nv; ++i)
             if (d_vertex_patch[s_verts[i]] != p) temp_v[wi++] = s_verts[i];
-        for (uint16_t i = 0; i < nv; ++i) s_verts[i] = temp_v[i];
+        for (uint32_t i = 0; i < nv; ++i) s_verts[i] = temp_v[i];
     }
     __syncthreads();
 
@@ -687,6 +684,26 @@ GpuPatchBuildResult gpu_build_patches(
     result.success = true;
     return result;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// K0a-only wrapper
+// ═══════════════════════════════════════════════════════════════════════════
+
+void gpu_run_k0a(
+    const uint32_t* d_face_patch,
+    const uint32_t* d_ev,
+    const uint32_t* d_ef_f0,
+    uint32_t* d_edge_patch,
+    uint32_t* d_vertex_patch,
+    uint32_t num_edges)
+{
+    int grid = (num_edges + 255) / 256;
+    k0a_assign_edge_vertex_patch<<<grid, 256>>>(
+        d_face_patch, d_ev, d_ef_f0,
+        d_edge_patch, d_vertex_patch, num_edges);
+    CUDA_ERROR(cudaDeviceSynchronize());
+}
+
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Combined K1+K2 wrapper

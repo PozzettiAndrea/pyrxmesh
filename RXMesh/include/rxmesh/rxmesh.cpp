@@ -382,8 +382,11 @@ void RXMesh::build(const std::vector<std::vector<uint32_t>>& fv,
             verts_by_patch[pid].push_back(v);
     }
 
-    // GPU K1+K2 disabled: produces GPU-edge-ID-based data that crashes
-    // build_device (expects CPU edge IDs). Need K3+K4 to complete the chain.
+    // GPU K1+K2 — disabled pending edge ID reconciliation.
+    // The GPU topology uses different edge IDs than the CPU m_edges_map.
+    // Until we either: (a) build a GPU→CPU edge mapping, or
+    // (b) replace ALL downstream code to use GPU edge IDs,
+    // the GPU path produces incompatible ltog arrays that crash build_device.
     if (false && m_d_edge_key != nullptr) {
         fprintf(stderr, "[build] Using GPU K1 for ltog construction...\n");
 
@@ -418,8 +421,6 @@ void RXMesh::build(const std::vector<std::vector<uint32_t>>& fv,
         CUDA_ERROR(cudaMalloc(&d_po, get_num_patches() * sizeof(uint32_t)));
         CUDA_ERROR(cudaMalloc(&d_rv, std::max(cpu_rv.size(), (size_t)1) * sizeof(uint32_t)));
         CUDA_ERROR(cudaMalloc(&d_ro, rib_pfx.size() * sizeof(uint32_t)));
-        CUDA_ERROR(cudaMalloc(&d_epc, m_num_edges * sizeof(uint32_t)));
-        CUDA_ERROR(cudaMalloc(&d_vpc, m_num_vertices * sizeof(uint32_t)));
         CUDA_ERROR(cudaMalloc(&d_fpc, m_num_faces * sizeof(uint32_t)));
 
         CUDA_ERROR(cudaMemcpy(d_pv, cpu_pv, pv_total*sizeof(uint32_t), cudaMemcpyHostToDevice));
@@ -427,9 +428,14 @@ void RXMesh::build(const std::vector<std::vector<uint32_t>>& fv,
         if (!cpu_rv.empty())
             CUDA_ERROR(cudaMemcpy(d_rv, cpu_rv.data(), cpu_rv.size()*sizeof(uint32_t), cudaMemcpyHostToDevice));
         CUDA_ERROR(cudaMemcpy(d_ro, rib_pfx.data(), rib_pfx.size()*sizeof(uint32_t), cudaMemcpyHostToDevice));
-        CUDA_ERROR(cudaMemcpy(d_epc, m_patcher->get_edge_patch().data(), m_num_edges*sizeof(uint32_t), cudaMemcpyHostToDevice));
-        CUDA_ERROR(cudaMemcpy(d_vpc, m_patcher->get_vertex_patch().data(), m_num_vertices*sizeof(uint32_t), cudaMemcpyHostToDevice));
         CUDA_ERROR(cudaMemcpy(d_fpc, m_patcher->get_face_patch().data(), m_num_faces*sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+        // Run K0a to get GPU-edge-ID-compatible edge/vertex patch assignments
+        CUDA_ERROR(cudaMalloc(&d_epc, m_num_edges * sizeof(uint32_t)));
+        CUDA_ERROR(cudaMalloc(&d_vpc, m_num_vertices * sizeof(uint32_t)));
+        CUDA_ERROR(cudaMemset(d_vpc, 0xFF, m_num_vertices * sizeof(uint32_t)));
+        gpu_run_k0a(d_fpc, m_d_ev, m_d_ef_f0, d_epc, d_vpc, m_num_edges);
+        fprintf(stderr, "[build] K0a done (GPU edge/vertex patches)\n");
 
         // Compute max per-patch sizes (conservative estimate)
         uint32_t max_f_est = 0;
@@ -460,10 +466,15 @@ void RXMesh::build(const std::vector<std::vector<uint32_t>>& fv,
             edge_cap_est, face_cap_est);
 
         // Copy K1 results into CPU ltog arrays
+        fprintf(stderr, "[build] Copying K1 results for %u patches (max_f=%u max_e=%u max_v=%u, ltog sizes: f=%zu e=%zu v=%zu)...\n",
+                get_num_patches(), max_f_k1, max_e_k1, max_v_k1,
+                k1k2r.ltog_f.size(), k1k2r.ltog_e.size(), k1k2r.ltog_v.size());
         for (uint32_t p = 0; p < get_num_patches(); ++p) {
             uint16_t nf = k1k2r.num_elements_f[p];
             uint16_t ne = k1k2r.num_elements_e[p];
             uint16_t nv = k1k2r.num_elements_v[p];
+            fprintf(stderr, "[build] patch %u: nf=%u ne=%u nv=%u (f_base=%u e_base=%u v_base=%u)\n",
+                    p, nf, ne, nv, p*max_f_k1, p*max_e_k1, p*max_v_k1);
 
             uint32_t f_base = p * max_f_k1;
             uint32_t e_base = p * max_e_k1;
@@ -748,9 +759,14 @@ void RXMesh::build(const std::vector<std::vector<uint32_t>>& fv,
     m_max_face_capacity = static_cast<uint16_t>(std::ceil(
         m_capacity_factor * static_cast<float>(m_max_faces_per_patch)));
 
+    fprintf(stderr, "[build] m_gpu_k1k2_used=%d, max_e_cap=%u, max_f_cap=%u\n",
+            m_gpu_k1k2_used, m_max_edge_capacity, m_max_face_capacity);
+
     if (m_gpu_k1k2_used) {
         // Use K2 topology results instead of CPU build_single_patch_topology
         fprintf(stderr, "[build] Using GPU K2 topology results...\n");
+        fprintf(stderr, "[build] ev_stride=%u, fe_stride=%u\n",
+                m_gpu_k1k2_result.ev_stride, m_gpu_k1k2_result.fe_stride);
         for (uint32_t p = 0; p < get_num_patches(); ++p) {
             uint32_t edges_cap = m_max_edge_capacity;
             uint32_t faces_cap = m_max_face_capacity;
@@ -775,6 +791,13 @@ void RXMesh::build(const std::vector<std::vector<uint32_t>>& fv,
                     m_gpu_k1k2_result.fe_local[fe_src + i];
         }
         m_gpu_k1k2_used = false;  // consumed
+
+        // Validate patch 0's topology
+        fprintf(stderr, "[build] GPU K2: patch 0 ne=%zu nf=%zu ev[0]=%u,%u fe[0]=%u\n",
+                m_h_patches_ltog_e[0].size(), m_h_patches_ltog_f[0].size(),
+                (unsigned)m_h_patches_info[0].ev[0].id,
+                (unsigned)m_h_patches_info[0].ev[1].id,
+                (unsigned)m_h_patches_info[0].fe[0].id);
         fprintf(stderr, "[build] GPU K2 topology copied to host.\n");
     } else {
 #pragma omp parallel for
@@ -958,11 +981,13 @@ void RXMesh::build_supporting_structures(
     m_num_vertices = gpu.num_vertices;
     m_num_edges    = gpu.num_edges;
 
-    // Retain device arrays for GPU patch construction (K1, K2)
+    // Retain device arrays for GPU patch construction (K0a, K1, K2)
     m_d_edge_key = gpu.d_edge_key;
     m_d_ev = gpu.d_ev;
-    gpu.d_edge_key = nullptr;  // prevent double-free
+    m_d_ef_f0 = gpu.d_ef_f0;
+    gpu.d_edge_key = nullptr;
     gpu.d_ev = nullptr;
+    gpu.d_ef_f0 = nullptr;
 
     // Convert to vector-of-vectors (downstream expects this format)
     ev.resize(m_num_edges);

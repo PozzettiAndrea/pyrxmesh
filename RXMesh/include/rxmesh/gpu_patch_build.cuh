@@ -99,6 +99,15 @@ struct K1K2Result {
     uint32_t ev_stride, fe_stride;
 };
 
+// Run K0a only: assign edge/vertex patches on GPU
+void gpu_run_k0a(
+    const uint32_t* d_face_patch,
+    const uint32_t* d_ev,
+    const uint32_t* d_ef_f0,
+    uint32_t* d_edge_patch,    // output [E]
+    uint32_t* d_vertex_patch,  // output [V], must be pre-initialized to INVALID32
+    uint32_t num_edges);
+
 K1K2Result gpu_run_k1k2(
     const uint32_t* d_fv,
     const uint64_t* d_edge_key,
