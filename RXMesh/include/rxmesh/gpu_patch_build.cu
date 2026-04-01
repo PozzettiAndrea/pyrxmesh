@@ -689,6 +689,136 @@ GpuPatchBuildResult gpu_build_patches(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Combined K1+K2 wrapper
+// ═══════════════════════════════════════════════════════════════════════════
+
+K1K2Result gpu_run_k1k2(
+    const uint32_t* d_fv,
+    const uint64_t* d_edge_key,
+    const uint32_t* d_ev_global,
+    uint32_t num_edges_global,
+    const uint32_t* d_patches_val,
+    const uint32_t* d_patches_offset,
+    const uint32_t* d_ribbon_val,
+    const uint32_t* d_ribbon_offset,
+    const uint32_t* d_face_patch,
+    const uint32_t* d_edge_patch,
+    const uint32_t* d_vertex_patch,
+    uint32_t num_patches,
+    uint32_t max_f, uint32_t max_e, uint32_t max_v,
+    uint32_t edge_capacity, uint32_t face_capacity)
+{
+    using clk = std::chrono::high_resolution_clock;
+    auto ms_since = [](auto t0) {
+        return std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+    };
+    auto t0 = clk::now();
+
+    // ── K1: build ltog ───────────────────────────────────────────────────
+    uint32_t total_f = num_patches * max_f;
+    uint32_t total_e = num_patches * max_e;
+    uint32_t total_v = num_patches * max_v;
+
+    std::vector<uint32_t> f_off(num_patches+1), e_off(num_patches+1), v_off(num_patches+1);
+    for (uint32_t p = 0; p <= num_patches; ++p) {
+        f_off[p] = p * max_f;
+        e_off[p] = p * max_e;
+        v_off[p] = p * max_v;
+    }
+
+    uint32_t *d_ltog_f, *d_ltog_e, *d_ltog_v;
+    uint32_t *d_f_off, *d_e_off, *d_v_off;
+    uint16_t *d_nef, *d_nee, *d_nev, *d_nof, *d_noe, *d_nov;
+
+    CUDA_ERROR(cudaMalloc(&d_ltog_f, total_f * sizeof(uint32_t)));
+    CUDA_ERROR(cudaMalloc(&d_ltog_e, total_e * sizeof(uint32_t)));
+    CUDA_ERROR(cudaMalloc(&d_ltog_v, total_v * sizeof(uint32_t)));
+    CUDA_ERROR(cudaMalloc(&d_f_off, (num_patches+1) * sizeof(uint32_t)));
+    CUDA_ERROR(cudaMalloc(&d_e_off, (num_patches+1) * sizeof(uint32_t)));
+    CUDA_ERROR(cudaMalloc(&d_v_off, (num_patches+1) * sizeof(uint32_t)));
+    CUDA_ERROR(cudaMalloc(&d_nef, num_patches * sizeof(uint16_t)));
+    CUDA_ERROR(cudaMalloc(&d_nee, num_patches * sizeof(uint16_t)));
+    CUDA_ERROR(cudaMalloc(&d_nev, num_patches * sizeof(uint16_t)));
+    CUDA_ERROR(cudaMalloc(&d_nof, num_patches * sizeof(uint16_t)));
+    CUDA_ERROR(cudaMalloc(&d_noe, num_patches * sizeof(uint16_t)));
+    CUDA_ERROR(cudaMalloc(&d_nov, num_patches * sizeof(uint16_t)));
+
+    CUDA_ERROR(cudaMemcpy(d_f_off, f_off.data(), (num_patches+1)*sizeof(uint32_t), cudaMemcpyHostToDevice));
+    CUDA_ERROR(cudaMemcpy(d_e_off, e_off.data(), (num_patches+1)*sizeof(uint32_t), cudaMemcpyHostToDevice));
+    CUDA_ERROR(cudaMemcpy(d_v_off, v_off.data(), (num_patches+1)*sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    k1_build_ltog<<<num_patches, 256>>>(
+        d_fv, d_edge_key, d_ev_global, num_edges_global,
+        d_patches_val, d_patches_offset,
+        d_ribbon_val, d_ribbon_offset,
+        d_face_patch, d_edge_patch, d_vertex_patch,
+        num_patches,
+        d_ltog_f, d_ltog_e, d_ltog_v,
+        d_f_off, d_e_off, d_v_off,
+        d_nef, d_nee, d_nev, d_nof, d_noe, d_nov);
+    CUDA_ERROR(cudaDeviceSynchronize());
+    fprintf(stderr, "[gpu_k1k2] K1 done: %.1fms\n", ms_since(t0));
+
+    // ── K2: build topology ───────────────────────────────────────────────
+    auto tp = clk::now();
+    uint32_t ev_stride = edge_capacity * 2;
+    uint32_t fe_stride = face_capacity * 3;
+
+    uint16_t *d_ev_local, *d_fe_local;
+    CUDA_ERROR(cudaMalloc(&d_ev_local, num_patches * ev_stride * sizeof(uint16_t)));
+    CUDA_ERROR(cudaMalloc(&d_fe_local, num_patches * fe_stride * sizeof(uint16_t)));
+    CUDA_ERROR(cudaMemset(d_ev_local, 0xFF, num_patches * ev_stride * sizeof(uint16_t)));
+    CUDA_ERROR(cudaMemset(d_fe_local, 0xFF, num_patches * fe_stride * sizeof(uint16_t)));
+
+    k2_build_topology<<<num_patches, 256>>>(
+        d_fv, d_edge_key, d_ev_global, num_edges_global,
+        d_patches_val, d_patches_offset,
+        d_ribbon_val, d_ribbon_offset,
+        d_face_patch, d_edge_patch, d_vertex_patch,
+        d_ltog_f, d_f_off, d_ltog_e, d_e_off, d_ltog_v, d_v_off,
+        d_nef, d_nof, d_nee, d_noe, d_nev, d_nov,
+        num_patches,
+        d_ev_local, d_fe_local, ev_stride, fe_stride);
+    CUDA_ERROR(cudaDeviceSynchronize());
+    fprintf(stderr, "[gpu_k1k2] K2 done: %.1fms\n", ms_since(tp));
+
+    // ── Download results ─────────────────────────────────────────────────
+    tp = clk::now();
+    K1K2Result r;
+    r.max_f = max_f; r.max_e = max_e; r.max_v = max_v;
+    r.ev_stride = ev_stride; r.fe_stride = fe_stride;
+
+    r.ltog_f.resize(total_f); r.ltog_e.resize(total_e); r.ltog_v.resize(total_v);
+    r.num_elements_f.resize(num_patches); r.num_elements_e.resize(num_patches); r.num_elements_v.resize(num_patches);
+    r.num_owned_f.resize(num_patches); r.num_owned_e.resize(num_patches); r.num_owned_v.resize(num_patches);
+    r.ev_local.resize(num_patches * ev_stride);
+    r.fe_local.resize(num_patches * fe_stride);
+
+    CUDA_ERROR(cudaMemcpy(r.ltog_f.data(), d_ltog_f, total_f*sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    CUDA_ERROR(cudaMemcpy(r.ltog_e.data(), d_ltog_e, total_e*sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    CUDA_ERROR(cudaMemcpy(r.ltog_v.data(), d_ltog_v, total_v*sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    CUDA_ERROR(cudaMemcpy(r.num_elements_f.data(), d_nef, num_patches*sizeof(uint16_t), cudaMemcpyDeviceToHost));
+    CUDA_ERROR(cudaMemcpy(r.num_elements_e.data(), d_nee, num_patches*sizeof(uint16_t), cudaMemcpyDeviceToHost));
+    CUDA_ERROR(cudaMemcpy(r.num_elements_v.data(), d_nev, num_patches*sizeof(uint16_t), cudaMemcpyDeviceToHost));
+    CUDA_ERROR(cudaMemcpy(r.num_owned_f.data(), d_nof, num_patches*sizeof(uint16_t), cudaMemcpyDeviceToHost));
+    CUDA_ERROR(cudaMemcpy(r.num_owned_e.data(), d_noe, num_patches*sizeof(uint16_t), cudaMemcpyDeviceToHost));
+    CUDA_ERROR(cudaMemcpy(r.num_owned_v.data(), d_nov, num_patches*sizeof(uint16_t), cudaMemcpyDeviceToHost));
+    CUDA_ERROR(cudaMemcpy(r.ev_local.data(), d_ev_local, num_patches*ev_stride*sizeof(uint16_t), cudaMemcpyDeviceToHost));
+    CUDA_ERROR(cudaMemcpy(r.fe_local.data(), d_fe_local, num_patches*fe_stride*sizeof(uint16_t), cudaMemcpyDeviceToHost));
+
+    fprintf(stderr, "[gpu_k1k2] download: %.1fms, TOTAL: %.1fms\n", ms_since(tp), ms_since(t0));
+
+    CUDA_ERROR(cudaFree(d_ltog_f)); CUDA_ERROR(cudaFree(d_ltog_e)); CUDA_ERROR(cudaFree(d_ltog_v));
+    CUDA_ERROR(cudaFree(d_f_off)); CUDA_ERROR(cudaFree(d_e_off)); CUDA_ERROR(cudaFree(d_v_off));
+    CUDA_ERROR(cudaFree(d_nef)); CUDA_ERROR(cudaFree(d_nee)); CUDA_ERROR(cudaFree(d_nev));
+    CUDA_ERROR(cudaFree(d_nof)); CUDA_ERROR(cudaFree(d_noe)); CUDA_ERROR(cudaFree(d_nov));
+    CUDA_ERROR(cudaFree(d_ev_local)); CUDA_ERROR(cudaFree(d_fe_local));
+
+    return r;
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Test wrapper for K1
 // ═══════════════════════════════════════════════════════════════════════════
 

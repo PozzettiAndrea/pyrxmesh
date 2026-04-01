@@ -160,7 +160,8 @@ GpuTopoResult gpu_build_topology(const uint32_t* h_faces, uint32_t num_faces)
         d_ev_flat, d_ef_f0, d_ef_f1, d_ff_count);
     CUDA_ERROR(cudaDeviceSynchronize());
 
-    CUDA_ERROR(cudaFree(d_edge_key));
+    // Keep d_edge_key for downstream K1 edge lookups (freed via result.free_device())
+    // d_edge_face and d_edge_id are no longer needed
     CUDA_ERROR(cudaFree(d_edge_face));
     CUDA_ERROR(cudaFree(d_edge_id));
 
@@ -223,7 +224,10 @@ GpuTopoResult gpu_build_topology(const uint32_t* h_faces, uint32_t num_faces)
         max_v = std::max(max_v, result.ev_flat[i]);
     result.num_vertices = max_v + 1;
 
-    CUDA_ERROR(cudaFree(d_ev_flat));
+    // Retain device arrays for downstream GPU kernels
+    result.d_edge_key = d_edge_key;
+    result.d_ev = d_ev_flat;
+
     CUDA_ERROR(cudaFree(d_ef_f0));
     CUDA_ERROR(cudaFree(d_ef_f1));
     CUDA_ERROR(cudaFree(d_ff_count));

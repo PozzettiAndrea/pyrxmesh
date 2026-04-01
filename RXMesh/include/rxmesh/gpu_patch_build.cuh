@@ -85,4 +85,34 @@ K1Result gpu_test_k1(
     uint32_t num_patches,
     uint32_t max_f, uint32_t max_e, uint32_t max_v);
 
+// Test wrapper: run K1+K2 together and return ltog + topology results
+struct K1K2Result {
+    // K1 outputs
+    std::vector<uint32_t> ltog_f, ltog_e, ltog_v;  // concatenated
+    std::vector<uint16_t> num_elements_f, num_elements_e, num_elements_v;
+    std::vector<uint16_t> num_owned_f, num_owned_e, num_owned_v;
+    uint32_t max_f, max_e, max_v;  // strides
+
+    // K2 outputs: local topology per patch (concatenated, stride = max_cap * 2 or * 3)
+    std::vector<uint16_t> ev_local;  // [P * ev_stride]
+    std::vector<uint16_t> fe_local;  // [P * fe_stride]
+    uint32_t ev_stride, fe_stride;
+};
+
+K1K2Result gpu_run_k1k2(
+    const uint32_t* d_fv,
+    const uint64_t* d_edge_key,
+    const uint32_t* d_ev_global,  // [E*2] on device
+    uint32_t num_edges_global,
+    const uint32_t* d_patches_val,
+    const uint32_t* d_patches_offset,
+    const uint32_t* d_ribbon_val,
+    const uint32_t* d_ribbon_offset,
+    const uint32_t* d_face_patch,
+    const uint32_t* d_edge_patch,
+    const uint32_t* d_vertex_patch,
+    uint32_t num_patches,
+    uint32_t max_f, uint32_t max_e, uint32_t max_v,
+    uint32_t edge_capacity, uint32_t face_capacity);
+
 }  // namespace rxmesh

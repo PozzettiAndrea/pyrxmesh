@@ -13,6 +13,7 @@
 #include "rxmesh/util/util.h"
 
 #include "rxmesh/util/timer.h"
+#include "rxmesh/gpu_patch_build.cuh"
 
 class RXMeshTest;
 
@@ -589,6 +590,14 @@ class RXMesh
 
     Context  m_rxmesh_context;
     EdgeMapT m_edges_map;
+
+    // Retained GPU topology data for GPU patch construction
+    uint64_t* m_d_edge_key = nullptr;  // [num_edges] sorted packed keys
+    uint32_t* m_d_ev = nullptr;        // [num_edges * 2] on device
+
+    // GPU K1+K2 results (when GPU path is used)
+    bool m_gpu_k1k2_used = false;
+    K1K2Result m_gpu_k1k2_result;
 
     // Should be updated with update_host
     uint32_t m_num_edges, m_num_faces, m_num_vertices;
