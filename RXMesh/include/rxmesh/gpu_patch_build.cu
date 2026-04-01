@@ -228,8 +228,8 @@ __device__ static uint16_t gpu_lower_bound(
 
 // Max elements per patch (conservative, covers max_patch_size ~700 faces)
 #define K1_MAX_FACES  1024
-#define K1_MAX_EDGES  2048
-#define K1_MAX_VERTS  1024
+#define K1_MAX_EDGES  3072
+#define K1_MAX_VERTS  1536
 
 __global__ static void k1_build_ltog(
     // Topology
@@ -327,52 +327,69 @@ __global__ static void k1_build_ltog(
     }
     __syncthreads();
 
-    // ── Sort and deduplicate in shared memory ────────────────────────────
-    // Thread 0 does the sort+unique (small arrays, <2048 elements)
-    // TODO: parallel bitonic sort would be faster but sequential is simpler
-    if (threadIdx.x == 0) {
-        uint32_t nv_raw = total_faces * 3;
-        uint32_t ne_raw = total_faces * 3;
+    // ── Parallel sort + dedup in shared memory ─────────────────────────
+    // All threads participate in odd-even transposition sort, then parallel compaction.
+    uint32_t nv_raw = total_faces * 3;
+    uint32_t ne_raw = total_faces * 3;
 
-        // Simple insertion sort + dedup for vertices
-        // Copy to s_verts, sort, unique
-        s_nv = 0;
-        for (uint32_t i = 0; i < nv_raw && s_nv < K1_MAX_VERTS; ++i) {
-            uint32_t val = s_all_verts[i];
-            // Binary insert into sorted s_verts
-            uint16_t pos = 0;
-            while (pos < s_nv && s_verts[pos] < val) pos++;
-            if (pos < s_nv && s_verts[pos] == val) continue; // duplicate
-            // Shift right
-            for (uint16_t j = s_nv; j > pos; --j) s_verts[j] = s_verts[j-1];
-            s_verts[pos] = val;
-            s_nv++;
-        }
-
-        // Same for edges
-        s_ne = 0;
-        for (uint32_t i = 0; i < ne_raw && s_ne < K1_MAX_EDGES; ++i) {
-            uint32_t val = s_all_edges[i];
-            uint16_t pos = 0;
-            while (pos < s_ne && s_edges[pos] < val) pos++;
-            if (pos < s_ne && s_edges[pos] == val) continue;
-            for (uint16_t j = s_ne; j > pos; --j) s_edges[j] = s_edges[j-1];
-            s_edges[pos] = val;
-            s_ne++;
-        }
-
-        // Sort faces too
-        // Simple bubble sort (small array)
-        for (uint16_t i = 0; i < total_faces; ++i) {
-            for (uint16_t j = i + 1; j < total_faces; ++j) {
-                if (s_faces[j] < s_faces[i]) {
-                    uint32_t tmp = s_faces[i];
-                    s_faces[i] = s_faces[j];
-                    s_faces[j] = tmp;
+    // Helper: parallel odd-even sort on shared memory array
+    auto parallel_sort = [&](uint32_t* arr, uint32_t n) {
+        for (uint32_t phase = 0; phase < n; ++phase) {
+            uint32_t start = phase & 1;  // alternate even/odd phases
+            for (uint32_t i = start + threadIdx.x * 2; i + 1 < n; i += blockDim.x * 2) {
+                if (arr[i] > arr[i + 1]) {
+                    uint32_t tmp = arr[i];
+                    arr[i] = arr[i + 1];
+                    arr[i + 1] = tmp;
                 }
             }
+            __syncthreads();
         }
-    }
+    };
+
+    // Helper: parallel dedup on sorted array → compacted unique array
+    // Returns count of unique elements (via shared counter)
+    auto parallel_dedup = [&](uint32_t* sorted, uint32_t n,
+                              uint32_t* out, uint32_t* s_count) {
+        if (threadIdx.x == 0) *s_count = 0;
+        __syncthreads();
+
+        // Mark unique: first element + any element different from predecessor
+        for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+            bool is_unique = (i == 0) || (sorted[i] != sorted[i - 1]);
+            if (is_unique) {
+                uint32_t pos = atomicAdd(s_count, 1u);
+                // Can't write to correct position yet (need prefix sum).
+                // Instead, mark in-place: store index+1 if unique, 0 if dup.
+                sorted[i] = sorted[i] | 0x80000000u;  // high bit = unique flag
+            }
+        }
+        __syncthreads();
+
+        // Compact: thread 0 scans and copies (sequential but array is small)
+        if (threadIdx.x == 0) {
+            uint32_t wi = 0;
+            for (uint32_t i = 0; i < n; ++i) {
+                if (sorted[i] & 0x80000000u) {
+                    out[wi++] = sorted[i] & 0x7FFFFFFFu;
+                }
+            }
+            *s_count = wi;
+        }
+        __syncthreads();
+    };
+
+    // Sort and dedup vertices
+    // First copy s_all_verts to a working buffer (reuse s_all_verts in-place)
+    parallel_sort(s_all_verts, nv_raw);
+    parallel_dedup(s_all_verts, nv_raw, s_verts, &s_nv);
+
+    // Sort and dedup edges
+    parallel_sort(s_all_edges, ne_raw);
+    parallel_dedup(s_all_edges, ne_raw, s_edges, &s_ne);
+
+    // Sort faces (parallel)
+    parallel_sort(s_faces, total_faces);
     __syncthreads();
 
     uint32_t nv = s_nv, ne = s_ne, nf = total_faces;
