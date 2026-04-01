@@ -688,4 +688,103 @@ GpuPatchBuildResult gpu_build_patches(
     return result;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Test wrapper for K1
+// ═══════════════════════════════════════════════════════════════════════════
+
+K1Result gpu_test_k1(
+    const uint32_t* d_fv,
+    const uint64_t* d_edge_key,
+    uint32_t num_edges_global,
+    const uint32_t* d_patches_val,
+    const uint32_t* d_patches_offset,
+    const uint32_t* d_ribbon_val,
+    const uint32_t* d_ribbon_offset,
+    const uint32_t* d_face_patch,
+    const uint32_t* d_edge_patch,
+    const uint32_t* d_vertex_patch,
+    uint32_t num_patches,
+    uint32_t max_f, uint32_t max_e, uint32_t max_v)
+{
+    uint32_t total_f = num_patches * max_f;
+    uint32_t total_e = num_patches * max_e;
+    uint32_t total_v = num_patches * max_v;
+
+    // Build offset arrays (uniform stride)
+    std::vector<uint32_t> f_off(num_patches + 1), e_off(num_patches + 1), v_off(num_patches + 1);
+    for (uint32_t p = 0; p <= num_patches; ++p) {
+        f_off[p] = p * max_f;
+        e_off[p] = p * max_e;
+        v_off[p] = p * max_v;
+    }
+
+    uint32_t *d_ltog_f, *d_ltog_e, *d_ltog_v;
+    uint32_t *d_f_off, *d_e_off, *d_v_off;
+    uint16_t *d_nef, *d_nee, *d_nev;
+    uint16_t *d_nof, *d_noe, *d_nov;
+
+    CUDA_ERROR(cudaMalloc(&d_ltog_f, total_f * sizeof(uint32_t)));
+    CUDA_ERROR(cudaMalloc(&d_ltog_e, total_e * sizeof(uint32_t)));
+    CUDA_ERROR(cudaMalloc(&d_ltog_v, total_v * sizeof(uint32_t)));
+    CUDA_ERROR(cudaMalloc(&d_f_off, (num_patches+1) * sizeof(uint32_t)));
+    CUDA_ERROR(cudaMalloc(&d_e_off, (num_patches+1) * sizeof(uint32_t)));
+    CUDA_ERROR(cudaMalloc(&d_v_off, (num_patches+1) * sizeof(uint32_t)));
+    CUDA_ERROR(cudaMalloc(&d_nef, num_patches * sizeof(uint16_t)));
+    CUDA_ERROR(cudaMalloc(&d_nee, num_patches * sizeof(uint16_t)));
+    CUDA_ERROR(cudaMalloc(&d_nev, num_patches * sizeof(uint16_t)));
+    CUDA_ERROR(cudaMalloc(&d_nof, num_patches * sizeof(uint16_t)));
+    CUDA_ERROR(cudaMalloc(&d_noe, num_patches * sizeof(uint16_t)));
+    CUDA_ERROR(cudaMalloc(&d_nov, num_patches * sizeof(uint16_t)));
+
+    CUDA_ERROR(cudaMemcpy(d_f_off, f_off.data(), (num_patches+1)*sizeof(uint32_t), cudaMemcpyHostToDevice));
+    CUDA_ERROR(cudaMemcpy(d_e_off, e_off.data(), (num_patches+1)*sizeof(uint32_t), cudaMemcpyHostToDevice));
+    CUDA_ERROR(cudaMemcpy(d_v_off, v_off.data(), (num_patches+1)*sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    // Launch K1
+    k1_build_ltog<<<num_patches, 256>>>(
+        d_fv, d_edge_key, nullptr, num_edges_global,
+        d_patches_val, d_patches_offset,
+        d_ribbon_val, d_ribbon_offset,
+        d_face_patch, d_edge_patch, d_vertex_patch,
+        num_patches,
+        d_ltog_f, d_ltog_e, d_ltog_v,
+        d_f_off, d_e_off, d_v_off,
+        d_nef, d_nee, d_nev,
+        d_nof, d_noe, d_nov);
+    CUDA_ERROR(cudaDeviceSynchronize());
+
+    // Download results
+    K1Result r;
+    r.max_f_per_patch = max_f;
+    r.max_e_per_patch = max_e;
+    r.max_v_per_patch = max_v;
+
+    r.ltog_f.resize(total_f);
+    r.ltog_e.resize(total_e);
+    r.ltog_v.resize(total_v);
+    r.num_elements_f.resize(num_patches);
+    r.num_elements_e.resize(num_patches);
+    r.num_elements_v.resize(num_patches);
+    r.num_owned_f.resize(num_patches);
+    r.num_owned_e.resize(num_patches);
+    r.num_owned_v.resize(num_patches);
+
+    CUDA_ERROR(cudaMemcpy(r.ltog_f.data(), d_ltog_f, total_f*sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    CUDA_ERROR(cudaMemcpy(r.ltog_e.data(), d_ltog_e, total_e*sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    CUDA_ERROR(cudaMemcpy(r.ltog_v.data(), d_ltog_v, total_v*sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    CUDA_ERROR(cudaMemcpy(r.num_elements_f.data(), d_nef, num_patches*sizeof(uint16_t), cudaMemcpyDeviceToHost));
+    CUDA_ERROR(cudaMemcpy(r.num_elements_e.data(), d_nee, num_patches*sizeof(uint16_t), cudaMemcpyDeviceToHost));
+    CUDA_ERROR(cudaMemcpy(r.num_elements_v.data(), d_nev, num_patches*sizeof(uint16_t), cudaMemcpyDeviceToHost));
+    CUDA_ERROR(cudaMemcpy(r.num_owned_f.data(), d_nof, num_patches*sizeof(uint16_t), cudaMemcpyDeviceToHost));
+    CUDA_ERROR(cudaMemcpy(r.num_owned_e.data(), d_noe, num_patches*sizeof(uint16_t), cudaMemcpyDeviceToHost));
+    CUDA_ERROR(cudaMemcpy(r.num_owned_v.data(), d_nov, num_patches*sizeof(uint16_t), cudaMemcpyDeviceToHost));
+
+    CUDA_ERROR(cudaFree(d_ltog_f)); CUDA_ERROR(cudaFree(d_ltog_e)); CUDA_ERROR(cudaFree(d_ltog_v));
+    CUDA_ERROR(cudaFree(d_f_off)); CUDA_ERROR(cudaFree(d_e_off)); CUDA_ERROR(cudaFree(d_v_off));
+    CUDA_ERROR(cudaFree(d_nef)); CUDA_ERROR(cudaFree(d_nee)); CUDA_ERROR(cudaFree(d_nev));
+    CUDA_ERROR(cudaFree(d_nof)); CUDA_ERROR(cudaFree(d_noe)); CUDA_ERROR(cudaFree(d_nov));
+
+    return r;
+}
+
 }  // namespace rxmesh

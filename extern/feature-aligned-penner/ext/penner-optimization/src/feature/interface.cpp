@@ -206,14 +206,10 @@ std::tuple<Eigen::MatrixXd, Eigen::MatrixXi, std::vector<VertexEdge>, std::vecto
     FeatureFinder feature_finder(V, F);
     feature_finder.mark_dihedral_angle_features(dihedral_angle);
     spdlog::info("Feature edges detected ({}° dihedral): {}", dihedral_angle, feature_finder.get_features().size());
+    feature_finder.erode_dilate(4);
+    spdlog::info("Feature edges after erode_dilate: {}", feature_finder.get_features().size());
     feature_finder.prune_small_components(4);
     spdlog::info("Feature edges after prune_small_components: {}", feature_finder.get_features().size());
-    feature_finder.prune_small_features(5);
-    spdlog::info("Feature edges after prune_small_features: {}", feature_finder.get_features().size());
-    if (use_erode_dilate) {
-        feature_finder.erode_dilate(4);
-        spdlog::info("Feature edges after erode_dilate: {}", feature_finder.get_features().size());
-    }
 
     // refine faces to avoid faces with two boundary edges
     auto [V_ref_f, F_ref_f, feature_edges_f] = refine_corner_feature_faces(feature_finder);

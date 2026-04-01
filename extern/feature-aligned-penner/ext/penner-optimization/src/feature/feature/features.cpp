@@ -187,10 +187,19 @@ void FeatureFinder::prune_small_features(int min_feature_size)
 
 void FeatureFinder::erode_dilate(int steps)
 {
+    // Matches QuadWild's ErodeDilate (triangle_mesh_type.h)
     const auto& m = m_mesh;
+    const auto& V = m_vertex_positions;
+    const auto& vtx_re = m_vtx_reindex;
     int num_halfedges = m.n_halfedges();
 
-    // Compute feature valence per vertex
+    // Compute bounding box diagonal for length threshold
+    Eigen::Vector3d bbmin = V.colwise().minCoeff();
+    Eigen::Vector3d bbmax = V.colwise().maxCoeff();
+    double bb_diag = (bbmax - bbmin).norm();
+    double len_threshold = bb_diag * 0.05;
+
+    // Compute feature valence per vertex (matching QuadWild: count per-halfedge incidences)
     auto compute_feature_valence = [&]() -> std::vector<int> {
         std::vector<int> valence(m.n_vertices(), 0);
         for (int hij = 0; hij < num_halfedges; hij++) {
@@ -203,7 +212,8 @@ void FeatureFinder::erode_dilate(int steps)
         return valence;
     };
 
-    // Mark junction vertices (feature valence > 2)
+    // Mark junction vertices: valence > 2 (matching QuadWild: Q()>4 with halfedge counting,
+    // which is equivalent to feature-edge valence > 2 since each edge contributes +1)
     auto init_valence = compute_feature_valence();
     std::vector<bool> is_junction(m.n_vertices(), false);
     for (size_t i = 0; i < is_junction.size(); i++) {
@@ -216,31 +226,46 @@ void FeatureFinder::erode_dilate(int steps)
         if (is_feature_halfedge(hij)) orig_features.push_back(hij);
     }
 
-    // Erode: remove feature edges at chain endpoints
+    // Compute edge length from vertex positions
+    auto edge_length = [&](int hij) -> double {
+        int hji = m.opp[hij];
+        int vi = vtx_re[m.v_rep[m.to[hji]]];
+        int vj = vtx_re[m.v_rep[m.to[hij]]];
+        if (vi >= V.rows() || vj >= V.rows()) return 0.0;
+        return (V.row(vi) - V.row(vj)).norm();
+    };
+
+    // Erode: remove short feature edges at chain endpoints (matching QuadWild)
     for (int s = 0; s < steps; s++) {
         auto val = compute_feature_valence();
         for (int hij = 0; hij < num_halfedges; hij++) {
             if (!is_feature_halfedge(hij)) continue;
             int hji = m.opp[hij];
             if (hij > hji) continue;
+            // Skip boundary edges (no twin face)
+            if (hji < 0) continue;
+            // Skip long edges (QuadWild: Len > bbox.Diag()*0.05)
+            if (edge_length(hij) > len_threshold) continue;
+
             int v0 = m.v_rep[m.to[hij]];
             int v1 = m.v_rep[m.to[hji]];
-            if ((val[v0] <= 2 && !is_junction[v0]) ||
-                (val[v1] <= 2 && !is_junction[v1])) {
+            // Erode if either endpoint is a chain endpoint (valence == 1, i.e. count == 2 in QW halfedge counting)
+            if ((val[v0] <= 1) || (val[v1] <= 1)) {
                 set_feature_edge(hij, false);
             }
         }
     }
 
-    // Dilate: re-add original features at chain endpoints
+    // Dilate: re-add original features at chain endpoints (matching QuadWild)
     for (int s = 0; s < steps; s++) {
         auto val = compute_feature_valence();
         for (int hij : orig_features) {
             if (is_feature_halfedge(hij)) continue;
             int v0 = m.v_rep[m.to[hij]];
             int v1 = m.v_rep[m.to[m.opp[hij]]];
-            if ((val[v0] == 2 && !is_junction[v0]) ||
-                (val[v1] == 2 && !is_junction[v1])) {
+            // Re-add if endpoint has valence 1 (Q()==2 in QW) and is not a junction
+            if ((val[v0] == 1 && !is_junction[v0]) ||
+                (val[v1] == 1 && !is_junction[v1])) {
                 set_feature_edge(hij, true);
             }
         }

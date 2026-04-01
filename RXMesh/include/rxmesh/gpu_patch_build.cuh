@@ -55,4 +55,34 @@ GpuPatchBuildResult gpu_build_patches(
     PatchInfo* d_patches_info,    // [max_num_patches] device array
     PatchInfo* h_patches_info);   // [max_num_patches] host mirror
 
+// Test wrapper: run K1 (build_ltog) and return results for validation.
+struct K1Result {
+    std::vector<uint32_t> ltog_f;  // all patches concatenated
+    std::vector<uint32_t> ltog_e;
+    std::vector<uint32_t> ltog_v;
+    std::vector<uint16_t> num_elements_f;
+    std::vector<uint16_t> num_elements_e;
+    std::vector<uint16_t> num_elements_v;
+    std::vector<uint16_t> num_owned_f;
+    std::vector<uint16_t> num_owned_e;
+    std::vector<uint16_t> num_owned_v;
+    uint32_t max_f_per_patch;  // stride
+    uint32_t max_e_per_patch;
+    uint32_t max_v_per_patch;
+};
+
+K1Result gpu_test_k1(
+    const uint32_t* d_fv,
+    const uint64_t* d_edge_key,
+    uint32_t num_edges_global,
+    const uint32_t* d_patches_val,
+    const uint32_t* d_patches_offset,
+    const uint32_t* d_ribbon_val,
+    const uint32_t* d_ribbon_offset,  // [P+1]
+    const uint32_t* d_face_patch,
+    const uint32_t* d_edge_patch,
+    const uint32_t* d_vertex_patch,
+    uint32_t num_patches,
+    uint32_t max_f, uint32_t max_e, uint32_t max_v);
+
 }  // namespace rxmesh

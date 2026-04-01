@@ -247,7 +247,7 @@ def run_cmd(cmd, label, timeout_s=300):
 
 def main():
     parser = argparse.ArgumentParser(description="Penner pipeline step-by-step")
-    parser.add_argument("--mesh", default="dragon")
+    parser.add_argument("--mesh", default="bolt")
     parser.add_argument("--sa", default="3", help="Quantization auto-scale multiplier")
     parser.add_argument("--no-ed", action="store_true", help="Disable erode/dilate feature cleanup")
     args = parser.parse_args()
@@ -300,11 +300,10 @@ def main():
     # Steps 1-6: mesh + feature edges (OBJ with 'l' lines)
     step_files = [
         ("01", "Feature Detection ({}°)".format(35), "detect"),
-        ("02", "Prune Small Components", "prune_comp"),
-        ("03", "Prune Small Features", "prune_feat"),
-        ("04", "Erode / Dilate", "erode_dilate"),
-        ("05", "Refine Corner Faces", "refine_corners"),
-        ("06", "Refined Mesh + Spanning Tree", "refined"),
+        ("02", "Erode / Dilate", "erode_dilate"),
+        ("03", "Prune Small Components", "prune_comp"),
+        ("04", "Refine Corner Faces", "refine_corners"),
+        ("05", "Refined Mesh + Spanning Tree", "refined"),
     ]
     for file_num, label, suffix in step_files:
         path = os.path.join(work_dir, f"{args.mesh}_step{file_num}_{suffix}.obj")
@@ -321,7 +320,7 @@ def main():
         rows.append((title, img, timing, f"{len(v)}V {len(f)}F | {len(lines)} features"))
 
     # Cut mesh
-    cut_path = os.path.join(work_dir, f"{args.mesh}_step07_cut.obj")
+    cut_path = os.path.join(work_dir, f"{args.mesh}_step06_cut.obj")
     if os.path.exists(cut_path):
         display_step += 1
         v_cut, f_cut, lines_cut = load_obj(cut_path)

@@ -50,6 +50,7 @@ int main(int argc, char* argv[])
     bool show_parameterization = false;
     bool use_erode_dilate = true;
     bool no_erode_dilate = false;
+    bool ed_only = false;
     double dihedral_angle = 35.0;
     app.add_option("--name", mesh, "Mesh name (without obj suffix, e.g., fandisk)")->required();
     app.add_option("-i,--input", input_dir, "Input directory")->check(CLI::ExistingDirectory)->required();
@@ -59,6 +60,7 @@ int main(int argc, char* argv[])
     app.add_flag("--show_parameterization", show_parameterization, "Show aligned parameterization");
     app.add_flag("--erode_dilate", use_erode_dilate, "Use erode/dilate for feature cleanup (default: on)");
     app.add_flag("--no_erode_dilate", no_erode_dilate, "Disable erode/dilate feature cleanup");
+    app.add_flag("--ed_only", ed_only, "Erode/dilate WITHOUT prune (for debugging)");
 
     // Marked Metric Parameters
     NewtonParameters alg_params;
@@ -102,46 +104,39 @@ int main(int argc, char* argv[])
         spdlog::info("Step 1 — Feature detection ({}°): {} edges", dihedral_angle, ff_detect.get_features().size());
         dump_mesh_with_features(join_path(output_dir, mesh + "_step01_detect.obj"), V, F, ff_detect.get_features());
 
-        // ── Step 2: Prune small components ─────────────────────────
+        // ── Step 2: Erode/dilate ────────────────────────────────────
+        ff_detect.erode_dilate(4);
+        spdlog::info("Step 2 — After erode_dilate: {} edges", ff_detect.get_features().size());
+        dump_mesh_with_features(join_path(output_dir, mesh + "_step02_erode_dilate.obj"), V, F, ff_detect.get_features());
+
+        // ── Step 3: Prune small components (cleanup degenerate loops) ──
         ff_detect.prune_small_components(4);
-        spdlog::info("Step 2 — After prune_small_components: {} edges", ff_detect.get_features().size());
-        dump_mesh_with_features(join_path(output_dir, mesh + "_step02_prune_comp.obj"), V, F, ff_detect.get_features());
+        spdlog::info("Step 3 — After prune_small_components: {} edges", ff_detect.get_features().size());
+        dump_mesh_with_features(join_path(output_dir, mesh + "_step03_prune_comp.obj"), V, F, ff_detect.get_features());
 
-        // ── Step 3: Prune small features ───────────────────────────
-        ff_detect.prune_small_features(5);
-        spdlog::info("Step 3 — After prune_small_features: {} edges", ff_detect.get_features().size());
-        dump_mesh_with_features(join_path(output_dir, mesh + "_step03_prune_feat.obj"), V, F, ff_detect.get_features());
-
-        // ── Step 4: Erode/dilate (optional) ────────────────────────
-        if (use_erode_dilate) {
-            ff_detect.erode_dilate(4);
-            spdlog::info("Step 4 — After erode_dilate: {} edges", ff_detect.get_features().size());
-            dump_mesh_with_features(join_path(output_dir, mesh + "_step04_erode_dilate.obj"), V, F, ff_detect.get_features());
-        }
-
-        // ── Step 5: Refine corner faces ────────────────────────────
+        // ── Step 4: Refine corner faces ────────────────────────────
         auto [V_ref_f, F_ref_f, feature_edges_f] = refine_corner_feature_faces(ff_detect);
-        spdlog::info("Step 5 — After refine_corner_faces: {} V, {} F, {} features", V_ref_f.rows(), F_ref_f.rows(), feature_edges_f.size());
-        dump_mesh_with_features(join_path(output_dir, mesh + "_step05_refine_corners.obj"), V_ref_f, F_ref_f, feature_edges_f);
+        spdlog::info("Step 4 — After refine_corner_faces: {} V, {} F, {} features", V_ref_f.rows(), F_ref_f.rows(), feature_edges_f.size());
+        dump_mesh_with_features(join_path(output_dir, mesh + "_step04_refine_corners.obj"), V_ref_f, F_ref_f, feature_edges_f);
 
-        // ── Step 6: Refine feature components (spanning tree) ──────
+        // ── Step 5: Refine feature components (spanning tree) ──────
         FeatureFinder ff_refined(V_ref_f, F_ref_f);
         ff_refined.mark_features(feature_edges_f);
         std::tie(V, F, feature_edges, hard_feature_edges) = refine_feature_components(ff_refined, false);
-        spdlog::info("Step 6 — Refined mesh: {} V, {} F, {} features, {} hard features",
+        spdlog::info("Step 5 — Refined mesh: {} V, {} F, {} features, {} hard features",
                      V.rows(), F.rows(), feature_edges.size(), hard_feature_edges.size());
-        dump_mesh_with_features(join_path(output_dir, mesh + "_step06_refined.obj"), V, F, feature_edges);
+        dump_mesh_with_features(join_path(output_dir, mesh + "_step05_refined.obj"), V, F, feature_edges);
         // Also dump the legacy name for compatibility
         dump_mesh_with_features(join_path(output_dir, mesh + "_refined.obj"), V, F, feature_edges);
 
-        // ── Step 7: Generate cut mesh ──────────────────────────────
+        // ── Step 6: Generate cut mesh ──────────────────────────────
         FeatureFinder feature_finder(V, F);
         feature_finder.mark_features(feature_edges);
         auto[V_cut, F_cut, V_map, F_is_feature] = feature_finder.generate_feature_cut_mesh();
-        spdlog::info("Step 7 — Cut mesh: {} V, {} F (from {} V original)", V_cut.rows(), F_cut.rows(), V.rows());
+        spdlog::info("Step 6 — Cut mesh: {} V, {} F (from {} V original)", V_cut.rows(), F_cut.rows(), V.rows());
 
         {
-            std::string cut_file = join_path(output_dir, mesh + "_step07_cut.obj");
+            std::string cut_file = join_path(output_dir, mesh + "_step06_cut.obj");
             std::ofstream cout(cut_file);
             for (int i = 0; i < V_cut.rows(); i++)
                 cout << "v " << V_cut(i,0) << " " << V_cut(i,1) << " " << V_cut(i,2) << "\n";
@@ -167,7 +162,7 @@ int main(int argc, char* argv[])
                 std::filesystem::copy_options::overwrite_existing);
         }
 
-        // ── Step 8: Cross field ────────────────────────────────────
+        // ── Step 7: Cross field ────────────────────────────────────
         int radius = 5;
         Scalar rel_anisotropy=0.9;
         Scalar abs_anisotropy=0.2;
@@ -178,12 +173,12 @@ int main(int argc, char* argv[])
             radius,
             abs_anisotropy / bb_diag,
             rel_anisotropy);
-        spdlog::info("Step 8 — Cross field computed: {} faces, {} fixed directions",
+        spdlog::info("Step 7 — Cross field computed: {} faces, {} fixed directions",
                      F_cut.rows(), [&]{ int n=0; for(auto b:is_fixed_direction) if(b) n++; return n; }());
 
         // Dump direction field as per-face 3D vectors
         {
-            std::string dir_file = join_path(output_dir, mesh + "_step08_direction.txt");
+            std::string dir_file = join_path(output_dir, mesh + "_step07_direction.txt");
             std::ofstream dout(dir_file);
             dout << direction.rows() << "\n";
             for (int i = 0; i < direction.rows(); i++)
@@ -191,7 +186,7 @@ int main(int argc, char* argv[])
             spdlog::info("Wrote direction field -> {}", dir_file);
         }
 
-        // ── Step 9: Build metric generator (rotation form, Th_hat, kappa) ──
+        // ── Step 8: Build metric generator (rotation form, Th_hat, kappa) ──
         MarkedMetricParameters marked_metric_params;
         marked_metric_params.remove_trivial_torus = false; // FIXME
         marked_metric_params.use_log_length = true;
@@ -199,14 +194,14 @@ int main(int argc, char* argv[])
         CutMetricGenerator cut_metric_generator(V_cut, F_cut, marked_metric_params, {});
         cut_metric_generator.generate_fields(V_cut, F_cut, V_map, direction, is_fixed_direction);
         std::tie(reference_field, theta, kappa, period_jump) = cut_metric_generator.get_field();
-        spdlog::info("Step 9 — Field: {} theta, {} kappa rows, {} period_jump rows",
+        spdlog::info("Step 8 — Field: {} theta, {} kappa rows, {} period_jump rows",
                      theta.size(), kappa.rows(), period_jump.rows());
 
         // Dump per-face component IDs (field computation decomposition)
         {
             const auto& comps = cut_metric_generator.get_components();
             int nc = comps.maxCoeff() + 1;
-            std::string comp_file = join_path(output_dir, mesh + "_step09_components.txt");
+            std::string comp_file = join_path(output_dir, mesh + "_step08_components.txt");
             std::ofstream cout(comp_file);
             cout << comps.size() << " " << nc << "\n";
             for (int i = 0; i < comps.size(); i++) cout << comps[i] << "\n";
@@ -220,7 +215,7 @@ int main(int argc, char* argv[])
         }
         // Dump V_map (cut vertex → original vertex)
         {
-            std::string vmap_file = join_path(output_dir, mesh + "_step07_vmap.txt");
+            std::string vmap_file = join_path(output_dir, mesh + "_step06_vmap.txt");
             std::ofstream vout(vmap_file);
             vout << V_map.size() << "\n";
             for (int i = 0; i < V_map.size(); i++) vout << V_map[i] << "\n";
@@ -228,14 +223,14 @@ int main(int argc, char* argv[])
 
         // Dump theta (per-face rotation from reference direction)
         {
-            std::string theta_file = join_path(output_dir, mesh + "_step09_theta.txt");
+            std::string theta_file = join_path(output_dir, mesh + "_step08_theta.txt");
             std::ofstream tout(theta_file);
             for (int i = 0; i < theta.size(); i++) tout << theta[i] << "\n";
             spdlog::info("Wrote theta -> {}", theta_file);
         }
         // Dump period jumps (per-edge integer rotation)
         {
-            std::string pj_file = join_path(output_dir, mesh + "_step09_period_jump.txt");
+            std::string pj_file = join_path(output_dir, mesh + "_step08_period_jump.txt");
             std::ofstream pout(pj_file);
             for (int i = 0; i < period_jump.rows(); i++)
                 pout << period_jump(i,0) << " " << period_jump(i,1) << " " << period_jump(i,2) << "\n";
@@ -244,7 +239,7 @@ int main(int argc, char* argv[])
     }
 
     // ── Step 10: Newton optimization ───────────────────────────────
-    spdlog::info("Step 10 — Newton optimization (projecting to feature constraints)");
+    spdlog::info("Step 9 — Newton optimization (projecting to feature constraints)");
     alg_params.output_dir = output_dir;
     alg_params.error_eps = 1e-10;
     alg_params.solver = "ldlt";
@@ -260,13 +255,13 @@ int main(int argc, char* argv[])
         period_jump,
         marked_metric_params);
     aligned_metric_generator.optimize_full(alg_params);
-    spdlog::info("Step 10a — optimize_full done");
+    spdlog::info("Step 9a — optimize_full done");
     aligned_metric_generator.optimize_relaxed(alg_params);
-    spdlog::info("Step 10b — optimize_relaxed done");
+    spdlog::info("Step 9b — optimize_relaxed done");
 
     // ── Step 11: Overlay mesh + layout (parameterize) ──────────────
     aligned_metric_generator.parameterize(false);
-    spdlog::info("Step 11 — Parameterization (overlay + layout) done");
+    spdlog::info("Step 10 — Parameterization (overlay + layout) done");
     auto [V_r, F_r, uv_r, FT_r, fn_to_f_r, endpoints_r] = aligned_metric_generator.get_parameterization();
     auto [feature_face_edges, misaligned_edges] = aligned_metric_generator.get_refined_features();
     auto feature_edges_r = compute_face_edge_endpoints(feature_face_edges, F_r);
@@ -275,10 +270,10 @@ int main(int argc, char* argv[])
     if (show_parameterization) view_seamless_parameterization(V_r, F_r, uv_r, FT_r, "refined mesh", true);
 
     // ── Step 12: Write output (overlay mesh with UV) ───────────────
-    std::string output_filename = join_path(output_dir, mesh+"_step12_opt.obj");
+    std::string output_filename = join_path(output_dir, mesh+"_step11_opt.obj");
     write_obj_with_uv(output_filename, V_r, F_r, uv_r, FT_r);
     write_mesh_edges(output_filename, feature_edges_r);
-    spdlog::info("Step 12 — Wrote overlay mesh with UV: {} V, {} F, {} UV -> {}", V_r.rows(), F_r.rows(), uv_r.rows(), output_filename);
+    spdlog::info("Step 11 — Wrote overlay mesh with UV: {} V, {} F, {} UV -> {}", V_r.rows(), F_r.rows(), uv_r.rows(), output_filename);
     // Legacy name
     {
         std::string legacy = join_path(output_dir, mesh+"_opt.obj");
