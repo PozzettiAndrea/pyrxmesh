@@ -600,6 +600,10 @@ class RXMesh
     bool m_gpu_k1k2_used = false;
     K1K2Result m_gpu_k1k2_result;
 
+    // GPU-edge-ID-space patch assignments (from K0a)
+    std::vector<uint32_t> m_gpu_edge_patch;    // [num_edges] in GPU edge ID space
+    std::vector<uint32_t> m_gpu_vertex_patch;  // [num_vertices]
+
     // Should be updated with update_host
     uint32_t m_num_edges, m_num_faces, m_num_vertices;
 

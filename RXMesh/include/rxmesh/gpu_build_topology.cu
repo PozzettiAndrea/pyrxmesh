@@ -9,6 +9,7 @@
 #include <thrust/device_ptr.h>
 #include <thrust/sort.h>
 #include <thrust/scan.h>
+#include <thrust/unique.h>
 #include <thrust/execution_policy.h>
 
 namespace rxmesh {
@@ -160,8 +161,20 @@ GpuTopoResult gpu_build_topology(const uint32_t* h_faces, uint32_t num_faces)
         d_ev_flat, d_ef_f0, d_ef_f1, d_ff_count);
     CUDA_ERROR(cudaDeviceSynchronize());
 
-    // Keep d_edge_key for downstream K1 edge lookups (freed via result.free_device())
-    // d_edge_face and d_edge_id are no longer needed
+    // Compact d_edge_key from num_half_edges (with duplicates) to num_edges (unique).
+    // K1's gpu_find_edge_id needs a unique key array for correct binary search.
+    {
+        uint64_t* d_unique_key;
+        CUDA_ERROR(cudaMalloc(&d_unique_key, num_edges * sizeof(uint64_t)));
+        thrust::unique_copy(
+            thrust::device,
+            thrust::device_pointer_cast(d_edge_key),
+            thrust::device_pointer_cast(d_edge_key) + num_half_edges,
+            thrust::device_pointer_cast(d_unique_key));
+        CUDA_ERROR(cudaFree(d_edge_key));
+        d_edge_key = d_unique_key;
+    }
+
     CUDA_ERROR(cudaFree(d_edge_face));
     CUDA_ERROR(cudaFree(d_edge_id));
 

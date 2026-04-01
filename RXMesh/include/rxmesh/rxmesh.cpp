@@ -382,12 +382,8 @@ void RXMesh::build(const std::vector<std::vector<uint32_t>>& fv,
             verts_by_patch[pid].push_back(v);
     }
 
-    // GPU K1+K2 — disabled pending edge ID reconciliation.
-    // The GPU topology uses different edge IDs than the CPU m_edges_map.
-    // Until we either: (a) build a GPU→CPU edge mapping, or
-    // (b) replace ALL downstream code to use GPU edge IDs,
-    // the GPU path produces incompatible ltog arrays that crash build_device.
-    if (false && m_d_edge_key != nullptr) {
+    // GPU K1+K2: build ltog + topology on GPU (full GPU edge ID space)
+    if (m_d_edge_key != nullptr) {
         fprintf(stderr, "[build] Using GPU K1 for ltog construction...\n");
 
         // Upload needed data to GPU
@@ -435,6 +431,13 @@ void RXMesh::build(const std::vector<std::vector<uint32_t>>& fv,
         CUDA_ERROR(cudaMalloc(&d_vpc, m_num_vertices * sizeof(uint32_t)));
         CUDA_ERROR(cudaMemset(d_vpc, 0xFF, m_num_vertices * sizeof(uint32_t)));
         gpu_run_k0a(d_fpc, m_d_ev, m_d_ef_f0, d_epc, d_vpc, m_num_edges);
+        // Download K0a results to host for build_device
+        m_gpu_edge_patch.resize(m_num_edges);
+        m_gpu_vertex_patch.resize(m_num_vertices);
+        CUDA_ERROR(cudaMemcpy(m_gpu_edge_patch.data(), d_epc,
+                              m_num_edges * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        CUDA_ERROR(cudaMemcpy(m_gpu_vertex_patch.data(), d_vpc,
+                              m_num_vertices * sizeof(uint32_t), cudaMemcpyDeviceToHost));
         fprintf(stderr, "[build] K0a done (GPU edge/vertex patches)\n");
 
         // Compute max per-patch sizes (conservative estimate)
@@ -491,12 +494,14 @@ void RXMesh::build(const std::vector<std::vector<uint32_t>>& fv,
             m_h_num_owned_v[p] = k1k2r.num_owned_v[p];
         }
 
-        // Mark that we used GPU path — skip CPU build_single_patch_topology later
-        m_gpu_k1k2_used = true;
-        m_gpu_k1k2_result = std::move(k1k2r);
-
+        // Use GPU edge IDs throughout — K2 topology is consistent with K1's ltog.
+        // build_device will also use GPU edge IDs since it reads from ltog arrays.
+        fprintf(stderr, "[build] K1 copy done.\n");
         fprintf(stderr, "[build] GPU K1+K2 done. Patch 0: F=%u E=%u V=%u\n",
                 k1k2r.num_elements_f[0], k1k2r.num_elements_e[0], k1k2r.num_elements_v[0]);
+
+        m_gpu_k1k2_used = true;
+        m_gpu_k1k2_result = std::move(k1k2r);
 
         CUDA_ERROR(cudaFree(d_fv_k1));
         CUDA_ERROR(cudaFree(d_pv)); CUDA_ERROR(cudaFree(d_po));
@@ -1678,18 +1683,14 @@ void RXMesh::populate_patch_stash()
     for (int p = 0; p < static_cast<int>(get_num_patches()); ++p) {
         m_h_patches_info[p].patch_stash = PatchStash(false);
 
-        populate_patch_stash(p,
-                             m_h_patches_ltog_v[p],
-                             m_patcher->get_vertex_patch(),
-                             m_h_num_owned_v[p]);
-        populate_patch_stash(p,
-                             m_h_patches_ltog_e[p],
-                             m_patcher->get_edge_patch(),
-                             m_h_num_owned_e[p]);
-        populate_patch_stash(p,
-                             m_h_patches_ltog_f[p],
-                             m_patcher->get_face_patch(),
-                             m_h_num_owned_f[p]);
+        const auto& vp_s = m_gpu_vertex_patch.empty()
+            ? m_patcher->get_vertex_patch() : m_gpu_vertex_patch;
+        const auto& ep_s = m_gpu_edge_patch.empty()
+            ? m_patcher->get_edge_patch() : m_gpu_edge_patch;
+        populate_patch_stash(p, m_h_patches_ltog_v[p], vp_s, m_h_num_owned_v[p]);
+        populate_patch_stash(p, m_h_patches_ltog_e[p], ep_s, m_h_num_owned_e[p]);
+        populate_patch_stash(p, m_h_patches_ltog_f[p],
+                             m_patcher->get_face_patch(), m_h_num_owned_f[p]);
     }
 
     // #pragma omp parallel for
@@ -2043,41 +2044,30 @@ void RXMesh::build_device_single_patch(const uint32_t patch_id,
         m_timers.stop("buildHT");
     };
 
+    // Use GPU patch arrays when available, CPU patcher arrays otherwise
+    const auto& vp = m_gpu_vertex_patch.empty()
+        ? m_patcher->get_vertex_patch() : m_gpu_vertex_patch;
+    const auto& ep = m_gpu_edge_patch.empty()
+        ? m_patcher->get_edge_patch() : m_gpu_edge_patch;
+    const auto& fp = m_patcher->get_face_patch();  // face IDs are same in both spaces
+
     const uint16_t lp_cap_v = max_lp_hashtable_capacity<LocalVertexT>();
     build_ht(m_h_patches_ltog_v,
-             ltog_v,
-             m_patcher->get_vertex_patch(),
-             m_h_num_owned_v,
-             p_num_vertices,
-             p_num_owned_vertices,
-             lp_cap_v,
-             h_patch_info.patch_stash,
-             h_patch_info.lp_v,
-             d_patch.lp_v);
+             ltog_v, vp, m_h_num_owned_v,
+             p_num_vertices, p_num_owned_vertices, lp_cap_v,
+             h_patch_info.patch_stash, h_patch_info.lp_v, d_patch.lp_v);
 
     const uint16_t lp_cap_e = max_lp_hashtable_capacity<LocalEdgeT>();
     build_ht(m_h_patches_ltog_e,
-             ltog_e,
-             m_patcher->get_edge_patch(),
-             m_h_num_owned_e,
-             p_num_edges,
-             p_num_owned_edges,
-             lp_cap_e,
-             h_patch_info.patch_stash,
-             h_patch_info.lp_e,
-             d_patch.lp_e);
+             ltog_e, ep, m_h_num_owned_e,
+             p_num_edges, p_num_owned_edges, lp_cap_e,
+             h_patch_info.patch_stash, h_patch_info.lp_e, d_patch.lp_e);
 
     const uint16_t lp_cap_f = max_lp_hashtable_capacity<LocalFaceT>();
     build_ht(m_h_patches_ltog_f,
-             ltog_f,
-             m_patcher->get_face_patch(),
-             m_h_num_owned_f,
-             p_num_faces,
-             p_num_owned_faces,
-             lp_cap_f,
-             h_patch_info.patch_stash,
-             h_patch_info.lp_f,
-             d_patch.lp_f);
+             ltog_f, fp, m_h_num_owned_f,
+             p_num_faces, p_num_owned_faces, lp_cap_f,
+             h_patch_info.patch_stash, h_patch_info.lp_f, d_patch.lp_f);
 
     m_timers.start("cudaMemcpy");
     CUDA_ERROR(cudaMemcpy(
