@@ -1,0 +1,58 @@
+#pragma once
+
+#include <cstdint>
+#include "rxmesh/gpu_build_topology.cuh"
+
+namespace rxmesh {
+
+// Forward declarations
+class RXMesh;
+struct PatchInfo;
+
+// Result of GPU patch construction — device pointers to bulk-allocated arrays.
+struct GpuPatchBuildResult {
+    uint32_t num_patches;
+    uint32_t num_vertices;
+    uint32_t num_edges;
+    uint32_t num_faces;
+
+    // Per-element patch ownership (device arrays)
+    uint32_t* d_edge_patch;    // [num_edges]
+    uint32_t* d_vertex_patch;  // [num_vertices]
+
+    // Per-patch element counts
+    uint16_t max_vertices_per_patch;
+    uint16_t max_edges_per_patch;
+    uint16_t max_faces_per_patch;
+
+    // Whether construction succeeded
+    bool success;
+};
+
+// Build all per-patch data structures on GPU.
+// Takes GPU-resident topology + partition results, produces PatchInfo array.
+// Replaces: assign_patch, extract_ribbons, build_single_patch_ltog,
+//           build_single_patch_topology, build_device.
+GpuPatchBuildResult gpu_build_patches(
+    // GPU topology (from gpu_build_topology, kept on device)
+    const uint32_t* d_fv,         // [num_faces * 3]
+    const uint64_t* d_edge_key,   // [num_edges] packed (min<<32|max)
+    const uint32_t* d_ev,         // [num_edges * 2]
+    const uint32_t* d_ef_f0,      // [num_edges]
+    const uint32_t* d_ef_f1,      // [num_edges]
+    const uint32_t* d_ff_offset,  // [num_faces + 1]
+    const uint32_t* d_ff_values,  // CSR values
+    uint32_t num_vertices,
+    uint32_t num_edges,
+    uint32_t num_faces,
+    // Patcher results (on device)
+    const uint32_t* d_face_patch, // [num_faces]
+    uint32_t num_patches,
+    // Capacities
+    float capacity_factor,
+    float lp_load_factor,
+    // Output
+    PatchInfo* d_patches_info,    // [max_num_patches] device array
+    PatchInfo* h_patches_info);   // [max_num_patches] host mirror
+
+}  // namespace rxmesh

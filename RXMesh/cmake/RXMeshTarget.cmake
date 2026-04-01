@@ -22,6 +22,7 @@ set(RXMESH_LIBRARY_SOURCES
     "${RXMESH_SOURCE_DIR}/include/rxmesh/reduce_handle.cu"
     "${RXMESH_SOURCE_DIR}/include/rxmesh/patcher/patcher.cu"
     "${RXMESH_SOURCE_DIR}/include/rxmesh/gpu_build_topology.cu"
+    "${RXMESH_SOURCE_DIR}/include/rxmesh/gpu_patch_build.cu"
     "${RXMESH_SOURCE_DIR}/include/rxmesh/util/git_sha1.cpp"
     "${RXMESH_SOURCE_DIR}/include/rxmesh/util/MshLoader.cpp"
     "${RXMESH_SOURCE_DIR}/include/rxmesh/util/MshSaver.cpp"
