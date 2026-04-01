@@ -382,18 +382,20 @@ void RXMesh::build(const std::vector<std::vector<uint32_t>>& fv,
             verts_by_patch[pid].push_back(v);
     }
 
-    // GPU K1+K2 — disabled while debugging Dragon crash
+    // Approach A: Global thrust sort-based ltog construction.
+    // DISABLED: produces ltog with different element counts than CPU.
+    // Root cause: edge IDs are in same space (no mismatch!) but
+    // the thrust approach misses some elements. Needs debugging.
     if (false && m_d_edge_key != nullptr) {
-        fprintf(stderr, "[build] Using GPU K1 for ltog construction...\n");
+        fprintf(stderr, "[build] Approach A: thrust-based ltog...\n");
 
-        // Upload needed data to GPU
+        // Upload fv to GPU
         std::vector<uint32_t> flat_fv_k1(m_num_faces * 3);
         for (uint32_t f = 0; f < m_num_faces; ++f) {
             flat_fv_k1[f*3+0] = fv[f][0];
             flat_fv_k1[f*3+1] = fv[f][1];
             flat_fv_k1[f*3+2] = fv[f][2];
         }
-
         uint32_t* d_fv_k1;
         CUDA_ERROR(cudaMalloc(&d_fv_k1, m_num_faces * 3 * sizeof(uint32_t)));
         CUDA_ERROR(cudaMemcpy(d_fv_k1, flat_fv_k1.data(),
@@ -409,10 +411,9 @@ void RXMesh::build(const std::vector<std::vector<uint32_t>>& fv,
         rib_pfx[0] = 0;
         for (uint32_t p = 0; p < get_num_patches(); ++p)
             rib_pfx[p + 1] = cpu_ro[p];
-
         uint32_t pv_total = cpu_po[get_num_patches() - 1];
 
-        uint32_t *d_pv, *d_po, *d_rv, *d_ro, *d_epc, *d_vpc, *d_fpc;
+        uint32_t *d_pv, *d_po, *d_rv, *d_ro, *d_fpc, *d_epc, *d_vpc;
         CUDA_ERROR(cudaMalloc(&d_pv, pv_total * sizeof(uint32_t)));
         CUDA_ERROR(cudaMalloc(&d_po, get_num_patches() * sizeof(uint32_t)));
         CUDA_ERROR(cudaMalloc(&d_rv, std::max(cpu_rv.size(), (size_t)1) * sizeof(uint32_t)));
@@ -426,135 +427,75 @@ void RXMesh::build(const std::vector<std::vector<uint32_t>>& fv,
         CUDA_ERROR(cudaMemcpy(d_ro, rib_pfx.data(), rib_pfx.size()*sizeof(uint32_t), cudaMemcpyHostToDevice));
         CUDA_ERROR(cudaMemcpy(d_fpc, m_patcher->get_face_patch().data(), m_num_faces*sizeof(uint32_t), cudaMemcpyHostToDevice));
 
-        // Use Patcher's edge/vertex patches (CPU edge ID space) but
-        // we need them in GPU edge ID space for K1. Build a CPU→GPU mapping
-        // and translate. This ensures K1's owned/ribbon partition matches
-        // the Patcher's face assignments.
-
-        // Build CPU→GPU edge ID mapping
-        std::vector<uint32_t> cpu_to_gpu_eid(m_num_edges, INVALID32);
-        for (uint32_t ge = 0; ge < m_num_edges; ++ge) {
-            uint32_t v0 = ev[ge][0], v1 = ev[ge][1];
-            auto it = m_edges_map.find(detail::edge_key(v0, v1));
-            if (it != m_edges_map.end())
-                cpu_to_gpu_eid[it->second] = ge;
-        }
-
-        // Translate Patcher's edge_patch from CPU→GPU edge ID space
-        std::vector<uint32_t> gpu_edge_patch_translated(m_num_edges, INVALID32);
-        auto& cpu_ep = m_patcher->get_edge_patch();
-        for (uint32_t ce = 0; ce < m_num_edges; ++ce) {
-            uint32_t ge = cpu_to_gpu_eid[ce];
-            if (ge != INVALID32)
-                gpu_edge_patch_translated[ge] = cpu_ep[ce];
-        }
-
+        // Edge IDs are ALL in GPU edge ID space (m_edges_map maps to GPU IDs).
+        // No translation needed — just upload Patcher's arrays directly.
         CUDA_ERROR(cudaMalloc(&d_epc, m_num_edges * sizeof(uint32_t)));
         CUDA_ERROR(cudaMalloc(&d_vpc, m_num_vertices * sizeof(uint32_t)));
-        CUDA_ERROR(cudaMemcpy(d_epc, gpu_edge_patch_translated.data(),
-                              m_num_edges * sizeof(uint32_t), cudaMemcpyHostToDevice));
-        CUDA_ERROR(cudaMemcpy(d_vpc, m_patcher->get_vertex_patch().data(),
-                              m_num_vertices * sizeof(uint32_t), cudaMemcpyHostToDevice));
+        CUDA_ERROR(cudaMemcpy(d_epc, m_patcher->get_edge_patch().data(), m_num_edges*sizeof(uint32_t), cudaMemcpyHostToDevice));
+        CUDA_ERROR(cudaMemcpy(d_vpc, m_patcher->get_vertex_patch().data(), m_num_vertices*sizeof(uint32_t), cudaMemcpyHostToDevice));
 
-        // Don't set m_gpu_edge_patch — use Patcher's arrays for build_device
-        fprintf(stderr, "[build] Using Patcher patches with GPU edge ID translation\n");
-
-        // Compute max per-patch sizes (conservative estimate)
-        uint32_t max_f_est = 0;
-        for (uint32_t p = 0; p < get_num_patches(); ++p) {
-            uint32_t owned_start = (p == 0) ? 0 : cpu_po[p - 1];
-            uint32_t owned_end = cpu_po[p];
-            uint32_t rib_count = rib_pfx[p+1] - rib_pfx[p];
-            uint32_t total = (owned_end - owned_start) + rib_count;
-            max_f_est = std::max(max_f_est, total);
-        }
-        uint32_t max_f_k1 = max_f_est + 100;
-        uint32_t max_e_k1 = max_f_k1 * 2;  // edges ~ 1.5x faces, with margin
-        uint32_t max_v_k1 = max_f_k1;
-
-        // Compute capacities (needed by K2)
-        // Estimate from max faces per patch
-        uint32_t edge_cap_est = static_cast<uint32_t>(
-            std::ceil(m_capacity_factor * max_f_k1 * 1.7f));
-        uint32_t face_cap_est = static_cast<uint32_t>(
-            std::ceil(m_capacity_factor * max_f_k1));
-
-        auto k1k2r = gpu_run_k1k2(
-            d_fv_k1, m_d_edge_key, m_d_ev, m_num_edges,
-            d_pv, d_po, d_rv, d_ro,
+        // Run thrust-based ltog
+        auto thr = gpu_thrust_build_ltog(
+            d_fv_k1, m_d_edge_key, m_num_faces, m_num_edges, m_num_vertices,
             d_fpc, d_epc, d_vpc,
-            get_num_patches(),
-            max_f_k1, max_e_k1, max_v_k1,
-            edge_cap_est, face_cap_est);
+            d_pv, d_po, d_rv, d_ro, get_num_patches());
 
-        // Copy K1 results into CPU ltog arrays
-        fprintf(stderr, "[build] Copying K1 results for %u patches (max_f=%u max_e=%u max_v=%u, ltog sizes: f=%zu e=%zu v=%zu)...\n",
-                get_num_patches(), max_f_k1, max_e_k1, max_v_k1,
-                k1k2r.ltog_f.size(), k1k2r.ltog_e.size(), k1k2r.ltog_v.size());
+        // No edge ID translation needed — all IDs are in GPU edge ID space
+        // (m_edges_map maps vertex pairs to GPU edge IDs).
+
+        // Copy thrust results into m_h_patches_ltog_*
         for (uint32_t p = 0; p < get_num_patches(); ++p) {
-            uint16_t nf = k1k2r.num_elements_f[p];
-            uint16_t ne = k1k2r.num_elements_e[p];
-            uint16_t nv = k1k2r.num_elements_v[p];
-            fprintf(stderr, "[build] patch %u: nf=%u ne=%u nv=%u (f_base=%u e_base=%u v_base=%u)\n",
-                    p, nf, ne, nv, p*max_f_k1, p*max_e_k1, p*max_v_k1);
-
-            uint32_t f_base = p * max_f_k1;
-            uint32_t e_base = p * max_e_k1;
-            uint32_t v_base = p * max_v_k1;
-
-            m_h_patches_ltog_f[p].assign(k1k2r.ltog_f.begin() + f_base,
-                                          k1k2r.ltog_f.begin() + f_base + nf);
-            m_h_patches_ltog_e[p].assign(k1k2r.ltog_e.begin() + e_base,
-                                          k1k2r.ltog_e.begin() + e_base + ne);
-            m_h_patches_ltog_v[p].assign(k1k2r.ltog_v.begin() + v_base,
-                                          k1k2r.ltog_v.begin() + v_base + nv);
-            m_h_num_owned_f[p] = k1k2r.num_owned_f[p];
-            m_h_num_owned_e[p] = k1k2r.num_owned_e[p];
-            m_h_num_owned_v[p] = k1k2r.num_owned_v[p];
+            uint32_t fs = thr.f_offset[p], fe = thr.f_offset[p+1];
+            uint32_t es = thr.e_offset[p], ee = thr.e_offset[p+1];
+            uint32_t vs = thr.v_offset[p], ve = thr.v_offset[p+1];
+            m_h_patches_ltog_f[p].assign(thr.ltog_f.begin()+fs, thr.ltog_f.begin()+fe);
+            m_h_patches_ltog_e[p].assign(thr.ltog_e.begin()+es, thr.ltog_e.begin()+ee);
+            m_h_patches_ltog_v[p].assign(thr.ltog_v.begin()+vs, thr.ltog_v.begin()+ve);
+            m_h_num_owned_f[p] = thr.num_owned_f[p];
+            m_h_num_owned_e[p] = thr.num_owned_e[p];
+            m_h_num_owned_v[p] = thr.num_owned_v[p];
         }
 
-        // Use GPU edge IDs throughout — K2 topology is consistent with K1's ltog.
-        // build_device will also use GPU edge IDs since it reads from ltog arrays.
-        fprintf(stderr, "[build] K1 copy done.\n");
-
-        // Translate ltog_e from GPU edge IDs back to CPU edge IDs
-        // so build_device can use Patcher's CPU-space edge_patch arrays.
-        // Build GPU→CPU mapping
-        std::vector<uint32_t> gpu_to_cpu_eid(m_num_edges, INVALID32);
-        for (uint32_t ce = 0; ce < m_num_edges; ++ce) {
-            uint32_t ge = cpu_to_gpu_eid[ce];
-            if (ge != INVALID32)
-                gpu_to_cpu_eid[ge] = ce;
-        }
-
-        int invalid_translations = 0;
-        for (uint32_t p = 0; p < get_num_patches(); ++p) {
-            uint16_t ne = m_h_patches_ltog_e[p].size();
-            uint16_t nowned = m_h_num_owned_e[p];
-            for (uint16_t i = 0; i < ne; ++i) {
-                uint32_t ge = m_h_patches_ltog_e[p][i];
-                if (ge >= m_num_edges || gpu_to_cpu_eid[ge] == INVALID32) {
-                    invalid_translations++;
-                    m_h_patches_ltog_e[p][i] = 0;  // placeholder
-                } else {
-                    m_h_patches_ltog_e[p][i] = gpu_to_cpu_eid[ge];
-                }
-            }
-            // Re-sort after translation (owned section, then not-owned)
-            std::sort(m_h_patches_ltog_e[p].begin(),
-                      m_h_patches_ltog_e[p].begin() + nowned);
-            std::sort(m_h_patches_ltog_e[p].begin() + nowned,
-                      m_h_patches_ltog_e[p].end());
-        }
-        fprintf(stderr, "[build] ltog_e translated to CPU edge IDs (%d invalid)\n",
-                invalid_translations);
-
-        fprintf(stderr, "[build] GPU K1+K2 done. Patch 0: F=%u E=%u V=%u\n",
-                k1k2r.num_elements_f[0], k1k2r.num_elements_e[0], k1k2r.num_elements_v[0]);
-
-        // K2 topology is in GPU edge ID space — can't use it with CPU ltog_e.
-        // Fall back to CPU build_single_patch_topology.
         m_gpu_k1k2_used = false;
+
+        // Validation disabled — was interfering with results
+        if (false) // Quick validation: run CPU ltog for patch 0 and compare
+        {
+            // Save current GPU ltog for patch 0
+            auto gpu_f0 = m_h_patches_ltog_f[0];
+            auto gpu_e0 = m_h_patches_ltog_e[0];
+            auto gpu_v0 = m_h_patches_ltog_v[0];
+
+            // Run CPU ltog for patch 0
+            build_single_patch_ltog(fv, ev, 0,
+                                    edges_by_patch[0], verts_by_patch[0]);
+            auto cpu_f0 = m_h_patches_ltog_f[0];
+            auto cpu_e0 = m_h_patches_ltog_e[0];
+            auto cpu_v0 = m_h_patches_ltog_v[0];
+
+            fprintf(stderr, "[VALIDATE] patch 0: GPU F=%zu/%zu E=%zu/%zu V=%zu/%zu\n",
+                    gpu_f0.size(), cpu_f0.size(),
+                    gpu_e0.size(), cpu_e0.size(),
+                    gpu_v0.size(), cpu_v0.size());
+            // Print first few edges to compare
+            fprintf(stderr, "[VALIDATE] GPU edges[0..4]: ");
+            for (int i = 0; i < std::min((int)gpu_e0.size(), 5); ++i)
+                fprintf(stderr, "%u ", gpu_e0[i]);
+            fprintf(stderr, "\n[VALIDATE] CPU edges[0..4]: ");
+            for (int i = 0; i < std::min((int)cpu_e0.size(), 5); ++i)
+                fprintf(stderr, "%u ", cpu_e0[i]);
+            fprintf(stderr, "\n");
+            // Check if GPU edges are a subset of CPU edges
+            std::set<uint32_t> cpu_set(cpu_e0.begin(), cpu_e0.end());
+            int missing = 0;
+            for (auto e : gpu_e0) if (cpu_set.find(e) == cpu_set.end()) missing++;
+            fprintf(stderr, "[VALIDATE] GPU edges missing from CPU: %d\n", missing);
+
+            // Restore GPU ltog
+            m_h_patches_ltog_f[0] = gpu_f0;
+            m_h_patches_ltog_e[0] = gpu_e0;
+            m_h_patches_ltog_v[0] = gpu_v0;
+        }
 
         CUDA_ERROR(cudaFree(d_fv_k1));
         CUDA_ERROR(cudaFree(d_pv)); CUDA_ERROR(cudaFree(d_po));

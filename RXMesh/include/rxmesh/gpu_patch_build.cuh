@@ -99,6 +99,43 @@ struct K1K2Result {
     uint32_t ev_stride, fe_stride;
 };
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Approach A: Global thrust sort-based ltog construction
+// No per-block kernels, no shared memory limits, no hand-rolled sort.
+// Uses thrust::sort_by_key + thrust::unique to build per-patch ltog arrays.
+// ═══════════════════════════════════════════════════════════════════════════
+
+struct ThrustLtogResult {
+    // Per-patch data (host, ready to store in m_h_patches_ltog_*)
+    // Flat concatenated arrays + per-patch offsets/counts
+    std::vector<uint32_t> ltog_f;  // all faces, sorted by patch then by global ID
+    std::vector<uint32_t> ltog_e;  // all edges
+    std::vector<uint32_t> ltog_v;  // all vertices
+    std::vector<uint32_t> f_offset; // [P+1] where each patch starts in ltog_f
+    std::vector<uint32_t> e_offset; // [P+1]
+    std::vector<uint32_t> v_offset; // [P+1]
+    std::vector<uint16_t> num_owned_f; // [P]
+    std::vector<uint16_t> num_owned_e; // [P]
+    std::vector<uint16_t> num_owned_v; // [P]
+};
+
+ThrustLtogResult gpu_thrust_build_ltog(
+    const uint32_t* d_fv,              // [F*3] on device
+    const uint64_t* d_edge_key,        // [E] unique sorted packed keys on device
+    uint32_t num_faces,
+    uint32_t num_edges,
+    uint32_t num_vertices,
+    // Patcher results (on device)
+    const uint32_t* d_face_patch,      // [F]
+    const uint32_t* d_edge_patch,      // [E] in GPU edge ID space
+    const uint32_t* d_vertex_patch,    // [V]
+    // Patch face lists (from Patcher, on device)
+    const uint32_t* d_patches_val,     // owned face IDs sorted by patch
+    const uint32_t* d_patches_offset,  // [P] cumulative offsets
+    const uint32_t* d_ribbon_val,      // ribbon face IDs per patch
+    const uint32_t* d_ribbon_offset,   // [P+1] prefix offsets
+    uint32_t num_patches);
+
 // Run K0a only: assign edge/vertex patches on GPU
 void gpu_run_k0a(
     const uint32_t* d_face_patch,
