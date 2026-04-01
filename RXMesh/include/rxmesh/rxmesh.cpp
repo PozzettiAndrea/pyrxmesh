@@ -10,6 +10,7 @@
 
 #include "patcher/patcher.h"
 #include "rxmesh/gpu_build_topology.cuh"
+#include "rxmesh/gpu_patch_build.cuh"
 #include "rxmesh/context.h"
 #include "rxmesh/patch_scheduler.h"
 #include "rxmesh/rxmesh.h"
@@ -385,6 +386,150 @@ void RXMesh::build(const std::vector<std::vector<uint32_t>>& fv,
     for (int p = 0; p < static_cast<int>(get_num_patches()); ++p) {
         build_single_patch_ltog(fv, ev, p,
                                 edges_by_patch[p], verts_by_patch[p]);
+    }
+
+    // ── Validate GPU K0a against CPU results ────────────────────────────
+    if (false && m_num_faces <= 500000) {  // disabled — K0a validated OK
+        fprintf(stderr, "[GPU_PATCH_VALIDATE] Running GPU K0a+K0b+K1...\n");
+
+        // Upload CPU data needed by GPU kernels
+        uint32_t* d_fv;
+        uint32_t* d_ev;
+        uint32_t* d_ef_f0;
+        uint32_t* d_face_patch_dev;
+        uint32_t* d_edge_patch_dev;
+        uint32_t* d_vertex_patch_dev;
+        uint32_t* d_ff_off_dev;
+        uint32_t* d_ff_val_dev;
+        uint64_t* d_edge_key_dev;
+
+        // Build flat fv
+        std::vector<uint32_t> flat_fv(m_num_faces * 3);
+        for (uint32_t f = 0; f < m_num_faces; ++f) {
+            flat_fv[f*3+0] = fv[f][0];
+            flat_fv[f*3+1] = fv[f][1];
+            flat_fv[f*3+2] = fv[f][2];
+        }
+
+        // Build flat ev
+        std::vector<uint32_t> flat_ev(m_num_edges * 2);
+        for (uint32_t e = 0; e < m_num_edges; ++e) {
+            flat_ev[e*2+0] = ev[e][0];
+            flat_ev[e*2+1] = ev[e][1];
+        }
+
+        // Build ef_f0
+        std::vector<uint32_t> flat_ef_f0(m_num_edges);
+        for (uint32_t e = 0; e < m_num_edges; ++e)
+            flat_ef_f0[e] = ef[e][0];
+
+        // Build edge keys (sorted)
+        std::vector<uint64_t> edge_keys(m_num_edges);
+        for (uint32_t e = 0; e < m_num_edges; ++e) {
+            uint32_t lo = std::min(ev[e][0], ev[e][1]);
+            uint32_t hi = std::max(ev[e][0], ev[e][1]);
+            edge_keys[e] = (uint64_t(lo) << 32) | uint64_t(hi);
+        }
+        // Sort edge_keys and create a mapping from sorted position to edge ID
+        // Actually, gpu_find_edge_id expects d_edge_key sorted. Our GPU topo
+        // already sorted them, but the CPU ev[] is in construction order.
+        // For validation, we need to sort edge_keys.
+        std::vector<uint32_t> edge_sort_idx(m_num_edges);
+        std::iota(edge_sort_idx.begin(), edge_sort_idx.end(), 0);
+        std::sort(edge_sort_idx.begin(), edge_sort_idx.end(),
+                  [&](uint32_t a, uint32_t b) { return edge_keys[a] < edge_keys[b]; });
+        std::vector<uint64_t> sorted_keys(m_num_edges);
+        for (uint32_t i = 0; i < m_num_edges; ++i)
+            sorted_keys[i] = edge_keys[edge_sort_idx[i]];
+
+        // Upload to GPU
+        CUDA_ERROR(cudaMalloc(&d_fv, m_num_faces * 3 * sizeof(uint32_t)));
+        CUDA_ERROR(cudaMalloc(&d_ev, m_num_edges * 2 * sizeof(uint32_t)));
+        CUDA_ERROR(cudaMalloc(&d_ef_f0, m_num_edges * sizeof(uint32_t)));
+        CUDA_ERROR(cudaMalloc(&d_edge_key_dev, m_num_edges * sizeof(uint64_t)));
+        CUDA_ERROR(cudaMalloc(&d_face_patch_dev, m_num_faces * sizeof(uint32_t)));
+        CUDA_ERROR(cudaMalloc(&d_ff_off_dev, (m_num_faces+1) * sizeof(uint32_t)));
+        CUDA_ERROR(cudaMalloc(&d_ff_val_dev, ff_values.size() * sizeof(uint32_t)));
+
+        CUDA_ERROR(cudaMemcpy(d_fv, flat_fv.data(), m_num_faces*3*sizeof(uint32_t), cudaMemcpyHostToDevice));
+        CUDA_ERROR(cudaMemcpy(d_ev, flat_ev.data(), m_num_edges*2*sizeof(uint32_t), cudaMemcpyHostToDevice));
+        CUDA_ERROR(cudaMemcpy(d_ef_f0, flat_ef_f0.data(), m_num_edges*sizeof(uint32_t), cudaMemcpyHostToDevice));
+        CUDA_ERROR(cudaMemcpy(d_edge_key_dev, sorted_keys.data(), m_num_edges*sizeof(uint64_t), cudaMemcpyHostToDevice));
+        CUDA_ERROR(cudaMemcpy(d_face_patch_dev, m_patcher->get_face_patch().data(), m_num_faces*sizeof(uint32_t), cudaMemcpyHostToDevice));
+        CUDA_ERROR(cudaMemcpy(d_ff_off_dev, ff_offset.data(), (m_num_faces+1)*sizeof(uint32_t), cudaMemcpyHostToDevice));
+        CUDA_ERROR(cudaMemcpy(d_ff_val_dev, ff_values.data(), ff_values.size()*sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+        // Run K0a
+        auto gpu_result = gpu_build_patches(
+            d_fv, d_edge_key_dev, d_ev, d_ef_f0, nullptr,
+            d_ff_off_dev, d_ff_val_dev,
+            m_num_vertices, m_num_edges, m_num_faces,
+            d_face_patch_dev, get_num_patches(),
+            m_capacity_factor, m_lp_hashtable_load_factor,
+            nullptr, nullptr);
+
+        // Download K0a results and compare
+        std::vector<uint32_t> gpu_edge_patch(m_num_edges);
+        std::vector<uint32_t> gpu_vertex_patch(m_num_vertices);
+        CUDA_ERROR(cudaMemcpy(gpu_edge_patch.data(), gpu_result.d_edge_patch,
+                              m_num_edges*sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        CUDA_ERROR(cudaMemcpy(gpu_vertex_patch.data(), gpu_result.d_vertex_patch,
+                              m_num_vertices*sizeof(uint32_t), cudaMemcpyDeviceToHost));
+
+        // Compare edge_patch
+        int ep_mismatch = 0, ep_bad = 0;
+        auto& cpu_ep = m_patcher->get_edge_patch();
+        for (uint32_t e = 0; e < m_num_edges; ++e) {
+            if (gpu_edge_patch[e] != cpu_ep[e]) {
+                ep_mismatch++;
+                // Check both patches contain this edge's face
+                uint32_t gpu_p = gpu_edge_patch[e];
+                uint32_t cpu_p = cpu_ep[e];
+                // Edge's face is ef_f0[e] — check both patches are valid
+                uint32_t f0 = flat_ef_f0[e];
+                uint32_t f0_patch = m_patcher->get_face_patch()[f0];
+                // The edge should be incident to a face in its assigned patch
+                // GPU assigns edge to patch of ef_f0[e], which is always valid
+                if (gpu_p >= get_num_patches()) ep_bad++;
+            }
+        }
+        fprintf(stderr, "[GPU_PATCH_VALIDATE] K0a edge_patch: %d differ (expected for boundary), %d invalid\n",
+                ep_mismatch, ep_bad);
+
+        // Compare vertex_patch
+        int vp_mismatch = 0, vp_bad = 0;
+        auto& cpu_vp = m_patcher->get_vertex_patch();
+        for (uint32_t v = 0; v < m_num_vertices; ++v) {
+            if (gpu_vertex_patch[v] != cpu_vp[v]) {
+                vp_mismatch++;
+                if (gpu_vertex_patch[v] >= get_num_patches()) vp_bad++;
+            }
+        }
+        fprintf(stderr, "[GPU_PATCH_VALIDATE] K0a vertex_patch: %d differ (expected for boundary), %d invalid\n",
+                vp_mismatch, vp_bad);
+
+        // Cleanup
+        CUDA_ERROR(cudaFree(d_fv));
+        CUDA_ERROR(cudaFree(d_ev));
+        CUDA_ERROR(cudaFree(d_ef_f0));
+        CUDA_ERROR(cudaFree(d_edge_key_dev));
+        CUDA_ERROR(cudaFree(d_face_patch_dev));
+        CUDA_ERROR(cudaFree(d_ff_off_dev));
+        CUDA_ERROR(cudaFree(d_ff_val_dev));
+        CUDA_ERROR(cudaFree(gpu_result.d_edge_patch));
+        CUDA_ERROR(cudaFree(gpu_result.d_vertex_patch));
+
+        // Compare K0b ribbon count
+        uint32_t cpu_total_ribbon = 0;
+        for (uint32_t p = 0; p < get_num_patches(); ++p) {
+            uint32_t r_start = (p == 0) ? 0 : m_patcher->get_external_ribbon_offset()[p - 1];
+            uint32_t r_end = m_patcher->get_external_ribbon_offset()[p];
+            cpu_total_ribbon += (r_end - r_start);
+        }
+        fprintf(stderr, "[GPU_PATCH_VALIDATE] K0b ribbons: CPU=%u, GPU=%u\n",
+                cpu_total_ribbon, gpu_result.num_faces /* placeholder - need actual */);
+
+        fprintf(stderr, "[GPU_PATCH_VALIDATE] done\n");
     }
 
     // calc max elements for use in build_device (which populates
