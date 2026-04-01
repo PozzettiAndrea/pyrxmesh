@@ -931,11 +931,40 @@ ThrustLtogResult gpu_thrust_build_ltog(
     thrust::sort(thrust::device,
                  thrust::device_pointer_cast(d_vert_pairs),
                  thrust::device_pointer_cast(d_vert_pairs) + total_vert_entries);
-    // Sort face pairs by (patch, face_id)
-    thrust::sort_by_key(thrust::device,
-                        thrust::device_pointer_cast(d_face_pairs_patch),
-                        thrust::device_pointer_cast(d_face_pairs_patch) + total_patch_faces,
-                        thrust::device_pointer_cast(d_face_pairs_fid));
+    // Pack face pairs as uint64_t (patch<<32 | face_id) for proper sorting
+    {
+        uint64_t* d_face_pairs_packed;
+        CUDA_ERROR(cudaMalloc(&d_face_pairs_packed, total_patch_faces * sizeof(uint64_t)));
+        thrust::tabulate(thrust::device,
+            thrust::device_pointer_cast(d_face_pairs_packed),
+            thrust::device_pointer_cast(d_face_pairs_packed) + total_patch_faces,
+            [d_face_pairs_patch, d_face_pairs_fid] __device__ (uint32_t i) -> uint64_t {
+                return (uint64_t(d_face_pairs_patch[i]) << 32) | uint64_t(d_face_pairs_fid[i]);
+            });
+        CUDA_ERROR(cudaFree(d_face_pairs_patch));
+        CUDA_ERROR(cudaFree(d_face_pairs_fid));
+
+        thrust::sort(thrust::device,
+                     thrust::device_pointer_cast(d_face_pairs_packed),
+                     thrust::device_pointer_cast(d_face_pairs_packed) + total_patch_faces);
+
+        // Unpack back
+        CUDA_ERROR(cudaMalloc(&d_face_pairs_patch, total_patch_faces * sizeof(uint32_t)));
+        CUDA_ERROR(cudaMalloc(&d_face_pairs_fid, total_patch_faces * sizeof(uint32_t)));
+        thrust::tabulate(thrust::device,
+            thrust::device_pointer_cast(d_face_pairs_patch),
+            thrust::device_pointer_cast(d_face_pairs_patch) + total_patch_faces,
+            [d_face_pairs_packed] __device__ (uint32_t i) -> uint32_t {
+                return d_face_pairs_packed[i] >> 32;
+            });
+        thrust::tabulate(thrust::device,
+            thrust::device_pointer_cast(d_face_pairs_fid),
+            thrust::device_pointer_cast(d_face_pairs_fid) + total_patch_faces,
+            [d_face_pairs_packed] __device__ (uint32_t i) -> uint32_t {
+                return d_face_pairs_packed[i] & 0xFFFFFFFFu;
+            });
+        CUDA_ERROR(cudaFree(d_face_pairs_packed));
+    }
     CUDA_ERROR(cudaDeviceSynchronize());
     fprintf(stderr, "[thrust_ltog] step2 sort: %.0fms\n", ms_since(tp));
 

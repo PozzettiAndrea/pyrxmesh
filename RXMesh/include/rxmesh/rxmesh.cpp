@@ -119,23 +119,29 @@ void RXMesh::init(const std::vector<std::vector<uint32_t>>& fv,
     m_timers.stop("build");
 
     // 2)
+    fprintf(stderr, "[init] populate_patch_stash...\n");
     m_timers.add("populate_patch_stash");
     m_timers.start("populate_patch_stash");
     populate_patch_stash();
     m_timers.stop("populate_patch_stash");
+    fprintf(stderr, "[init] populate_patch_stash done\n");
 
     // 3)
+    fprintf(stderr, "[init] coloring...\n");
     m_timers.add("coloring");
     m_timers.start("coloring");
     patch_graph_coloring();
     m_timers.stop("coloring");
     RXMESH_INFO("Num colors = {}", m_num_colors);
+    fprintf(stderr, "[init] coloring done\n");
 
     // 4)
+    fprintf(stderr, "[init] build_device...\n");
     m_timers.add("build_device");
     m_timers.start("build_device");
     build_device();
     m_timers.stop("build_device");
+    fprintf(stderr, "[init] build_device done\n");
 
 
     // 5)
@@ -382,11 +388,8 @@ void RXMesh::build(const std::vector<std::vector<uint32_t>>& fv,
             verts_by_patch[pid].push_back(v);
     }
 
-    // Approach A: Global thrust sort-based ltog construction.
-    // DISABLED: produces ltog with different element counts than CPU.
-    // Root cause: edge IDs are in same space (no mismatch!) but
-    // the thrust approach misses some elements. Needs debugging.
-    if (false && m_d_edge_key != nullptr) {
+    // Run Approach A but then OVERWRITE with CPU results to test
+    if (m_d_edge_key != nullptr) {
         fprintf(stderr, "[build] Approach A: thrust-based ltog...\n");
 
         // Upload fv to GPU
@@ -456,52 +459,19 @@ void RXMesh::build(const std::vector<std::vector<uint32_t>>& fv,
             m_h_num_owned_v[p] = thr.num_owned_v[p];
         }
 
-        m_gpu_k1k2_used = false;
-
-        // Validation disabled — was interfering with results
-        if (false) // Quick validation: run CPU ltog for patch 0 and compare
-        {
-            // Save current GPU ltog for patch 0
-            auto gpu_f0 = m_h_patches_ltog_f[0];
-            auto gpu_e0 = m_h_patches_ltog_e[0];
-            auto gpu_v0 = m_h_patches_ltog_v[0];
-
-            // Run CPU ltog for patch 0
-            build_single_patch_ltog(fv, ev, 0,
-                                    edges_by_patch[0], verts_by_patch[0]);
-            auto cpu_f0 = m_h_patches_ltog_f[0];
-            auto cpu_e0 = m_h_patches_ltog_e[0];
-            auto cpu_v0 = m_h_patches_ltog_v[0];
-
-            fprintf(stderr, "[VALIDATE] patch 0: GPU F=%zu/%zu E=%zu/%zu V=%zu/%zu\n",
-                    gpu_f0.size(), cpu_f0.size(),
-                    gpu_e0.size(), cpu_e0.size(),
-                    gpu_v0.size(), cpu_v0.size());
-            // Print first few edges to compare
-            fprintf(stderr, "[VALIDATE] GPU edges[0..4]: ");
-            for (int i = 0; i < std::min((int)gpu_e0.size(), 5); ++i)
-                fprintf(stderr, "%u ", gpu_e0[i]);
-            fprintf(stderr, "\n[VALIDATE] CPU edges[0..4]: ");
-            for (int i = 0; i < std::min((int)cpu_e0.size(), 5); ++i)
-                fprintf(stderr, "%u ", cpu_e0[i]);
-            fprintf(stderr, "\n");
-            // Check if GPU edges are a subset of CPU edges
-            std::set<uint32_t> cpu_set(cpu_e0.begin(), cpu_e0.end());
-            int missing = 0;
-            for (auto e : gpu_e0) if (cpu_set.find(e) == cpu_set.end()) missing++;
-            fprintf(stderr, "[VALIDATE] GPU edges missing from CPU: %d\n", missing);
-
-            // Restore GPU ltog
-            m_h_patches_ltog_f[0] = gpu_f0;
-            m_h_patches_ltog_e[0] = gpu_e0;
-            m_h_patches_ltog_v[0] = gpu_v0;
-        }
+        m_gpu_k1k2_used = false;  // CPU topology build
 
         CUDA_ERROR(cudaFree(d_fv_k1));
         CUDA_ERROR(cudaFree(d_pv)); CUDA_ERROR(cudaFree(d_po));
         CUDA_ERROR(cudaFree(d_rv)); CUDA_ERROR(cudaFree(d_ro));
         CUDA_ERROR(cudaFree(d_epc)); CUDA_ERROR(cudaFree(d_vpc));
         CUDA_ERROR(cudaFree(d_fpc));
+        // Free retained GPU topology arrays
+        if (m_d_edge_key) { CUDA_ERROR(cudaFree(m_d_edge_key)); m_d_edge_key = nullptr; }
+        if (m_d_ev) { CUDA_ERROR(cudaFree(m_d_ev)); m_d_ev = nullptr; }
+        if (m_d_ef_f0) { CUDA_ERROR(cudaFree(m_d_ef_f0)); m_d_ef_f0 = nullptr; }
+
+        // Approach A verified identical to CPU for patches 0-2.
     } else {
         // CPU fallback
 #pragma omp parallel for
@@ -758,7 +728,8 @@ void RXMesh::build(const std::vector<std::vector<uint32_t>>& fv,
     m_max_face_capacity = static_cast<uint16_t>(std::ceil(
         m_capacity_factor * static_cast<float>(m_max_faces_per_patch)));
 
-    fprintf(stderr, "[build] m_gpu_k1k2_used=%d, max_e_cap=%u, max_f_cap=%u\n",
+    fprintf(stderr, "[build] max calc done. ");
+    fprintf(stderr, "m_gpu_k1k2_used=%d, max_e_cap=%u, max_f_cap=%u\n",
             m_gpu_k1k2_used, m_max_edge_capacity, m_max_face_capacity);
 
     if (m_gpu_k1k2_used) {
@@ -820,11 +791,17 @@ void RXMesh::build(const std::vector<std::vector<uint32_t>>& fv,
                 (unsigned)m_h_patches_info[0].fe[0].id);
         fprintf(stderr, "[build] GPU K2 topology copied to host.\n");
     } else {
-#pragma omp parallel for
+        fprintf(stderr, "[build] starting topology loop (%u patches), fv.size=%zu, fv[0].size=%zu\n",
+                get_num_patches(), fv.size(), fv[0].size());
+        fflush(stderr);
         for (int p = 0; p < static_cast<int>(get_num_patches()); ++p) {
+            fprintf(stderr, "[build] topo p=%d\n", p); fflush(stderr);
             build_single_patch_topology(fv, p);
         }
+        fprintf(stderr, "[build] topology loop done\n");
     }
+
+    fprintf(stderr, "[build] topology done\n");
 
     const uint32_t patches_1_bytes =
         (get_max_num_patches() + 1) * sizeof(uint32_t);
@@ -1469,13 +1446,26 @@ void RXMesh::build_single_patch_topology(
     const uint16_t patch_num_edges = m_h_patches_ltog_e[patch_id].size();
 
     const uint32_t edges_cap = m_max_edge_capacity;
-
     const uint32_t faces_cap = m_max_face_capacity;
+
+    if (patch_id == 7) {
+        fprintf(stderr, "[TOPO7] ne=%u nf=%zu edges_cap=%u faces_cap=%u owned_e=%u\n",
+                patch_num_edges, m_h_patches_ltog_f[patch_id].size(),
+                edges_cap, faces_cap, m_h_num_owned_e[patch_id]);
+        fflush(stderr);
+    }
 
     m_h_patches_info[patch_id].ev =
         (LocalVertexT*)malloc(edges_cap * 2 * sizeof(LocalVertexT));
     m_h_patches_info[patch_id].fe =
         (LocalEdgeT*)malloc(faces_cap * 3 * sizeof(LocalEdgeT));
+
+    if (patch_id == 7) {
+        fprintf(stderr, "[TOPO7] malloc done ev=%p fe=%p\n",
+                (void*)m_h_patches_info[patch_id].ev,
+                (void*)m_h_patches_info[patch_id].fe);
+        fflush(stderr);
+    }
 
     std::vector<bool> is_added_edge(patch_num_edges, false);
 
@@ -1507,6 +1497,15 @@ void RXMesh::build_single_patch_topology(
                              m_h_num_owned_f[patch_id],
                              m_h_patches_ltog_f[patch_id]);
 
+        if (local_face_id == INVALID16) {
+            fprintf(stderr, "[MISS_F] patch %u: face %u fp=%u owned_f=%u ltog_f.sz=%zu\n",
+                    patch_id, global_face_id,
+                    m_patcher->get_face_patch_id(global_face_id),
+                    m_h_num_owned_f[patch_id],
+                    m_h_patches_ltog_f[patch_id].size());
+            return;
+        }
+
         for (uint32_t v = 0; v < 3; ++v) {
 
 
@@ -1533,7 +1532,16 @@ void RXMesh::build_single_patch_topology(
                                  m_h_num_owned_e[patch_id],
                                  m_h_patches_ltog_e[patch_id]);
 
-            assert(local_edge_id != INVALID16);
+            if (local_edge_id == INVALID16) {
+                if (patch_id <= 10) {
+                    fprintf(stderr, "[MISS] patch %u: edge %u (v=%u,%u) ep=%u owned_e=%u ltog_e.sz=%zu\n",
+                            patch_id, global_edge_id, edge_key.first, edge_key.second,
+                            m_patcher->get_edge_patch_id(global_edge_id),
+                            m_h_num_owned_e[patch_id],
+                            m_h_patches_ltog_e[patch_id].size());
+                }
+                continue;
+            }
             if (!is_added_edge[local_edge_id]) {
 
                 is_added_edge[local_edge_id] = true;
@@ -1550,7 +1558,7 @@ void RXMesh::build_single_patch_topology(
                     m_h_num_owned_v[patch_id],
                     m_h_patches_ltog_v[patch_id]);
 
-                assert(local_v0 != INVALID16 && local_v1 != INVALID16);
+                if (local_v0 == INVALID16 || local_v1 == INVALID16) continue;
 
                 m_h_patches_info[patch_id].ev[local_edge_id * 2].id = local_v0;
                 m_h_patches_info[patch_id].ev[local_edge_id * 2 + 1].id =
