@@ -43,9 +43,22 @@ class Patcher
             const uint32_t num_edges,
             bool           use_metis);
 
+    // Fast constructor: sorted edge keys + binary search (skips m_edges_map)
+    Patcher(uint32_t                                  patch_size,
+            const std::vector<uint32_t>&              ff_offset,
+            const std::vector<uint32_t>&              ff_values,
+            const std::vector<std::vector<uint32_t>>& fv,
+            const std::vector<uint64_t>&              sorted_edge_keys,
+            const uint32_t num_vertices,
+            const uint32_t num_edges,
+            bool           use_metis);
+
     Patcher(std::string filename);
 
     ~Patcher();
+
+    void assign_patch_fast(const std::vector<std::vector<uint32_t>>& fv,
+                           const std::vector<uint64_t>& sorted_edge_keys);
 
     void print_statistics();
 

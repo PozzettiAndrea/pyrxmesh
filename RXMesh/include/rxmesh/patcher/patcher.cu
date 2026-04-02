@@ -178,6 +178,75 @@ Patcher::Patcher(uint32_t                                        patch_size,
     GPU_FREE(d_patches_val);
 }
 
+// Fast constructor: uses sorted edge keys (binary search) instead of edges_map
+Patcher::Patcher(uint32_t                                  patch_size,
+                 const std::vector<uint32_t>&              ff_offset,
+                 const std::vector<uint32_t>&              ff_values,
+                 const std::vector<std::vector<uint32_t>>& fv,
+                 const std::vector<uint64_t>&              sorted_edge_keys,
+                 const uint32_t                            num_vertices,
+                 const uint32_t                            num_edges,
+                 bool                                      use_metis)
+    : m_patch_size(patch_size), m_num_patches(0), m_num_vertices(num_vertices),
+      m_num_edges(num_edges), m_num_faces(fv.size()), m_num_seeds(0),
+      m_max_num_patches(0), m_num_components(0), m_num_lloyd_run(0),
+      m_patching_time_ms(0.0)
+{
+    m_num_patches = m_num_faces / m_patch_size + ((m_num_faces % m_patch_size) ? 1 : 0);
+    m_max_num_patches = 5 * m_num_patches;
+    m_num_seeds = m_num_patches;
+    std::vector<uint32_t> seeds;
+
+    uint32_t *d_face_patch=nullptr, *d_queue=nullptr, *d_queue_ptr=nullptr;
+    uint32_t *d_ff_values_d=nullptr, *d_ff_offset_d=nullptr;
+    void *d_cub_temp_storage_scan=nullptr, *d_cub_temp_storage_max=nullptr;
+    size_t cub_scan_bytes=0, cub_max_bytes=0;
+    uint32_t *d_seeds=nullptr, *d_new_num_patches=nullptr, *d_max_patch_size=nullptr;
+    uint32_t *d_patches_offset=nullptr, *d_patches_size=nullptr, *d_patches_val=nullptr;
+
+    allocate_memory(seeds);
+
+    if (m_num_patches <= 1) {
+        m_patches_offset[0] = m_num_faces;
+        m_num_seeds = 1; m_num_components = 1; m_num_lloyd_run = 0;
+        for (uint32_t i = 0; i < m_num_faces; ++i) {
+            m_face_patch[i] = 0; m_patches_val[i] = i;
+        }
+        allocate_device_memory(seeds, ff_offset, ff_values,
+            d_face_patch, d_queue, d_queue_ptr, d_ff_values_d, d_ff_offset_d,
+            d_cub_temp_storage_scan, d_cub_temp_storage_max,
+            cub_scan_bytes, cub_max_bytes, d_seeds, d_new_num_patches,
+            d_max_patch_size, d_patches_offset, d_patches_size, d_patches_val);
+        assign_patch_fast(fv, sorted_edge_keys);
+    } else {
+        if (use_metis) {
+            metis_kway(ff_offset, ff_values);
+        } else {
+            initialize_random_seeds(seeds, ff_offset, ff_values);
+            allocate_device_memory(seeds, ff_offset, ff_values,
+                d_face_patch, d_queue, d_queue_ptr, d_ff_values_d, d_ff_offset_d,
+                d_cub_temp_storage_scan, d_cub_temp_storage_max,
+                cub_scan_bytes, cub_max_bytes, d_seeds, d_new_num_patches,
+                d_max_patch_size, d_patches_offset, d_patches_size, d_patches_val);
+            run_lloyd(d_face_patch, d_queue, d_queue_ptr, d_ff_values_d, d_ff_offset_d,
+                d_cub_temp_storage_scan, d_cub_temp_storage_max,
+                cub_scan_bytes, cub_max_bytes, d_seeds, d_new_num_patches,
+                d_max_patch_size, d_patches_offset, d_patches_size, d_patches_val);
+        }
+        extract_ribbons(fv, ff_offset, ff_values);
+        assign_patch_fast(fv, sorted_edge_keys);
+    }
+
+    calc_edge_cut(fv, ff_offset, ff_values);
+    print_statistics();
+
+    GPU_FREE(d_face_patch); GPU_FREE(d_queue); GPU_FREE(d_queue_ptr);
+    GPU_FREE(d_ff_values_d); GPU_FREE(d_ff_offset_d);
+    GPU_FREE(d_cub_temp_storage_scan); GPU_FREE(d_cub_temp_storage_max);
+    GPU_FREE(d_seeds); GPU_FREE(d_new_num_patches); GPU_FREE(d_max_patch_size);
+    GPU_FREE(d_patches_offset); GPU_FREE(d_patches_size); GPU_FREE(d_patches_val);
+}
+
 void Patcher::grid(const std::vector<std::vector<uint32_t>>& fv)
 {
     // this only work if the input is a mesh coming from create_plane()
@@ -772,42 +841,59 @@ void Patcher::extract_ribbons(const std::vector<std::vector<uint32_t>>& fv,
     m_ribbon_ext_val.resize(m_ribbon_ext_offset[m_num_patches - 1]);
 }
 
+// Helper: binary search for edge ID in sorted packed keys
+static uint32_t find_edge_in_sorted(
+    const std::vector<uint64_t>& sorted_keys, uint32_t v0, uint32_t v1)
+{
+    uint32_t lo = std::min(v0, v1), hi = std::max(v0, v1);
+    uint64_t key = (uint64_t(lo) << 32) | uint64_t(hi);
+    auto it = std::lower_bound(sorted_keys.begin(), sorted_keys.end(), key);
+    return (it != sorted_keys.end() && *it == key)
+        ? static_cast<uint32_t>(it - sorted_keys.begin()) : INVALID32;
+}
+
 void Patcher::assign_patch(
     const std::vector<std::vector<uint32_t>>&                 fv,
     const std::unordered_map<std::pair<uint32_t, uint32_t>,
                              uint32_t,
                              ::rxmesh::detail::edge_key_hash> edges_map)
 {
-    // For every patch p, for every face in the patch, find the three edges
-    // that bound that face, and assign them to the patch. For boundary vertices
-    // and edges assign them to one patch (TODO smallest face count). For now,
-    // we assign it to the first patch
-
+    // Legacy: uses edges_map.at() for edge lookup
     for (uint32_t cur_p = 0; cur_p < m_num_patches; ++cur_p) {
-
         uint32_t p_start = (cur_p == 0) ? 0 : m_patches_offset[cur_p - 1];
         uint32_t p_end   = m_patches_offset[cur_p];
-
         for (uint32_t f = p_start; f < p_end; ++f) {
-
             uint32_t face = m_patches_val[f];
-
             uint32_t v1 = fv[face].back();
             for (uint32_t v = 0; v < fv[face].size(); ++v) {
                 uint32_t v0 = fv[face][v];
-
-                std::pair<uint32_t, uint32_t> key =
-                    ::rxmesh::detail::edge_key(v0, v1);
+                auto key = ::rxmesh::detail::edge_key(v0, v1);
                 uint32_t edge_id = edges_map.at(key);
+                if (m_vertex_patch[v0] == INVALID32) m_vertex_patch[v0] = cur_p;
+                if (m_edge_patch[edge_id] == INVALID32) m_edge_patch[edge_id] = cur_p;
+                v1 = v0;
+            }
+        }
+    }
+}
 
-                if (m_vertex_patch[v0] == INVALID32) {
-                    m_vertex_patch[v0] = cur_p;
-                }
-
-                if (m_edge_patch[edge_id] == INVALID32) {
+void Patcher::assign_patch_fast(
+    const std::vector<std::vector<uint32_t>>& fv,
+    const std::vector<uint64_t>& sorted_edge_keys)
+{
+    // Fast: binary search on sorted packed keys (no unordered_map needed)
+    for (uint32_t cur_p = 0; cur_p < m_num_patches; ++cur_p) {
+        uint32_t p_start = (cur_p == 0) ? 0 : m_patches_offset[cur_p - 1];
+        uint32_t p_end   = m_patches_offset[cur_p];
+        for (uint32_t f = p_start; f < p_end; ++f) {
+            uint32_t face = m_patches_val[f];
+            uint32_t v1 = fv[face].back();
+            for (uint32_t v = 0; v < fv[face].size(); ++v) {
+                uint32_t v0 = fv[face][v];
+                uint32_t edge_id = find_edge_in_sorted(sorted_edge_keys, v0, v1);
+                if (m_vertex_patch[v0] == INVALID32) m_vertex_patch[v0] = cur_p;
+                if (edge_id != INVALID32 && m_edge_patch[edge_id] == INVALID32)
                     m_edge_patch[edge_id] = cur_p;
-                }
-
                 v1 = v0;
             }
         }

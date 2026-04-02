@@ -341,7 +341,7 @@ void RXMesh::build(const std::vector<std::vector<uint32_t>>& fv,
                                                            ff_offset,
                                                            ff_values,
                                                            fv,
-                                                           m_edges_map,
+                                                           m_sorted_edge_keys,
                                                            m_num_vertices,
                                                            m_num_edges,
                                                            false);
@@ -353,7 +353,7 @@ void RXMesh::build(const std::vector<std::vector<uint32_t>>& fv,
                                                        ff_offset,
                                                        ff_values,
                                                        fv,
-                                                       m_edges_map,
+                                                       m_sorted_edge_keys,
                                                        m_num_vertices,
                                                        m_num_edges,
                                                        false);
@@ -986,23 +986,30 @@ void RXMesh::build_supporting_structures(
     gpu.d_ev = nullptr;
     gpu.d_ef_f0 = nullptr;
 
-    // Convert to vector-of-vectors (downstream expects this format)
+    // Store flat arrays (skip 3s vector-of-vectors for ev/ef)
+    m_ev_flat = std::move(gpu.ev_flat);   // [num_edges * 2]
+    m_ef_f0 = std::move(gpu.ef_f0);      // [num_edges]
+    m_ef_f1 = std::move(gpu.ef_f1);      // [num_edges]
+
+    // Download sorted unique edge keys from GPU for fast binary search lookups
+    m_sorted_edge_keys.resize(m_num_edges);
+    CUDA_ERROR(cudaMemcpy(m_sorted_edge_keys.data(), m_d_edge_key,
+                          m_num_edges * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+
+    // ev vector-of-vectors: still needed by CPU fallback topology build
     ev.resize(m_num_edges);
+    for (uint32_t e = 0; e < m_num_edges; ++e)
+        ev[e] = {m_ev_flat[2 * e], m_ev_flat[2 * e + 1]};
+
+    // ef vector-of-vectors: still needed by calc_input_statistics
     ef.resize(m_num_edges);
     for (uint32_t e = 0; e < m_num_edges; ++e) {
-        ev[e] = {gpu.ev_flat[2 * e], gpu.ev_flat[2 * e + 1]};
-        if (gpu.ef_f1[e] == UINT32_MAX)
-            ef[e] = {gpu.ef_f0[e]};
-        else
-            ef[e] = {gpu.ef_f0[e], gpu.ef_f1[e]};
+        if (m_ef_f1[e] == UINT32_MAX) ef[e] = {m_ef_f0[e]};
+        else ef[e] = {m_ef_f0[e], m_ef_f1[e]};
     }
 
-    // Populate m_edges_map (needed by get_edge_id, patcher, etc.)
-    m_edges_map.clear();
-    m_edges_map.reserve(m_num_edges);
-    for (uint32_t e = 0; e < m_num_edges; ++e)
-        m_edges_map.insert(std::make_pair(
-            detail::edge_key(gpu.ev_flat[2*e], gpu.ev_flat[2*e+1]), e));
+    // m_edges_map: NO LONGER NEEDED — Patcher uses sorted_edge_keys,
+    // get_edge_id uses binary search on m_sorted_edge_keys.
 
     // Use GPU-computed face-face adjacency directly
     ff_offset = std::move(gpu.ff_offset);
@@ -1642,33 +1649,19 @@ const std::pair<uint32_t, uint16_t> RXMesh::map_to_local(
 
 uint32_t RXMesh::get_edge_id(const uint32_t v0, const uint32_t v1) const
 {
-    // v0 and v1 are two vertices in global space. we return the edge
-    // id in global space also (by querying m_edges_map)
-    assert(m_edges_map.size() != 0);
-
-    std::pair<uint32_t, uint32_t> edge = detail::edge_key(v0, v1);
-
-    assert(edge.first == v0 || edge.first == v1);
-    assert(edge.second == v0 || edge.second == v1);
-
-    return get_edge_id(edge);
+    // Fast binary search on sorted edge keys (replaces m_edges_map lookup)
+    uint32_t lo = std::min(v0, v1), hi = std::max(v0, v1);
+    uint64_t key = (uint64_t(lo) << 32) | uint64_t(hi);
+    auto it = std::lower_bound(
+        m_sorted_edge_keys.begin(), m_sorted_edge_keys.end(), key);
+    if (it != m_sorted_edge_keys.end() && *it == key)
+        return static_cast<uint32_t>(it - m_sorted_edge_keys.begin());
+    return INVALID32;
 }
 
 uint32_t RXMesh::get_edge_id(const std::pair<uint32_t, uint32_t>& edge) const
 {
-    uint32_t edge_id = INVALID32;
-    try {
-        edge_id = m_edges_map.at(edge);
-    } catch (const std::out_of_range&) {
-        RXMESH_ERROR(
-            "rxmesh::get_edge_id() mapping edges went wrong."
-            " Can not find an edge connecting vertices {} and {}",
-            edge.first,
-            edge.second);
-        exit(EXIT_FAILURE);
-    }
-
-    return edge_id;
+    return get_edge_id(edge.first, edge.second);
 }
 
 uint16_t RXMesh::get_per_patch_max_vertex_capacity() const

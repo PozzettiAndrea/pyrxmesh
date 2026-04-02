@@ -591,6 +591,11 @@ class RXMesh
     Context  m_rxmesh_context;
     EdgeMapT m_edges_map;
 
+    // Flat topology arrays (from GPU sort-scan, avoids vector-of-vectors)
+    std::vector<uint32_t> m_ev_flat;         // [num_edges * 2]
+    std::vector<uint32_t> m_ef_f0, m_ef_f1;  // [num_edges] each
+    std::vector<uint64_t> m_sorted_edge_keys; // [num_edges] sorted (min<<32|max)
+
     // Retained GPU topology data for GPU patch construction
     uint64_t* m_d_edge_key = nullptr;  // [num_edges] sorted packed keys
     uint32_t* m_d_ev = nullptr;        // [num_edges * 2] on device
