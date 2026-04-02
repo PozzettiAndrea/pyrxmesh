@@ -597,6 +597,9 @@ class RXMesh
     bool m_bulk_device_alloc = false;
     std::vector<uint8_t*> m_bulk_device_ptrs;  // freed in destructor
 
+    // Flat face array (set before build to skip fv→flat conversion)
+    std::vector<uint32_t> m_flat_faces;      // [num_faces * 3]
+
     // Flat topology arrays (from GPU sort-scan, avoids vector-of-vectors)
     std::vector<uint32_t> m_ev_flat;         // [num_edges * 2]
     std::vector<uint32_t> m_ef_f0, m_ef_f1;  // [num_edges] each
@@ -606,6 +609,7 @@ class RXMesh
     uint64_t* m_d_edge_key = nullptr;  // [num_edges] sorted packed keys
     uint32_t* m_d_ev = nullptr;        // [num_edges * 2] on device
     uint32_t* m_d_ef_f0 = nullptr;     // [num_edges] first face per edge
+    uint32_t* m_d_fv = nullptr;        // [num_faces * 3] face-vertex on device
 
     // GPU K1+K2 results (when GPU path is used)
     bool m_gpu_k1k2_used = false;

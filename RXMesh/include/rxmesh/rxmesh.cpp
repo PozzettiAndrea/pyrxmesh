@@ -90,6 +90,16 @@ void RXMesh::init(const std::vector<std::vector<uint32_t>>& fv,
             "RXMesh::init hashtable load factor should be less than 1");
     }
 
+    // Pre-build flat face array (avoids fv→flat→fv round-trip in build_supporting_structures)
+    if (m_flat_faces.empty()) {
+        m_flat_faces.resize(fv.size() * 3);
+        for (uint32_t f = 0; f < fv.size(); ++f) {
+            m_flat_faces[f * 3 + 0] = fv[f][0];
+            m_flat_faces[f * 3 + 1] = fv[f][1];
+            m_flat_faces[f * 3 + 2] = fv[f][2];
+        }
+    }
+
     // Enable CUDA memory pool caching for async allocations.
     // This makes cudaMallocAsync reuse freed memory instead of
     // returning it to the OS, dramatically reducing allocation overhead.
@@ -403,17 +413,8 @@ void RXMesh::build(const std::vector<std::vector<uint32_t>>& fv,
     if (m_d_edge_key != nullptr) {
         fprintf(stderr, "[build] Approach A: thrust-based ltog...\n");
 
-        // Upload fv to GPU
-        std::vector<uint32_t> flat_fv_k1(m_num_faces * 3);
-        for (uint32_t f = 0; f < m_num_faces; ++f) {
-            flat_fv_k1[f*3+0] = fv[f][0];
-            flat_fv_k1[f*3+1] = fv[f][1];
-            flat_fv_k1[f*3+2] = fv[f][2];
-        }
-        uint32_t* d_fv_k1;
-        CUDA_ERROR(cudaMalloc(&d_fv_k1, m_num_faces * 3 * sizeof(uint32_t)));
-        CUDA_ERROR(cudaMemcpy(d_fv_k1, flat_fv_k1.data(),
-                              m_num_faces * 3 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+        // Use retained device face array (no re-upload needed)
+        uint32_t* d_fv_k1 = m_d_fv;
 
         // Upload patcher results
         uint32_t* cpu_pv = m_patcher->get_patches_val();
@@ -472,15 +473,16 @@ void RXMesh::build(const std::vector<std::vector<uint32_t>>& fv,
 
         m_gpu_k1k2_used = false;  // CPU topology build
 
-        CUDA_ERROR(cudaFree(d_fv_k1));
+        // d_fv_k1 is m_d_fv (retained) — don't free
         CUDA_ERROR(cudaFree(d_pv)); CUDA_ERROR(cudaFree(d_po));
         CUDA_ERROR(cudaFree(d_rv)); CUDA_ERROR(cudaFree(d_ro));
         CUDA_ERROR(cudaFree(d_epc)); CUDA_ERROR(cudaFree(d_vpc));
         CUDA_ERROR(cudaFree(d_fpc));
-        // Free retained GPU topology arrays
+        // Free retained GPU topology arrays (no longer needed after Approach A)
         if (m_d_edge_key) { CUDA_ERROR(cudaFree(m_d_edge_key)); m_d_edge_key = nullptr; }
         if (m_d_ev) { CUDA_ERROR(cudaFree(m_d_ev)); m_d_ev = nullptr; }
         if (m_d_ef_f0) { CUDA_ERROR(cudaFree(m_d_ef_f0)); m_d_ef_f0 = nullptr; }
+        if (m_d_fv) { CUDA_ERROR(cudaFree(m_d_fv)); m_d_fv = nullptr; }
 
         // Approach A verified identical to CPU for patches 0-2.
     } else {
@@ -969,33 +971,37 @@ void RXMesh::build_supporting_structures(
 {
     m_num_faces = static_cast<uint32_t>(fv.size());
 
-    // Validate + build flat face array for GPU
-    std::vector<uint32_t> flat_faces(m_num_faces * 3);
-    for (uint32_t f = 0; f < m_num_faces; ++f) {
-        if (fv[f].size() != 3) {
-            RXMESH_ERROR(
-                "rxmesh::build_supporting_structures() Face {} is not "
-                "triangle. Non-triangular faces are not supported", f);
-            exit(EXIT_FAILURE);
+    // Build flat face array for GPU (skip if m_flat_faces already provided)
+    if (m_flat_faces.empty()) {
+        m_flat_faces.resize(m_num_faces * 3);
+        for (uint32_t f = 0; f < m_num_faces; ++f) {
+            if (fv[f].size() != 3) {
+                RXMESH_ERROR(
+                    "rxmesh::build_supporting_structures() Face {} is not "
+                    "triangle. Non-triangular faces are not supported", f);
+                exit(EXIT_FAILURE);
+            }
+            m_flat_faces[f * 3 + 0] = fv[f][0];
+            m_flat_faces[f * 3 + 1] = fv[f][1];
+            m_flat_faces[f * 3 + 2] = fv[f][2];
         }
-        flat_faces[f * 3 + 0] = fv[f][0];
-        flat_faces[f * 3 + 1] = fv[f][1];
-        flat_faces[f * 3 + 2] = fv[f][2];
     }
 
     // ── GPU sort-scan topology build ─────────────────────────────────────
-    auto gpu = gpu_build_topology(flat_faces.data(), m_num_faces);
+    auto gpu = gpu_build_topology(m_flat_faces.data(), m_num_faces);
 
     m_num_vertices = gpu.num_vertices;
     m_num_edges    = gpu.num_edges;
 
-    // Retain device arrays for GPU patch construction (K0a, K1, K2)
+    // Retain device arrays for GPU patch construction
     m_d_edge_key = gpu.d_edge_key;
     m_d_ev = gpu.d_ev;
     m_d_ef_f0 = gpu.d_ef_f0;
+    m_d_fv = gpu.d_fv;
     gpu.d_edge_key = nullptr;
     gpu.d_ev = nullptr;
     gpu.d_ef_f0 = nullptr;
+    gpu.d_fv = nullptr;
 
     // Store flat arrays (skip 3s vector-of-vectors for ev/ef)
     m_ev_flat = std::move(gpu.ev_flat);   // [num_edges * 2]

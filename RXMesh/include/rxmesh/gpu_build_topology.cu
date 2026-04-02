@@ -116,7 +116,7 @@ GpuTopoResult gpu_build_topology(const uint32_t* h_faces, uint32_t num_faces)
 
     int grid = (num_faces + BLOCK - 1) / BLOCK;
     expand_edges_kernel<<<grid, BLOCK>>>(d_faces, num_faces, d_edge_key, d_edge_face);
-    CUDA_ERROR(cudaFree(d_faces));
+    // Keep d_faces for downstream (Approach A uses it directly)
 
     // Step 2: Sort by packed key
     thrust::sort_by_key(
@@ -241,6 +241,7 @@ GpuTopoResult gpu_build_topology(const uint32_t* h_faces, uint32_t num_faces)
     result.d_edge_key = d_edge_key;
     result.d_ev = d_ev_flat;
     result.d_ef_f0 = d_ef_f0;
+    result.d_fv = d_faces;
 
     CUDA_ERROR(cudaFree(d_ef_f1));
     CUDA_ERROR(cudaFree(d_ff_count));

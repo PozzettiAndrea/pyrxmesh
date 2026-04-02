@@ -20,11 +20,13 @@ struct GpuTopoResult {
     uint64_t* d_edge_key = nullptr;    // [num_edges] sorted packed keys
     uint32_t* d_ev = nullptr;          // [num_edges * 2] on device
     uint32_t* d_ef_f0 = nullptr;       // [num_edges] first face per edge
+    uint32_t* d_fv = nullptr;          // [num_faces * 3] face-vertex on device
 
     void free_device() {
         if (d_edge_key) { cudaFree(d_edge_key); d_edge_key = nullptr; }
         if (d_ev) { cudaFree(d_ev); d_ev = nullptr; }
         if (d_ef_f0) { cudaFree(d_ef_f0); d_ef_f0 = nullptr; }
+        if (d_fv) { cudaFree(d_fv); d_fv = nullptr; }
     }
 };
 
