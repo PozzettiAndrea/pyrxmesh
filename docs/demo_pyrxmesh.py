@@ -544,10 +544,8 @@ def gen_decimation(dragon_v, dragon_f):
     }
 
 
-def gen_remeshing(bunny_v, bunny_f, dragon_v, dragon_f,
-                  armadillo_v=None, armadillo_f=None,
-                  happy_buddha_v=None, happy_buddha_f=None):
-    """Generate remeshing demos."""
+def gen_remeshing(bunny_v, bunny_f, dragon_v, dragon_f):
+    """Generate remeshing demos (bunny + delaunay)."""
     remesh_demos = []
 
     print("  Rendering: remesh (bunny)")
@@ -560,26 +558,6 @@ def gen_remeshing(bunny_v, bunny_f, dragon_v, dragon_f,
                 iterations=2,
             )"""),
         after_label="Isotropic Remeshed"))
-
-    if armadillo_v is not None:
-        print(f"  Rendering: remesh (armadillo, {len(armadillo_v):,} verts)")
-        remesh_demos.append(run_before_after("remesh_armadillo",
-            lambda v, f: pyrxmesh.remesh(v, f, relative_len=1.0, iterations=2, verbose=True),
-            armadillo_v, armadillo_f,
-            textwrap.dedent("""\
-                v, f = pyrxmesh.load_obj("armadillo.obj")
-                v_re, f_re = pyrxmesh.remesh(v, f, relative_len=1.0, iterations=2)"""),
-            after_label="Isotropic Remeshed"))
-
-    if happy_buddha_v is not None:
-        print(f"  Rendering: remesh (happy buddha, {len(happy_buddha_v):,} verts)")
-        remesh_demos.append(run_before_after("remesh_happy_buddha",
-            lambda v, f: pyrxmesh.remesh(v, f, relative_len=1.0, iterations=2, verbose=True),
-            happy_buddha_v, happy_buddha_f,
-            textwrap.dedent("""\
-                v, f = pyrxmesh.load_obj("happy_buddha.obj")
-                v_re, f_re = pyrxmesh.remesh(v, f, relative_len=1.0, iterations=2)"""),
-            after_label="Isotropic Remeshed"))
 
     print("  Rendering: delaunay")
     remesh_demos.append(run_before_after("delaunay",
@@ -668,56 +646,54 @@ def _compute_mesh_metrics(mesh):
     }
 
 
-def gen_asian_dragon_remesh(asian_dragon_v, asian_dragon_f):
-    """Generate isotropic remeshing demo on the Stanford Asian Dragon (3.6M verts)."""
-    remesh_demos = []
+def gen_large_mesh_remesh(section_name, label, verts_in, faces_in, obj_filename):
+    """Generate a full remeshing demo section for a large mesh with timing + metrics."""
+    demos = []
 
-    print("  Rendering: asian_dragon_remesh")
-    print(f"    Input: {len(asian_dragon_v):,} verts, {len(asian_dragon_f):,} faces")
+    print(f"  Rendering: {section_name}")
+    print(f"    Input: {len(verts_in):,} verts, {len(faces_in):,} faces")
 
     t_total = time.perf_counter()
 
     t0 = time.perf_counter()
     print("    [1/3] RXMesh construction + GPU remesh...", flush=True)
-    verts_out, faces_out = pyrxmesh.remesh(asian_dragon_v, asian_dragon_f,
+    verts_out, faces_out = pyrxmesh.remesh(verts_in, faces_in,
                                             relative_len=1.0, iterations=2, verbose=True)
     t_remesh = time.perf_counter() - t0
     print(f"    Remesh total: {fmt_time(t_remesh)}")
     print(f"    Output: {len(verts_out):,} verts, {len(faces_out):,} faces")
 
     t0 = time.perf_counter()
-    mesh_in = pv_mesh_from_numpy(asian_dragon_v, asian_dragon_f)
+    mesh_in = pv_mesh_from_numpy(verts_in, faces_in)
     mesh_out = pv_mesh_from_numpy(verts_out, faces_out)
     t_pv = time.perf_counter() - t0
     print(f"    PyVista mesh build: {fmt_time(t_pv)}")
 
-    # Compute mesh quality metrics
     print("    Computing mesh metrics...")
     metrics_in = _compute_mesh_metrics(mesh_in)
     metrics_out = _compute_mesh_metrics(mesh_out)
     print(f"    Input:  Q={metrics_in['quality_avg']:.2f} avg, val6={metrics_in['pct_val6']:.0f}%, edge_std={metrics_in['edge_std']:.4f}")
     print(f"    Output: Q={metrics_out['quality_avg']:.2f} avg, val6={metrics_out['pct_val6']:.0f}%, edge_std={metrics_out['edge_std']:.4f}")
 
-    prefix = os.path.join(OUT_DIR, "asian_dragon_remesh")
+    prefix = os.path.join(OUT_DIR, section_name)
+
+    # Show edges for smaller meshes, hide for large ones
+    show_edges = len(verts_in) < 200_000
 
     t0 = time.perf_counter()
     render_mesh(mesh_in, f"{prefix}_before.png",
-                f"Input: {len(asian_dragon_v):,} verts, {len(asian_dragon_f):,} tris",
-                show_edges=False)
-    t_r1 = time.perf_counter() - t0
-    print(f"    Render input: {fmt_time(t_r1)}")
+                f"Input: {len(verts_in):,} verts, {len(faces_in):,} tris",
+                show_edges=show_edges)
+    print(f"    Render input: {fmt_time(time.perf_counter() - t0)}")
 
     t0 = time.perf_counter()
     render_mesh(mesh_out, f"{prefix}_after.png",
                 f"Isotropic Remeshed: {len(verts_out):,} verts, {len(faces_out):,} tris  ({fmt_time(t_remesh)})",
-                color=MESH_COLOR_OUT, show_edges=False)
-    t_r2 = time.perf_counter() - t0
-    print(f"    Render output: {fmt_time(t_r2)}")
+                color=MESH_COLOR_OUT, show_edges=show_edges)
+    print(f"    Render output: {fmt_time(time.perf_counter() - t0)}")
 
-    t_all = time.perf_counter() - t_total
-    print(f"    Total section time: {fmt_time(t_all)}")
+    print(f"    Total section time: {fmt_time(time.perf_counter() - t_total)}")
 
-    # Build verbose metrics string for display
     def _fmt(m):
         return (f"{m['V']:,}V {m['F']:,}F | "
                 f"Q: {m['quality_avg']:.2f} avg, {m['quality_max']:.0f} max | "
@@ -725,14 +701,13 @@ def gen_asian_dragon_remesh(asian_dragon_v, asian_dragon_f):
 
     verbose = f"Input:  {_fmt(metrics_in)}\nOutput: {_fmt(metrics_out)}"
 
-    remesh_demos.append({
-        "name": "asian_dragon_remesh", "type": "before_after",
-        "verts_in": len(asian_dragon_v), "faces_in": len(asian_dragon_f),
+    demos.append({
+        "name": section_name, "type": "before_after",
+        "verts_in": len(verts_in), "faces_in": len(faces_in),
         "verts_out": len(verts_out), "faces_out": len(faces_out),
         "elapsed": t_remesh, "after_label": "Isotropic Remeshed",
-        "code": textwrap.dedent("""\
-            v, f = pyrxmesh.load_obj("xyzrgb_dragon.obj")
-            # 3.6M verts, 7.2M faces
+        "code": textwrap.dedent(f"""\
+            v, f = pyrxmesh.load_obj("{obj_filename}")
             v_re, f_re = pyrxmesh.remesh(
                 v, f, relative_len=1.0,
                 iterations=2,
@@ -741,10 +716,23 @@ def gen_asian_dragon_remesh(asian_dragon_v, asian_dragon_f):
     })
 
     return {
-        "title": "Isotropic Remeshing — Stanford Asian Dragon (3.6M verts)",
-        "subtitle": "GPU-accelerated remeshing on 3.6M vertex mesh with mesh quality metrics",
-        "demos": remesh_demos,
+        "title": f"Isotropic Remeshing — {label}",
+        "subtitle": "GPU-accelerated remeshing with mesh quality metrics",
+        "demos": demos,
     }
+
+
+def gen_armadillo_remesh(armadillo_v, armadillo_f):
+    return gen_large_mesh_remesh("armadillo_remesh", "Armadillo (172k verts)",
+                                 armadillo_v, armadillo_f, "armadillo.obj")
+
+def gen_happy_buddha_remesh(happy_buddha_v, happy_buddha_f):
+    return gen_large_mesh_remesh("happy_buddha_remesh", "Happy Buddha (543k verts)",
+                                 happy_buddha_v, happy_buddha_f, "happy_buddha.obj")
+
+def gen_asian_dragon_remesh(asian_dragon_v, asian_dragon_f):
+    return gen_large_mesh_remesh("asian_dragon_remesh", "Stanford Asian Dragon (3.6M verts)",
+                                 asian_dragon_v, asian_dragon_f, "xyzrgb_dragon.obj")
 
 
 def gen_patches(bunny_v, bunny_f, dragon_v, dragon_f):
@@ -849,10 +837,10 @@ SECTIONS = [
     ("smoothing", gen_smoothing, ["bunny_v", "bunny_f", "bunny_mesh"]),
     ("parameterization", gen_parameterization, ["bunny_v", "bunny_f"]),
     ("decimation", gen_decimation, ["dragon_v", "dragon_f"]),
-    ("remeshing", gen_remeshing, ["bunny_v", "bunny_f", "dragon_v", "dragon_f",
-                                  "armadillo_v", "armadillo_f",
-                                  "happy_buddha_v", "happy_buddha_f"]),
+    ("remeshing", gen_remeshing, ["bunny_v", "bunny_f", "dragon_v", "dragon_f"]),
     ("edge_ops", gen_edge_ops, ["bunny_v", "bunny_f"]),
+    ("armadillo_remesh", gen_armadillo_remesh, ["armadillo_v", "armadillo_f"]),
+    ("happy_buddha_remesh", gen_happy_buddha_remesh, ["happy_buddha_v", "happy_buddha_f"]),
     ("asian_dragon_remesh", gen_asian_dragon_remesh, ["asian_dragon_v", "asian_dragon_f"]),
     ("patches", gen_patches, ["bunny_v", "bunny_f", "dragon_v", "dragon_f"]),
 ]
