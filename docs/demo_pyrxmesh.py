@@ -544,11 +544,13 @@ def gen_decimation(dragon_v, dragon_f):
     }
 
 
-def gen_remeshing(bunny_v, bunny_f, dragon_v, dragon_f):
+def gen_remeshing(bunny_v, bunny_f, dragon_v, dragon_f,
+                  armadillo_v=None, armadillo_f=None,
+                  happy_buddha_v=None, happy_buddha_f=None):
     """Generate remeshing demos."""
     remesh_demos = []
 
-    print("  Rendering: remesh")
+    print("  Rendering: remesh (bunny)")
     remesh_demos.append(run_before_after("remesh",
         lambda v, f: pyrxmesh.remesh(v, f, relative_len=1.0, iterations=2, verbose=True),
         bunny_v, bunny_f,
@@ -558,6 +560,26 @@ def gen_remeshing(bunny_v, bunny_f, dragon_v, dragon_f):
                 iterations=2,
             )"""),
         after_label="Isotropic Remeshed"))
+
+    if armadillo_v is not None:
+        print(f"  Rendering: remesh (armadillo, {len(armadillo_v):,} verts)")
+        remesh_demos.append(run_before_after("remesh_armadillo",
+            lambda v, f: pyrxmesh.remesh(v, f, relative_len=1.0, iterations=2, verbose=True),
+            armadillo_v, armadillo_f,
+            textwrap.dedent("""\
+                v, f = pyrxmesh.load_obj("armadillo.obj")
+                v_re, f_re = pyrxmesh.remesh(v, f, relative_len=1.0, iterations=2)"""),
+            after_label="Isotropic Remeshed"))
+
+    if happy_buddha_v is not None:
+        print(f"  Rendering: remesh (happy buddha, {len(happy_buddha_v):,} verts)")
+        remesh_demos.append(run_before_after("remesh_happy_buddha",
+            lambda v, f: pyrxmesh.remesh(v, f, relative_len=1.0, iterations=2, verbose=True),
+            happy_buddha_v, happy_buddha_f,
+            textwrap.dedent("""\
+                v, f = pyrxmesh.load_obj("happy_buddha.obj")
+                v_re, f_re = pyrxmesh.remesh(v, f, relative_len=1.0, iterations=2)"""),
+            after_label="Isotropic Remeshed"))
 
     print("  Rendering: delaunay")
     remesh_demos.append(run_before_after("delaunay",
@@ -827,7 +849,9 @@ SECTIONS = [
     ("smoothing", gen_smoothing, ["bunny_v", "bunny_f", "bunny_mesh"]),
     ("parameterization", gen_parameterization, ["bunny_v", "bunny_f"]),
     ("decimation", gen_decimation, ["dragon_v", "dragon_f"]),
-    ("remeshing", gen_remeshing, ["bunny_v", "bunny_f", "dragon_v", "dragon_f"]),
+    ("remeshing", gen_remeshing, ["bunny_v", "bunny_f", "dragon_v", "dragon_f",
+                                  "armadillo_v", "armadillo_f",
+                                  "happy_buddha_v", "happy_buddha_f"]),
     ("edge_ops", gen_edge_ops, ["bunny_v", "bunny_f"]),
     ("asian_dragon_remesh", gen_asian_dragon_remesh, ["asian_dragon_v", "asian_dragon_f"]),
     ("patches", gen_patches, ["bunny_v", "bunny_f", "dragon_v", "dragon_f"]),
@@ -857,14 +881,25 @@ def main():
     print(f"  bunny: {len(bunny_v)} verts, {len(bunny_f)} faces")
     print(f"  dragon: {len(dragon_v)} verts, {len(dragon_f)} faces")
 
+    # Load larger meshes (skip if not found)
+    armadillo_v = armadillo_f = None
+    armadillo_path = os.path.join(RXMESH_INPUT, "armadillo.obj")
+    if os.path.exists(armadillo_path):
+        armadillo_v, armadillo_f = pyrxmesh.load_obj(armadillo_path)
+        print(f"  armadillo: {len(armadillo_v):,} verts, {len(armadillo_f):,} faces")
+
+    happy_buddha_v = happy_buddha_f = None
+    happy_buddha_path = os.path.join(RXMESH_INPUT, "happy_buddha.obj")
+    if os.path.exists(happy_buddha_path):
+        happy_buddha_v, happy_buddha_f = pyrxmesh.load_obj(happy_buddha_path)
+        print(f"  happy buddha: {len(happy_buddha_v):,} verts, {len(happy_buddha_f):,} faces")
+
+    asian_dragon_v = asian_dragon_f = None
     asian_dragon_path = os.path.join(RXMESH_INPUT, "xyzrgb_dragon.obj")
     if os.path.exists(asian_dragon_path):
         print("Loading Asian Dragon (3.6M verts)...")
         asian_dragon_v, asian_dragon_f = pyrxmesh.load_obj(asian_dragon_path)
-        print(f"  asian dragon: {len(asian_dragon_v)} verts, {len(asian_dragon_f)} faces")
-    else:
-        print("  asian dragon: not found, skipping")
-        asian_dragon_v = asian_dragon_f = None
+        print(f"  asian dragon: {len(asian_dragon_v):,} verts, {len(asian_dragon_f):,} faces")
 
     # Only build persistent meshes if needed
     needs_persistent = only in (None, "analysis", "smoothing")
@@ -877,6 +912,8 @@ def main():
     all_args = {
         "bunny_v": bunny_v, "bunny_f": bunny_f, "bunny_mesh": bunny_mesh,
         "dragon_v": dragon_v, "dragon_f": dragon_f, "dragon_mesh": dragon_mesh,
+        "armadillo_v": armadillo_v, "armadillo_f": armadillo_f,
+        "happy_buddha_v": happy_buddha_v, "happy_buddha_f": happy_buddha_f,
         "asian_dragon_v": asian_dragon_v, "asian_dragon_f": asian_dragon_f,
     }
 
