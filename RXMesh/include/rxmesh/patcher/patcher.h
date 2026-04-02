@@ -43,21 +43,22 @@ class Patcher
             const uint32_t num_edges,
             bool           use_metis);
 
-    // Fast constructor: sorted edge keys + binary search (skips m_edges_map)
-    Patcher(uint32_t                                  patch_size,
-            const std::vector<uint32_t>&              ff_offset,
-            const std::vector<uint32_t>&              ff_values,
-            const std::vector<std::vector<uint32_t>>& fv,
-            const std::vector<uint64_t>&              sorted_edge_keys,
-            const uint32_t num_vertices,
-            const uint32_t num_edges,
-            bool           use_metis);
+    // Fast constructor: flat faces + sorted edge keys (no vector-of-vectors)
+    Patcher(uint32_t                     patch_size,
+            const std::vector<uint32_t>& ff_offset,
+            const std::vector<uint32_t>& ff_values,
+            const uint32_t*              flat_fv,
+            uint32_t                     num_faces,
+            const std::vector<uint64_t>& sorted_edge_keys,
+            uint32_t                     num_vertices,
+            uint32_t                     num_edges,
+            bool                         use_metis);
 
     Patcher(std::string filename);
 
     ~Patcher();
 
-    void assign_patch_fast(const std::vector<std::vector<uint32_t>>& fv,
+    void assign_patch_fast(const uint32_t* flat_fv, uint32_t num_faces,
                            const std::vector<uint64_t>& sorted_edge_keys);
 
     void print_statistics();
@@ -227,7 +228,7 @@ class Patcher
                                 uint32_t*& d_patches_size,
                                 uint32_t*& d_patches_val);
 
-    void grid(const std::vector<std::vector<uint32_t>>& fv);
+    void grid(const uint32_t* flat_fv, uint32_t num_faces);
 
 
     /**
@@ -255,9 +256,9 @@ class Patcher
                                              std::vector<uint32_t>& component,
                                              uint32_t               num_seeds);
 
-    void extract_ribbons(const std::vector<std::vector<uint32_t>>& fv,
-                         const std::vector<uint32_t>&              ff_offset,
-                         const std::vector<uint32_t>&              ff_values);
+    void extract_ribbons(const uint32_t* flat_fv, uint32_t num_faces,
+                         const std::vector<uint32_t>& ff_offset,
+                         const std::vector<uint32_t>& ff_values);
 
     uint32_t construct_patches_compressed_format(uint32_t* d_face_patch,
                                                  void*  d_cub_temp_storage_scan,
@@ -291,9 +292,9 @@ class Patcher
     void metis_kway(const std::vector<uint32_t>& ff_offset,
                     const std::vector<uint32_t>& ff_values);
 
-    void calc_edge_cut(const std::vector<std::vector<uint32_t>>& fv,
-                       const std::vector<uint32_t>&              ff_offset,
-                       const std::vector<uint32_t>&              ff_values);
+    void calc_edge_cut(const uint32_t* flat_fv, uint32_t num_faces,
+                       const std::vector<uint32_t>& ff_offset,
+                       const std::vector<uint32_t>& ff_values);
 
     uint32_t m_patch_size, m_num_patches, m_num_vertices, m_num_edges,
         m_num_faces, m_num_seeds, m_max_num_patches, m_num_components,

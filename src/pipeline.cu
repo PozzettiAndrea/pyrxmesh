@@ -243,12 +243,17 @@ __global__ static void parse_lines_kernel(
         vert_data[idx * 3 + 1] = parse_float_gpu(data, end, pos);
         vert_data[idx * 3 + 2] = parse_float_gpu(data, end, pos);
     } else if (data[pos] == 'f' && pos + 1 < end && data[pos + 1] == ' ') {
-        // Face line: "f v1 v2 v3" or "f v1/vt1/vn1 v2/vt2/vn2 v3/vt3/vn3"
+        // Face line: "f v1 v2 v3" (triangles only)
         line_type[idx] = 2;
         pos += 2; // skip "f "
         face_data[idx * 3 + 0] = parse_int_gpu(data, end, pos) - 1; // OBJ is 1-indexed
         face_data[idx * 3 + 1] = parse_int_gpu(data, end, pos) - 1;
         face_data[idx * 3 + 2] = parse_int_gpu(data, end, pos) - 1;
+        // Check for 4th vertex (quad/polygon) — flag as type 3
+        while (pos < end && (data[pos] == ' ' || data[pos] == '\t')) pos++;
+        if (pos < end && data[pos] >= '0' && data[pos] <= '9') {
+            line_type[idx] = 3;  // non-triangle face detected
+        }
     } else {
         line_type[idx] = 0; // vt, vn, comments, etc — skip
     }
@@ -343,10 +348,19 @@ MeshResult pipeline_load_obj(const std::string& path)
     CUDA_ERROR(cudaMemcpy(h_line_type.data(), d_line_type,
                           num_lines * sizeof(int), cudaMemcpyDeviceToHost));
 
-    int num_verts = 0, num_faces = 0;
+    int num_verts = 0, num_faces = 0, num_non_tri = 0;
     for (int i = 0; i < num_lines; ++i) {
         if (h_line_type[i] == 1) num_verts++;
         else if (h_line_type[i] == 2) num_faces++;
+        else if (h_line_type[i] == 3) num_non_tri++;
+    }
+    if (num_non_tri > 0) {
+        throw std::runtime_error(
+            "OBJ contains " + std::to_string(num_non_tri) +
+            " non-triangle faces (quads/polygons). "
+            "pyrxmesh only supports triangle meshes. "
+            "Please triangulate your mesh first (e.g., in Blender: "
+            "Edit Mode → Face → Triangulate Faces, or meshio/trimesh).");
     }
 
     // Build index maps: for each vertex/face line, what's its output index?

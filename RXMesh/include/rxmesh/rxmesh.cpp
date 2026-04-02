@@ -361,7 +361,8 @@ void RXMesh::build(const std::vector<std::vector<uint32_t>>& fv,
             m_patcher = std::make_unique<patcher::Patcher>(m_patch_size,
                                                            ff_offset,
                                                            ff_values,
-                                                           fv,
+                                                           m_flat_faces.data(),
+                                                           m_num_faces,
                                                            m_sorted_edge_keys,
                                                            m_num_vertices,
                                                            m_num_edges,
@@ -373,7 +374,8 @@ void RXMesh::build(const std::vector<std::vector<uint32_t>>& fv,
         m_patcher = std::make_unique<patcher::Patcher>(m_patch_size,
                                                        ff_offset,
                                                        ff_values,
-                                                       fv,
+                                                       m_flat_faces.data(),
+                                                       m_num_faces,
                                                        m_sorted_edge_keys,
                                                        m_num_vertices,
                                                        m_num_edges,
@@ -804,12 +806,12 @@ void RXMesh::build(const std::vector<std::vector<uint32_t>>& fv,
                 (unsigned)m_h_patches_info[0].fe[0].id);
         fprintf(stderr, "[build] GPU K2 topology copied to host.\n");
     } else {
-        fprintf(stderr, "[build] starting topology loop (%u patches), fv.size=%zu, fv[0].size=%zu\n",
-                get_num_patches(), fv.size(), fv[0].size());
+        fprintf(stderr, "[build] starting topology loop (%u patches)\n",
+                get_num_patches());
         fflush(stderr);
         for (int p = 0; p < static_cast<int>(get_num_patches()); ++p) {
             fprintf(stderr, "[build] topo p=%d\n", p); fflush(stderr);
-            build_single_patch_topology(fv, p);
+            build_single_patch_topology(m_flat_faces.data(), p);
         }
         fprintf(stderr, "[build] topology loop done\n");
     }
@@ -1445,8 +1447,8 @@ void RXMesh::build_single_patch_ltog(
 }
 
 void RXMesh::build_single_patch_topology(
-    const std::vector<std::vector<uint32_t>>& fv,
-    const uint32_t                            patch_id)
+    const uint32_t* flat_fv,
+    const uint32_t  patch_id)
 {
     // patch start and end
     const uint32_t p_start =
@@ -1525,8 +1527,8 @@ void RXMesh::build_single_patch_topology(
         for (uint32_t v = 0; v < 3; ++v) {
 
 
-            const uint32_t global_v0 = fv[global_face_id][v];
-            const uint32_t global_v1 = fv[global_face_id][(v + 1) % 3];
+            const uint32_t global_v0 = flat_fv[global_face_id * 3 + v];
+            const uint32_t global_v1 = flat_fv[global_face_id * 3 + ((v + 1) % 3)];
 
             std::pair<uint32_t, uint32_t> edge_key =
                 detail::edge_key(global_v0, global_v1);

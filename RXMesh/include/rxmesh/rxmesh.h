@@ -548,8 +548,8 @@ class RXMesh
         const std::vector<uint32_t>&              patch_verts);
 
     void build_single_patch_topology(
-        const std::vector<std::vector<uint32_t>>& fv,
-        const uint32_t                            patch_id);
+        const uint32_t* flat_fv,
+        const uint32_t  patch_id);
 
     // get the max vertex/edge/face capacity i.e., the max number of
     // vertices/edges/faces allowed in a patch (for allocation purposes)

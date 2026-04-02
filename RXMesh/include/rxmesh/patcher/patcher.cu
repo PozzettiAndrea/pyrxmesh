@@ -53,6 +53,14 @@ Patcher::Patcher(uint32_t                                        patch_size,
       m_patching_time_ms(0.0)
 
 {
+    // Build flat face array for internal use
+    std::vector<uint32_t> flat_fv_vec(m_num_faces * 3);
+    for (uint32_t f = 0; f < m_num_faces; ++f) {
+        flat_fv_vec[f*3+0] = fv[f][0];
+        flat_fv_vec[f*3+1] = fv[f][1];
+        flat_fv_vec[f*3+2] = fv[f][2];
+    }
+    const uint32_t* flat_fv_ptr = flat_fv_vec.data();
 
     m_num_patches =
         m_num_faces / m_patch_size + ((m_num_faces % m_patch_size) ? 1 : 0);
@@ -112,7 +120,7 @@ Patcher::Patcher(uint32_t                                        patch_size,
     } else {
 
         if (false) {
-            grid(fv);
+            grid(flat_fv_ptr, m_num_faces);
         } else {
             if (use_metis) {
                 metis_kway(ff_offset, ff_values);
@@ -153,13 +161,13 @@ Patcher::Patcher(uint32_t                                        patch_size,
                           d_patches_val);
             }
         }
-        extract_ribbons(fv, ff_offset, ff_values);
+        extract_ribbons(flat_fv_ptr, m_num_faces, ff_offset, ff_values);
         // bfs(ff_offset, ff_values);
         assign_patch(fv, edges_map);
     }
 
 
-    calc_edge_cut(fv, ff_offset, ff_values);
+    calc_edge_cut(flat_fv_ptr, m_num_faces, ff_offset, ff_values);
 
     print_statistics();
 
@@ -178,17 +186,18 @@ Patcher::Patcher(uint32_t                                        patch_size,
     GPU_FREE(d_patches_val);
 }
 
-// Fast constructor: uses sorted edge keys (binary search) instead of edges_map
-Patcher::Patcher(uint32_t                                  patch_size,
-                 const std::vector<uint32_t>&              ff_offset,
-                 const std::vector<uint32_t>&              ff_values,
-                 const std::vector<std::vector<uint32_t>>& fv,
-                 const std::vector<uint64_t>&              sorted_edge_keys,
-                 const uint32_t                            num_vertices,
-                 const uint32_t                            num_edges,
-                 bool                                      use_metis)
+// Fast constructor: flat faces + sorted edge keys (no vector-of-vectors)
+Patcher::Patcher(uint32_t                     patch_size,
+                 const std::vector<uint32_t>& ff_offset,
+                 const std::vector<uint32_t>& ff_values,
+                 const uint32_t*              flat_fv,
+                 uint32_t                     num_faces,
+                 const std::vector<uint64_t>& sorted_edge_keys,
+                 uint32_t                     num_vertices,
+                 uint32_t                     num_edges,
+                 bool                         use_metis)
     : m_patch_size(patch_size), m_num_patches(0), m_num_vertices(num_vertices),
-      m_num_edges(num_edges), m_num_faces(fv.size()), m_num_seeds(0),
+      m_num_edges(num_edges), m_num_faces(num_faces), m_num_seeds(0),
       m_max_num_patches(0), m_num_components(0), m_num_lloyd_run(0),
       m_patching_time_ms(0.0)
 {
@@ -217,7 +226,7 @@ Patcher::Patcher(uint32_t                                  patch_size,
             d_cub_temp_storage_scan, d_cub_temp_storage_max,
             cub_scan_bytes, cub_max_bytes, d_seeds, d_new_num_patches,
             d_max_patch_size, d_patches_offset, d_patches_size, d_patches_val);
-        assign_patch_fast(fv, sorted_edge_keys);
+        assign_patch_fast(flat_fv, num_faces, sorted_edge_keys);
     } else {
         if (use_metis) {
             metis_kway(ff_offset, ff_values);
@@ -233,11 +242,11 @@ Patcher::Patcher(uint32_t                                  patch_size,
                 cub_scan_bytes, cub_max_bytes, d_seeds, d_new_num_patches,
                 d_max_patch_size, d_patches_offset, d_patches_size, d_patches_val);
         }
-        extract_ribbons(fv, ff_offset, ff_values);
-        assign_patch_fast(fv, sorted_edge_keys);
+        extract_ribbons(flat_fv, num_faces, ff_offset, ff_values);
+        assign_patch_fast(flat_fv, num_faces, sorted_edge_keys);
     }
 
-    calc_edge_cut(fv, ff_offset, ff_values);
+    calc_edge_cut(flat_fv, num_faces, ff_offset, ff_values);
     print_statistics();
 
     GPU_FREE(d_face_patch); GPU_FREE(d_queue); GPU_FREE(d_queue_ptr);
@@ -247,7 +256,7 @@ Patcher::Patcher(uint32_t                                  patch_size,
     GPU_FREE(d_patches_offset); GPU_FREE(d_patches_size); GPU_FREE(d_patches_val);
 }
 
-void Patcher::grid(const std::vector<std::vector<uint32_t>>& fv)
+void Patcher::grid(const uint32_t* flat_fv, uint32_t num_faces_in)
 {
     // this only work if the input is a mesh coming from create_plane()
     // where are laid out sequentially and so we can just group them using
@@ -281,9 +290,9 @@ void Patcher::grid(const std::vector<std::vector<uint32_t>>& fv)
         // for (uint32_t v = 0; v < fv[f].size(); ++v) {
         //     minn = std::min(fv[f][v], minn);
         // }
-        uint32_t id0 = calc_id(fv[f][0]);
-        uint32_t id1 = calc_id(fv[f][1]);
-        uint32_t id2 = calc_id(fv[f][2]);
+        uint32_t id0 = calc_id(flat_fv[f * 3 + 0]);
+        uint32_t id1 = calc_id(flat_fv[f * 3 + 1]);
+        uint32_t id2 = calc_id(flat_fv[f * 3 + 2]);
 
         m_face_patch[f] = std::max(id0, std::max(id1, id2));
     }
@@ -417,13 +426,10 @@ void Patcher::allocate_device_memory(const std::vector<uint32_t>& seeds,
     CUDA_ERROR(cudaMalloc((void**)&d_cub_temp_storage_max, cub_max_bytes));
 }
 
-void Patcher::calc_edge_cut(const std::vector<std::vector<uint32_t>>& fv,
-                            const std::vector<uint32_t>&              ff_offset,
-                            const std::vector<uint32_t>&              ff_values)
+void Patcher::calc_edge_cut(const uint32_t* flat_fv, uint32_t num_faces_in,
+                            const std::vector<uint32_t>& ff_offset,
+                            const std::vector<uint32_t>& ff_values)
 {
-    // given a graph where nodes represents faces in the mesh and two nodes
-    // are connected in this graph if two faces share an edge, we calculate
-    // the edge cut fo such a graph
     uint32_t face_edge_cut = 0;
     for (uint32_t f = 0; f < m_num_faces; ++f) {
         for (uint32_t i = ff_offset[f]; i < ff_offset[f + 1]; ++i) {
@@ -444,10 +450,10 @@ void Patcher::calc_edge_cut(const std::vector<std::vector<uint32_t>>& fv,
     uint32_t num_edges = 0;
 
     for (uint32_t f = 0; f < m_num_faces; ++f) {
-        for (uint32_t i = 0; i < fv[f].size(); ++i) {
+        for (uint32_t i = 0; i < 3; ++i) {
 
-            uint32_t v0 = fv[f][i];
-            uint32_t v1 = fv[f][(i + 1) % fv[f].size()];
+            uint32_t v0 = flat_fv[f * 3 + i];
+            uint32_t v1 = flat_fv[f * 3 + ((i + 1) % 3)];
 
             std::pair<uint32_t, uint32_t> edge = detail::edge_key(v0, v1);
 
@@ -707,18 +713,10 @@ void Patcher::bfs(const std::vector<uint32_t>& ff_offset,
     }
 }
 
-void Patcher::extract_ribbons(const std::vector<std::vector<uint32_t>>& fv,
+void Patcher::extract_ribbons(const uint32_t* flat_fv, uint32_t num_faces_in,
                               const std::vector<uint32_t>& ff_offset,
                               const std::vector<uint32_t>& ff_values)
 {
-    // Post process the patches by extracting the ribbons
-    // For patch P, we start first by identifying boundary faces; faces that has
-    // an edge on P's boundary. These faces are captured by querying the
-    // adjacent faces for each face in P. If any of these adjacent faces are not
-    // in the same patch, then this face is a boundary face. From these boundary
-    // faces we can extract boundary vertices. We also now know which patch is
-    // neighbor to P. Then we can use the boundary vertices to find the faces
-    // that are incident to these vertices on the neighbor patches
     std::vector<uint32_t> frontier;
     frontier.reserve(m_num_faces);
 
@@ -732,8 +730,8 @@ void Patcher::extract_ribbons(const std::vector<std::vector<uint32_t>>& fv,
         vertex_incident_faces[i].clear();
     }
     for (uint32_t face = 0; face < m_num_faces; ++face) {
-        for (uint32_t v = 0; v < fv[face].size(); ++v) {
-            vertex_incident_faces[fv[face][v]].push_back(face);
+        for (uint32_t v = 0; v < 3; ++v) {
+            vertex_incident_faces[flat_fv[face * 3 + v]].push_back(face);
         }
     }
 
@@ -745,10 +743,6 @@ void Patcher::extract_ribbons(const std::vector<std::vector<uint32_t>>& fv,
         bd_vertices.clear();
         frontier.clear();
 
-
-        //***** Pass One
-        // 1) build a frontier of the boundary faces by loop over all faces and
-        // add those that has an edge on the patch boundary
         for (uint32_t fb = p_start; fb < p_end; ++fb) {
             uint32_t face = m_patches_val[fb];
 
@@ -760,29 +754,22 @@ void Patcher::extract_ribbons(const std::vector<std::vector<uint32_t>>& fv,
                 uint32_t n       = ff_values[g];
                 uint32_t n_patch = get_face_patch_id(n);
 
-                // n is boundary face if its patch is not the current patch we
-                // are processing
                 if (n_patch != cur_p) {
                     if (!added) {
                         frontier.push_back(face);
                         added = true;
                     }
 
-                    // find/add the boundary vertices; these are the vertices
-                    // that are shared between face and n
-
-                    // add the common vertices in fv[face] and fv[n]
-                    for (uint32_t i = 0; i < fv[face].size(); ++i) {
-                        auto it_vf =
-                            std::find(fv[n].begin(), fv[n].end(), fv[face][i]);
-                        if (it_vf != fv[n].end()) {
-                            bd_vertices.push_back(fv[face][i]);
+                    // find common vertices between face and n
+                    for (uint32_t i = 0; i < 3; ++i) {
+                        uint32_t vi = flat_fv[face * 3 + i];
+                        for (uint32_t j = 0; j < 3; ++j) {
+                            if (flat_fv[n * 3 + j] == vi) {
+                                bd_vertices.push_back(vi);
+                                break;
+                            }
                         }
                     }
-
-                    // we don't break out of this loop because we want to get
-                    // all the boundary vertices
-                    // break;
                 }
             }
         }
@@ -878,18 +865,17 @@ void Patcher::assign_patch(
 }
 
 void Patcher::assign_patch_fast(
-    const std::vector<std::vector<uint32_t>>& fv,
+    const uint32_t* flat_fv, uint32_t num_faces,
     const std::vector<uint64_t>& sorted_edge_keys)
 {
-    // Fast: binary search on sorted packed keys (no unordered_map needed)
     for (uint32_t cur_p = 0; cur_p < m_num_patches; ++cur_p) {
         uint32_t p_start = (cur_p == 0) ? 0 : m_patches_offset[cur_p - 1];
         uint32_t p_end   = m_patches_offset[cur_p];
         for (uint32_t f = p_start; f < p_end; ++f) {
             uint32_t face = m_patches_val[f];
-            uint32_t v1 = fv[face].back();
-            for (uint32_t v = 0; v < fv[face].size(); ++v) {
-                uint32_t v0 = fv[face][v];
+            uint32_t v1 = flat_fv[face * 3 + 2];  // last vertex
+            for (uint32_t v = 0; v < 3; ++v) {
+                uint32_t v0 = flat_fv[face * 3 + v];
                 uint32_t edge_id = find_edge_in_sorted(sorted_edge_keys, v0, v1);
                 if (m_vertex_patch[v0] == INVALID32) m_vertex_patch[v0] = cur_p;
                 if (edge_id != INVALID32 && m_edge_patch[edge_id] == INVALID32)
