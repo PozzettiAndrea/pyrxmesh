@@ -996,20 +996,18 @@ void RXMesh::build_supporting_structures(
     CUDA_ERROR(cudaMemcpy(m_sorted_edge_keys.data(), m_d_edge_key,
                           m_num_edges * sizeof(uint64_t), cudaMemcpyDeviceToHost));
 
-    // ev vector-of-vectors: still needed by CPU fallback topology build
-    ev.resize(m_num_edges);
-    for (uint32_t e = 0; e < m_num_edges; ++e)
-        ev[e] = {m_ev_flat[2 * e], m_ev_flat[2 * e + 1]};
-
-    // ef vector-of-vectors: still needed by calc_input_statistics
-    ef.resize(m_num_edges);
-    for (uint32_t e = 0; e < m_num_edges; ++e) {
-        if (m_ef_f1[e] == UINT32_MAX) ef[e] = {m_ef_f0[e]};
-        else ef[e] = {m_ef_f0[e], m_ef_f1[e]};
+    // Skip ev/ef vector-of-vectors construction (saves ~3s on large meshes).
+    // CPU fallback ltog path and calc_input_statistics use flat arrays instead.
+    // Only build if Approach A is unavailable (m_d_edge_key == nullptr).
+    if (m_d_edge_key == nullptr) {
+        ev.resize(m_num_edges);
+        ef.resize(m_num_edges);
+        for (uint32_t e = 0; e < m_num_edges; ++e) {
+            ev[e] = {m_ev_flat[2 * e], m_ev_flat[2 * e + 1]};
+            if (m_ef_f1[e] == UINT32_MAX) ef[e] = {m_ef_f0[e]};
+            else ef[e] = {m_ef_f0[e], m_ef_f1[e]};
+        }
     }
-
-    // m_edges_map: NO LONGER NEEDED — Patcher uses sorted_edge_keys,
-    // get_edge_id uses binary search on m_sorted_edge_keys.
 
     // Use GPU-computed face-face adjacency directly
     ff_offset = std::move(gpu.ff_offset);
@@ -1257,50 +1255,44 @@ void RXMesh::build_supporting_structures_original(
 void RXMesh::calc_input_statistics(const std::vector<std::vector<uint32_t>>& fv,
                                    const std::vector<std::vector<uint32_t>>& ef)
 {
-    if (m_num_vertices == 0 || m_num_faces == 0 || m_num_edges == 0 ||
-        fv.size() == 0 || ef.size() == 0) {
+    if (m_num_vertices == 0 || m_num_faces == 0 || m_num_edges == 0) {
         RXMESH_ERROR(
             "RXMesh::calc_statistics() input mesh has not been initialized");
         exit(EXIT_FAILURE);
     }
 
-    // calc max valence, max ef, is input closed, and is input manifold
+    // Use flat arrays (m_ev_flat, m_ef_f0, m_ef_f1) instead of m_edges_map + ef
     m_input_max_edge_incident_faces = 0;
     m_input_max_valence             = 0;
     std::vector<uint32_t> vv_count(m_num_vertices, 0);
     m_is_input_closed        = true;
     m_is_input_edge_manifold = true;
-    for (const auto& e_iter : m_edges_map) {
-        uint32_t v0 = e_iter.first.first;
-        uint32_t v1 = e_iter.first.second;
 
+    for (uint32_t e = 0; e < m_num_edges; ++e) {
+        uint32_t v0 = m_ev_flat[2 * e];
+        uint32_t v1 = m_ev_flat[2 * e + 1];
         vv_count[v0]++;
         vv_count[v1]++;
-
         m_input_max_valence = std::max(m_input_max_valence, vv_count[v0]);
         m_input_max_valence = std::max(m_input_max_valence, vv_count[v1]);
 
-        uint32_t edge_id                = e_iter.second;
+        uint32_t ef_size = (m_ef_f1[e] == UINT32_MAX) ? 1 : 2;
         m_input_max_edge_incident_faces = std::max(
-            m_input_max_edge_incident_faces, uint32_t(ef[edge_id].size()));
-
-        if (ef[edge_id].size() < 2) {
-            m_is_input_closed = false;
-        }
-        if (ef[edge_id].size() > 2) {
-            m_is_input_edge_manifold = false;
-        }
+            m_input_max_edge_incident_faces, ef_size);
+        if (ef_size < 2) m_is_input_closed = false;
+        if (ef_size > 2) m_is_input_edge_manifold = false;
     }
 
     // calc max ff
     m_input_max_face_adjacent_faces = 0;
-    for (uint32_t f = 0; f < fv.size(); ++f) {
+    for (uint32_t f = 0; f < m_num_faces; ++f) {
         uint32_t ff_count = 0;
-        for (uint32_t v = 0; v < fv[f].size(); ++v) {
-            uint32_t v0       = fv[f][v];
-            uint32_t v1       = fv[f][(v + 1) % 3];
+        for (uint32_t v = 0; v < 3; ++v) {
+            uint32_t v0 = fv[f][v];
+            uint32_t v1 = fv[f][(v + 1) % 3];
             uint32_t edge_num = get_edge_id(v0, v1);
-            ff_count += ef[edge_num].size() - 1;
+            uint32_t ef_sz = (m_ef_f1[edge_num] == UINT32_MAX) ? 1 : 2;
+            ff_count += ef_sz - 1;
         }
         m_input_max_face_adjacent_faces =
             std::max(ff_count, m_input_max_face_adjacent_faces);
