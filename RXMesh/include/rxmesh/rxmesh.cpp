@@ -274,27 +274,38 @@ RXMesh::~RXMesh()
     // m_h_patches_info and then free the memory these pointers are pointing to.
     // Finally, we free the parent pointer memory
 
-    CUDA_ERROR(cudaMemcpy(m_h_patches_info,
-                          m_d_patches_info,
-                          get_num_patches() * sizeof(PatchInfo),
-                          cudaMemcpyDeviceToHost));
-
-    for (uint32_t p = 0; p < get_num_patches(); ++p) {
-        GPU_FREE(m_h_patches_info[p].active_mask_v);
-        GPU_FREE(m_h_patches_info[p].active_mask_e);
-        GPU_FREE(m_h_patches_info[p].active_mask_f);
-        GPU_FREE(m_h_patches_info[p].owned_mask_v);
-        GPU_FREE(m_h_patches_info[p].owned_mask_e);
-        GPU_FREE(m_h_patches_info[p].owned_mask_f);
-        GPU_FREE(m_h_patches_info[p].ev);
-        GPU_FREE(m_h_patches_info[p].fe);
-        GPU_FREE(m_h_patches_info[p].num_faces);
-        GPU_FREE(m_h_patches_info[p].dirty);
-        m_h_patches_info[p].lp_v.free();
-        m_h_patches_info[p].lp_e.free();
-        m_h_patches_info[p].lp_f.free();
-        m_h_patches_info[p].patch_stash.free();
-        m_h_patches_info[p].lock.free();
+    if (m_bulk_device_alloc) {
+        // Free bulk device arrays (not per-patch)
+        for (auto ptr : m_bulk_device_ptrs)
+            GPU_FREE(ptr);
+        // Free PatchLock per patch (allocated individually)
+        CUDA_ERROR(cudaMemcpy(m_h_patches_info, m_d_patches_info,
+                              get_num_patches() * sizeof(PatchInfo),
+                              cudaMemcpyDeviceToHost));
+        for (uint32_t p = 0; p < get_num_patches(); ++p)
+            m_h_patches_info[p].lock.free();
+    } else {
+        CUDA_ERROR(cudaMemcpy(m_h_patches_info,
+                              m_d_patches_info,
+                              get_num_patches() * sizeof(PatchInfo),
+                              cudaMemcpyDeviceToHost));
+        for (uint32_t p = 0; p < get_num_patches(); ++p) {
+            GPU_FREE(m_h_patches_info[p].active_mask_v);
+            GPU_FREE(m_h_patches_info[p].active_mask_e);
+            GPU_FREE(m_h_patches_info[p].active_mask_f);
+            GPU_FREE(m_h_patches_info[p].owned_mask_v);
+            GPU_FREE(m_h_patches_info[p].owned_mask_e);
+            GPU_FREE(m_h_patches_info[p].owned_mask_f);
+            GPU_FREE(m_h_patches_info[p].ev);
+            GPU_FREE(m_h_patches_info[p].fe);
+            GPU_FREE(m_h_patches_info[p].num_faces);
+            GPU_FREE(m_h_patches_info[p].dirty);
+            m_h_patches_info[p].lp_v.free();
+            m_h_patches_info[p].lp_e.free();
+            m_h_patches_info[p].lp_f.free();
+            m_h_patches_info[p].patch_stash.free();
+            m_h_patches_info[p].lock.free();
+        }
     }
     GPU_FREE(m_d_patches_info);
     free(m_h_patches_info);
@@ -1710,41 +1721,333 @@ void RXMesh::populate_patch_stash()
 
 void RXMesh::build_device()
 {
-    m_timers.start("cudaMalloc");
-    CUDA_ERROR(cudaMalloc((void**)&m_d_patches_info,
-                          get_max_num_patches() * sizeof(PatchInfo)));
-    m_timers.stop("cudaMalloc");
+    using clk = std::chrono::high_resolution_clock;
+    auto ms_since = [](auto t0) {
+        return std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+    };
+    auto t_total = clk::now();
 
-    m_topo_memory_mega_bytes +=
-        BYTES_TO_MEGABYTES(get_max_num_patches() * sizeof(PatchInfo));
+    const uint32_t P = get_num_patches();
+    const uint32_t P_max = get_max_num_patches();
+    const uint16_t v_cap = get_per_patch_max_vertex_capacity();
+    const uint16_t e_cap = get_per_patch_max_edge_capacity();
+    const uint16_t f_cap = get_per_patch_max_face_capacity();
 
+    // ── Bulk GPU allocation (replaces 17*P individual cudaMalloc calls) ──
+    auto tp = clk::now();
+    CUDA_ERROR(cudaMalloc((void**)&m_d_patches_info, P_max * sizeof(PatchInfo)));
 
-    // #pragma omp parallel for
-    for (int p = 0; p < static_cast<int>(get_num_patches()); ++p) {
+    // Per-patch buffer sizes (uniform stride)
+    const size_t ev_bytes_per    = e_cap * 2 * sizeof(LocalVertexT);
+    const size_t fe_bytes_per    = f_cap * 3 * sizeof(LocalEdgeT);
+    const size_t mask_v_bytes    = detail::mask_num_bytes(v_cap);
+    const size_t mask_e_bytes    = detail::mask_num_bytes(e_cap);
+    const size_t mask_f_bytes    = detail::mask_num_bytes(f_cap);
+    const size_t counts_bytes    = 6 * sizeof(uint16_t);  // 3 counts + padding
+    const size_t stash_bytes     = PatchStash::stash_size * sizeof(uint32_t);
+    const size_t dirty_bytes     = sizeof(int);
 
-        const uint16_t p_num_vertices =
-            static_cast<uint16_t>(m_h_patches_ltog_v[p].size());
-        const uint16_t p_num_edges =
-            static_cast<uint16_t>(m_h_patches_ltog_e[p].size());
-        const uint16_t p_num_faces =
-            static_cast<uint16_t>(m_h_patches_ltog_f[p].size());
+    // LPHashTable sizes
+    const uint16_t lp_cap_v = max_lp_hashtable_capacity<LocalVertexT>();
+    const uint16_t lp_cap_e = max_lp_hashtable_capacity<LocalEdgeT>();
+    const uint16_t lp_cap_f = max_lp_hashtable_capacity<LocalFaceT>();
+    // LPHashTable uses prime capacity — get the actual sizes
+    auto prime = [](uint16_t c) -> uint16_t {
+        // Replicate find_next_prime_number logic
+        c = std::max(c, uint16_t(2));
+        // Simple: just use c+1 as upper bound (LPHashTable will find actual prime)
+        return c;  // approximate — actual prime is ≥ c
+    };
+    // Build dummy tables to get exact sizes
+    LPHashTable dummy_v(lp_cap_v, false), dummy_e(lp_cap_e, false), dummy_f(lp_cap_f, false);
+    const size_t ht_v_bytes   = dummy_v.num_bytes();
+    const size_t ht_e_bytes   = dummy_e.num_bytes();
+    const size_t ht_f_bytes   = dummy_f.num_bytes();
+    const size_t ht_stash_bytes = LPHashTable::stash_size * sizeof(LPPair);
+    free(dummy_v.m_table); free(dummy_v.m_stash);
+    free(dummy_e.m_table); free(dummy_e.m_stash);
+    free(dummy_f.m_table); free(dummy_f.m_stash);
 
-        build_device_single_patch(p,
-                                  p_num_vertices,
-                                  p_num_edges,
-                                  p_num_faces,
-                                  get_per_patch_max_vertex_capacity(),
-                                  get_per_patch_max_edge_capacity(),
-                                  get_per_patch_max_face_capacity(),
-                                  m_h_num_owned_v[p],
-                                  m_h_num_owned_e[p],
-                                  m_h_num_owned_f[p],
-                                  m_h_patches_ltog_v[p],
-                                  m_h_patches_ltog_e[p],
-                                  m_h_patches_ltog_f[p],
-                                  m_h_patches_info[p],
-                                  m_d_patches_info[p]);
+    // Bulk allocate on device
+    uint8_t *d_ev_bulk, *d_fe_bulk;
+    uint8_t *d_mask_av_bulk, *d_mask_ae_bulk, *d_mask_af_bulk;
+    uint8_t *d_mask_ov_bulk, *d_mask_oe_bulk, *d_mask_of_bulk;
+    uint8_t *d_counts_bulk, *d_stash_bulk, *d_dirty_bulk;
+    uint8_t *d_ht_v_bulk, *d_ht_e_bulk, *d_ht_f_bulk;
+    uint8_t *d_ht_stash_v_bulk, *d_ht_stash_e_bulk, *d_ht_stash_f_bulk;
+
+    CUDA_ERROR(cudaMalloc(&d_ev_bulk, P_max * ev_bytes_per));
+    CUDA_ERROR(cudaMalloc(&d_fe_bulk, P_max * fe_bytes_per));
+    CUDA_ERROR(cudaMalloc(&d_mask_av_bulk, P_max * mask_v_bytes));
+    CUDA_ERROR(cudaMalloc(&d_mask_ae_bulk, P_max * mask_e_bytes));
+    CUDA_ERROR(cudaMalloc(&d_mask_af_bulk, P_max * mask_f_bytes));
+    CUDA_ERROR(cudaMalloc(&d_mask_ov_bulk, P_max * mask_v_bytes));
+    CUDA_ERROR(cudaMalloc(&d_mask_oe_bulk, P_max * mask_e_bytes));
+    CUDA_ERROR(cudaMalloc(&d_mask_of_bulk, P_max * mask_f_bytes));
+    CUDA_ERROR(cudaMalloc(&d_counts_bulk, P_max * counts_bytes));
+    CUDA_ERROR(cudaMalloc(&d_stash_bulk, P_max * stash_bytes));
+    CUDA_ERROR(cudaMalloc(&d_dirty_bulk, P_max * dirty_bytes));
+    CUDA_ERROR(cudaMalloc(&d_ht_v_bulk, P_max * ht_v_bytes));
+    CUDA_ERROR(cudaMalloc(&d_ht_e_bulk, P_max * ht_e_bytes));
+    CUDA_ERROR(cudaMalloc(&d_ht_f_bulk, P_max * ht_f_bytes));
+    CUDA_ERROR(cudaMalloc(&d_ht_stash_v_bulk, P_max * ht_stash_bytes));
+    CUDA_ERROR(cudaMalloc(&d_ht_stash_e_bulk, P_max * ht_stash_bytes));
+    CUDA_ERROR(cudaMalloc(&d_ht_stash_f_bulk, P_max * ht_stash_bytes));
+    fprintf(stderr, "[build_device] bulk alloc: %.0fms (17 cudaMalloc vs %u×17)\n",
+            ms_since(tp), P);
+
+    // ── Build host staging buffers + PatchInfo structs ───────────────────
+    tp = clk::now();
+    std::vector<uint8_t> h_ev_staging(P * ev_bytes_per, 0);
+    std::vector<uint8_t> h_fe_staging(P * fe_bytes_per, 0);
+    std::vector<uint8_t> h_mask_av(P * mask_v_bytes, 0);
+    std::vector<uint8_t> h_mask_ae(P * mask_e_bytes, 0);
+    std::vector<uint8_t> h_mask_af(P * mask_f_bytes, 0);
+    std::vector<uint8_t> h_mask_ov(P * mask_v_bytes, 0);
+    std::vector<uint8_t> h_mask_oe(P * mask_e_bytes, 0);
+    std::vector<uint8_t> h_mask_of(P * mask_f_bytes, 0);
+    std::vector<uint8_t> h_counts_staging(P * counts_bytes, 0);
+    std::vector<uint8_t> h_stash_staging(P * stash_bytes, 0xFF);
+    std::vector<uint8_t> h_dirty_staging(P * dirty_bytes, 0);
+    std::vector<uint8_t> h_ht_v_staging(P * ht_v_bytes);
+    std::vector<uint8_t> h_ht_e_staging(P * ht_e_bytes);
+    std::vector<uint8_t> h_ht_f_staging(P * ht_f_bytes);
+    std::vector<uint8_t> h_ht_stash_v(P * ht_stash_bytes);
+    std::vector<uint8_t> h_ht_stash_e(P * ht_stash_bytes);
+    std::vector<uint8_t> h_ht_stash_f(P * ht_stash_bytes);
+
+    // Use GPU patch arrays when available, CPU patcher arrays otherwise
+    const auto& vp = m_gpu_vertex_patch.empty()
+        ? m_patcher->get_vertex_patch() : m_gpu_vertex_patch;
+    const auto& ep = m_gpu_edge_patch.empty()
+        ? m_patcher->get_edge_patch() : m_gpu_edge_patch;
+    const auto& fp = m_patcher->get_face_patch();
+
+    for (uint32_t p = 0; p < P; ++p) {
+        uint16_t nv = m_h_patches_ltog_v[p].size();
+        uint16_t ne = m_h_patches_ltog_e[p].size();
+        uint16_t nf = m_h_patches_ltog_f[p].size();
+        uint16_t owned_v = m_h_num_owned_v[p];
+        uint16_t owned_e = m_h_num_owned_e[p];
+        uint16_t owned_f = m_h_num_owned_f[p];
+
+        // Counts
+        uint16_t* counts = (uint16_t*)(h_counts_staging.data() + p * counts_bytes);
+        counts[0] = nf; counts[1] = ne; counts[2] = nv;
+
+        // EV topology
+        memcpy(h_ev_staging.data() + p * ev_bytes_per,
+               m_h_patches_info[p].ev, ne * 2 * sizeof(LocalVertexT));
+
+        // FE topology
+        memcpy(h_fe_staging.data() + p * fe_bytes_per,
+               m_h_patches_info[p].fe, nf * 3 * sizeof(LocalEdgeT));
+
+        // Bitmasks (active: bits 0..n-1 set, owned: bits 0..owned-1 set)
+        auto fill_mask = [](uint8_t* buf, uint16_t cap, uint16_t n) {
+            uint32_t* mask = (uint32_t*)buf;
+            for (uint16_t i = 0; i < cap; ++i) {
+                if (i < n) detail::bitmask_set_bit(i, mask);
+                else detail::bitmask_clear_bit(i, mask);
+            }
+        };
+        fill_mask(h_mask_av.data() + p * mask_v_bytes, v_cap, nv);
+        fill_mask(h_mask_ae.data() + p * mask_e_bytes, e_cap, ne);
+        fill_mask(h_mask_af.data() + p * mask_f_bytes, f_cap, nf);
+        fill_mask(h_mask_ov.data() + p * mask_v_bytes, v_cap, owned_v);
+        fill_mask(h_mask_oe.data() + p * mask_e_bytes, e_cap, owned_e);
+        fill_mask(h_mask_of.data() + p * mask_f_bytes, f_cap, owned_f);
+
+        // PatchStash
+        memcpy(h_stash_staging.data() + p * stash_bytes,
+               m_h_patches_info[p].patch_stash.m_stash, stash_bytes);
+
+        // LPHashTables: build on host, copy into staging
+        auto build_ht_batch = [&](const std::vector<std::vector<uint32_t>>& ltog,
+                                   const std::vector<uint32_t>& p_ltog,
+                                   const std::vector<uint32_t>& element_patch,
+                                   const std::vector<uint16_t>& num_owned,
+                                   uint16_t num_elems, uint16_t num_owned_elems,
+                                   uint16_t cap, PatchStash& stash,
+                                   uint8_t* ht_buf, size_t ht_bytes,
+                                   uint8_t* stash_buf, size_t stash_sz) {
+            LPHashTable h_ht(cap, false);
+            uint16_t num_not_owned = num_elems - num_owned_elems;
+            for (uint16_t i = 0; i < num_not_owned; ++i) {
+                uint16_t local_id = i + num_owned_elems;
+                uint32_t global_id = p_ltog[local_id];
+                uint32_t owner_patch = element_patch[global_id];
+                auto it = std::lower_bound(
+                    ltog[owner_patch].begin(),
+                    ltog[owner_patch].begin() + num_owned[owner_patch],
+                    global_id);
+                if (it != ltog[owner_patch].begin() + num_owned[owner_patch]) {
+                    uint16_t local_in_owner = it - ltog[owner_patch].begin();
+                    uint8_t owner_st = stash.find_patch_index(owner_patch);
+                    h_ht.insert(LPPair(local_id, local_in_owner, owner_st), nullptr, nullptr);
+                }
+            }
+            memcpy(ht_buf, h_ht.m_table, ht_bytes);
+            memcpy(stash_buf, h_ht.m_stash, stash_sz);
+            free(h_ht.m_table);
+            free(h_ht.m_stash);
+        };
+
+        build_ht_batch(m_h_patches_ltog_v, m_h_patches_ltog_v[p], vp, m_h_num_owned_v,
+                        nv, owned_v, lp_cap_v, m_h_patches_info[p].patch_stash,
+                        h_ht_v_staging.data() + p * ht_v_bytes, ht_v_bytes,
+                        h_ht_stash_v.data() + p * ht_stash_bytes, ht_stash_bytes);
+        build_ht_batch(m_h_patches_ltog_e, m_h_patches_ltog_e[p], ep, m_h_num_owned_e,
+                        ne, owned_e, lp_cap_e, m_h_patches_info[p].patch_stash,
+                        h_ht_e_staging.data() + p * ht_e_bytes, ht_e_bytes,
+                        h_ht_stash_e.data() + p * ht_stash_bytes, ht_stash_bytes);
+        build_ht_batch(m_h_patches_ltog_f, m_h_patches_ltog_f[p], fp, m_h_num_owned_f,
+                        nf, owned_f, lp_cap_f, m_h_patches_info[p].patch_stash,
+                        h_ht_f_staging.data() + p * ht_f_bytes, ht_f_bytes,
+                        h_ht_stash_f.data() + p * ht_stash_bytes, ht_stash_bytes);
+
+        // Host PatchInfo setup (ev/fe already set, realloc to capacity)
+        m_h_patches_info[p].ev = (LocalVertexT*)realloc(
+            m_h_patches_info[p].ev, ev_bytes_per);
+        m_h_patches_info[p].fe = (LocalEdgeT*)realloc(
+            m_h_patches_info[p].fe, fe_bytes_per);
+        m_h_patches_info[p].num_faces = (uint16_t*)malloc(3 * sizeof(uint16_t));
+        m_h_patches_info[p].num_faces[0] = nf;
+        m_h_patches_info[p].num_edges = m_h_patches_info[p].num_faces + 1;
+        m_h_patches_info[p].num_edges[0] = ne;
+        m_h_patches_info[p].num_vertices = m_h_patches_info[p].num_faces + 2;
+        m_h_patches_info[p].num_vertices[0] = nv;
+        m_h_patches_info[p].vertices_capacity = v_cap;
+        m_h_patches_info[p].edges_capacity = e_cap;
+        m_h_patches_info[p].faces_capacity = f_cap;
+        m_h_patches_info[p].patch_id = p;
+        m_h_patches_info[p].dirty = (int*)malloc(sizeof(int));
+        m_h_patches_info[p].dirty[0] = 0;
+        m_h_patches_info[p].child_id = INVALID32;
+        m_h_patches_info[p].should_slice = false;
+
+        // Host bitmasks
+        m_h_patches_info[p].active_mask_v = (uint32_t*)malloc(mask_v_bytes);
+        m_h_patches_info[p].active_mask_e = (uint32_t*)malloc(mask_e_bytes);
+        m_h_patches_info[p].active_mask_f = (uint32_t*)malloc(mask_f_bytes);
+        m_h_patches_info[p].owned_mask_v = (uint32_t*)malloc(mask_v_bytes);
+        m_h_patches_info[p].owned_mask_e = (uint32_t*)malloc(mask_e_bytes);
+        m_h_patches_info[p].owned_mask_f = (uint32_t*)malloc(mask_f_bytes);
+        memcpy(m_h_patches_info[p].active_mask_v, h_mask_av.data() + p * mask_v_bytes, mask_v_bytes);
+        memcpy(m_h_patches_info[p].active_mask_e, h_mask_ae.data() + p * mask_e_bytes, mask_e_bytes);
+        memcpy(m_h_patches_info[p].active_mask_f, h_mask_af.data() + p * mask_f_bytes, mask_f_bytes);
+        memcpy(m_h_patches_info[p].owned_mask_v, h_mask_ov.data() + p * mask_v_bytes, mask_v_bytes);
+        memcpy(m_h_patches_info[p].owned_mask_e, h_mask_oe.data() + p * mask_e_bytes, mask_e_bytes);
+        memcpy(m_h_patches_info[p].owned_mask_f, h_mask_of.data() + p * mask_f_bytes, mask_f_bytes);
+
+        // Host hash tables
+        m_h_patches_info[p].lp_v = LPHashTable(lp_cap_v, false);
+        m_h_patches_info[p].lp_e = LPHashTable(lp_cap_e, false);
+        m_h_patches_info[p].lp_f = LPHashTable(lp_cap_f, false);
+        memcpy(m_h_patches_info[p].lp_v.m_table, h_ht_v_staging.data() + p * ht_v_bytes, ht_v_bytes);
+        memcpy(m_h_patches_info[p].lp_v.m_stash, h_ht_stash_v.data() + p * ht_stash_bytes, ht_stash_bytes);
+        memcpy(m_h_patches_info[p].lp_e.m_table, h_ht_e_staging.data() + p * ht_e_bytes, ht_e_bytes);
+        memcpy(m_h_patches_info[p].lp_e.m_stash, h_ht_stash_e.data() + p * ht_stash_bytes, ht_stash_bytes);
+        memcpy(m_h_patches_info[p].lp_f.m_table, h_ht_f_staging.data() + p * ht_f_bytes, ht_f_bytes);
+        memcpy(m_h_patches_info[p].lp_f.m_stash, h_ht_stash_f.data() + p * ht_stash_bytes, ht_stash_bytes);
     }
+    fprintf(stderr, "[build_device] host staging: %.0fms\n", ms_since(tp));
+
+    // ── Bulk H2D copy (replaces ~15*P individual cudaMemcpy) ─────────────
+    tp = clk::now();
+    CUDA_ERROR(cudaMemcpy(d_ev_bulk, h_ev_staging.data(), P * ev_bytes_per, cudaMemcpyHostToDevice));
+    CUDA_ERROR(cudaMemcpy(d_fe_bulk, h_fe_staging.data(), P * fe_bytes_per, cudaMemcpyHostToDevice));
+    CUDA_ERROR(cudaMemcpy(d_mask_av_bulk, h_mask_av.data(), P * mask_v_bytes, cudaMemcpyHostToDevice));
+    CUDA_ERROR(cudaMemcpy(d_mask_ae_bulk, h_mask_ae.data(), P * mask_e_bytes, cudaMemcpyHostToDevice));
+    CUDA_ERROR(cudaMemcpy(d_mask_af_bulk, h_mask_af.data(), P * mask_f_bytes, cudaMemcpyHostToDevice));
+    CUDA_ERROR(cudaMemcpy(d_mask_ov_bulk, h_mask_ov.data(), P * mask_v_bytes, cudaMemcpyHostToDevice));
+    CUDA_ERROR(cudaMemcpy(d_mask_oe_bulk, h_mask_oe.data(), P * mask_e_bytes, cudaMemcpyHostToDevice));
+    CUDA_ERROR(cudaMemcpy(d_mask_of_bulk, h_mask_of.data(), P * mask_f_bytes, cudaMemcpyHostToDevice));
+    CUDA_ERROR(cudaMemcpy(d_counts_bulk, h_counts_staging.data(), P * counts_bytes, cudaMemcpyHostToDevice));
+    CUDA_ERROR(cudaMemcpy(d_stash_bulk, h_stash_staging.data(), P * stash_bytes, cudaMemcpyHostToDevice));
+    CUDA_ERROR(cudaMemcpy(d_dirty_bulk, h_dirty_staging.data(), P * dirty_bytes, cudaMemcpyHostToDevice));
+    CUDA_ERROR(cudaMemcpy(d_ht_v_bulk, h_ht_v_staging.data(), P * ht_v_bytes, cudaMemcpyHostToDevice));
+    CUDA_ERROR(cudaMemcpy(d_ht_e_bulk, h_ht_e_staging.data(), P * ht_e_bytes, cudaMemcpyHostToDevice));
+    CUDA_ERROR(cudaMemcpy(d_ht_f_bulk, h_ht_f_staging.data(), P * ht_f_bytes, cudaMemcpyHostToDevice));
+    CUDA_ERROR(cudaMemcpy(d_ht_stash_v_bulk, h_ht_stash_v.data(), P * ht_stash_bytes, cudaMemcpyHostToDevice));
+    CUDA_ERROR(cudaMemcpy(d_ht_stash_e_bulk, h_ht_stash_e.data(), P * ht_stash_bytes, cudaMemcpyHostToDevice));
+    CUDA_ERROR(cudaMemcpy(d_ht_stash_f_bulk, h_ht_stash_f.data(), P * ht_stash_bytes, cudaMemcpyHostToDevice));
+    fprintf(stderr, "[build_device] H2D copy: %.0fms\n", ms_since(tp));
+
+    // ── Assemble PatchInfo structs with pointers into bulk arrays ─────────
+    tp = clk::now();
+    std::vector<PatchInfo> h_d_patch_infos(P_max);
+    for (uint32_t p = 0; p < P; ++p) {
+        PatchInfo& di = h_d_patch_infos[p];
+        di = PatchInfo();  // default init
+
+        // Counts
+        uint16_t* d_counts_p = (uint16_t*)(d_counts_bulk + p * counts_bytes);
+        di.num_faces = d_counts_p;
+        di.num_edges = d_counts_p + 1;
+        di.num_vertices = d_counts_p + 2;
+        di.vertices_capacity = v_cap;
+        di.edges_capacity = e_cap;
+        di.faces_capacity = f_cap;
+        di.patch_id = p;
+        di.color = m_h_patches_info[p].color;
+
+        // Topology
+        di.ev = (LocalVertexT*)(d_ev_bulk + p * ev_bytes_per);
+        di.fe = (LocalEdgeT*)(d_fe_bulk + p * fe_bytes_per);
+
+        // Bitmasks
+        di.active_mask_v = (uint32_t*)(d_mask_av_bulk + p * mask_v_bytes);
+        di.active_mask_e = (uint32_t*)(d_mask_ae_bulk + p * mask_e_bytes);
+        di.active_mask_f = (uint32_t*)(d_mask_af_bulk + p * mask_f_bytes);
+        di.owned_mask_v = (uint32_t*)(d_mask_ov_bulk + p * mask_v_bytes);
+        di.owned_mask_e = (uint32_t*)(d_mask_oe_bulk + p * mask_e_bytes);
+        di.owned_mask_f = (uint32_t*)(d_mask_of_bulk + p * mask_f_bytes);
+
+        // PatchStash
+        di.patch_stash = PatchStash();
+        di.patch_stash.m_stash = (uint32_t*)(d_stash_bulk + p * stash_bytes);
+
+        // LPHashTables (point into bulk device arrays)
+        di.lp_v = m_h_patches_info[p].lp_v;  // copy capacity, hash funcs
+        di.lp_v.m_table = (LPPair*)(d_ht_v_bulk + p * ht_v_bytes);
+        di.lp_v.m_stash = (LPPair*)(d_ht_stash_v_bulk + p * ht_stash_bytes);
+        di.lp_v.m_is_on_device = true;
+
+        di.lp_e = m_h_patches_info[p].lp_e;
+        di.lp_e.m_table = (LPPair*)(d_ht_e_bulk + p * ht_e_bytes);
+        di.lp_e.m_stash = (LPPair*)(d_ht_stash_e_bulk + p * ht_stash_bytes);
+        di.lp_e.m_is_on_device = true;
+
+        di.lp_f = m_h_patches_info[p].lp_f;
+        di.lp_f.m_table = (LPPair*)(d_ht_f_bulk + p * ht_f_bytes);
+        di.lp_f.m_stash = (LPPair*)(d_ht_stash_f_bulk + p * ht_stash_bytes);
+        di.lp_f.m_is_on_device = true;
+
+        // Lock + dirty
+        di.lock.init();
+        di.dirty = (int*)(d_dirty_bulk + p * dirty_bytes);
+        di.child_id = INVALID32;
+        di.should_slice = false;
+    }
+
+    // Upload PatchInfo array
+    CUDA_ERROR(cudaMemcpy(m_d_patches_info, h_d_patch_infos.data(),
+                          P_max * sizeof(PatchInfo), cudaMemcpyHostToDevice));
+
+    // Track bulk device pointers for cleanup (don't free per-patch)
+    m_bulk_device_alloc = true;
+    m_bulk_device_ptrs = {
+        d_ev_bulk, d_fe_bulk,
+        d_mask_av_bulk, d_mask_ae_bulk, d_mask_af_bulk,
+        d_mask_ov_bulk, d_mask_oe_bulk, d_mask_of_bulk,
+        d_counts_bulk, d_stash_bulk, d_dirty_bulk,
+        d_ht_v_bulk, d_ht_e_bulk, d_ht_f_bulk,
+        d_ht_stash_v_bulk, d_ht_stash_e_bulk, d_ht_stash_f_bulk,
+    };
+
+    fprintf(stderr, "[build_device] assemble: %.0fms\n", ms_since(tp));
+    fprintf(stderr, "[build_device] TOTAL: %.0fms\n", ms_since(t_total));
 
 
     // make sure that if a patch stash of patch p has patch q, then q's patch

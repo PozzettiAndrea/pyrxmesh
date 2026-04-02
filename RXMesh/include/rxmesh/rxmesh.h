@@ -591,6 +591,12 @@ class RXMesh
     Context  m_rxmesh_context;
     EdgeMapT m_edges_map;
 
+    // Bulk device allocations (batch build_device)
+    // When set, per-patch PatchInfo pointers are offsets into these —
+    // DO NOT cudaFree individual PatchInfo members.
+    bool m_bulk_device_alloc = false;
+    std::vector<uint8_t*> m_bulk_device_ptrs;  // freed in destructor
+
     // Flat topology arrays (from GPU sort-scan, avoids vector-of-vectors)
     std::vector<uint32_t> m_ev_flat;         // [num_edges * 2]
     std::vector<uint32_t> m_ef_f0, m_ef_f1;  // [num_edges] each
