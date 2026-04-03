@@ -170,11 +170,13 @@ MeshResult pipeline_remesh(
                 num_vertices, num_faces, relative_len);
 
     auto tp = clk::now();
-    // Cast int* → uint32_t* (no heap allocs, no vector-of-vectors)
+    // Cast int* → uint32_t* and double* → float* (flat, no heap allocs)
     std::vector<uint32_t> flat_faces_u32(num_faces * 3);
     for (int i = 0; i < num_faces * 3; ++i)
         flat_faces_u32[i] = static_cast<uint32_t>(faces[i]);
-    auto vv = flat_verts_to_vv(vertices, num_vertices);
+    std::vector<float> flat_verts_f32(num_vertices * 3);
+    for (int i = 0; i < num_vertices * 3; ++i)
+        flat_verts_f32[i] = static_cast<float>(vertices[i]);
     double t_prep = ms_since(tp);
 
     Arg.obj_file_name = "pyrxmesh_remesh";
@@ -184,7 +186,7 @@ MeshResult pipeline_remesh(
 
     tp = clk::now();
     RXMeshDynamic rx(flat_faces_u32.data(), num_faces, "", 512, 2.0f, 2);
-    rx.add_vertex_coordinates(vv);
+    rx.add_vertex_coordinates_flat(flat_verts_f32.data(), num_vertices);
     double t_build = ms_since(tp);
 
     if (!rx.is_edge_manifold())

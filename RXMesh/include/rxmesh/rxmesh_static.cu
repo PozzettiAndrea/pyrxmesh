@@ -161,6 +161,17 @@ RXMeshStatic::RXMeshStatic(const std::vector<std::string> files_path,
 #endif
 }
 
+void RXMeshStatic::add_vertex_coordinates_flat(
+    const float* coords, uint32_t num_verts)
+{
+    if (m_input_vertex_coordinates == nullptr) {
+        // Use the flat vector overload of add_vertex_attribute
+        std::vector<float> flat_coords(coords, coords + num_verts * 3);
+        m_input_vertex_coordinates =
+            this->add_vertex_attribute<float>(flat_coords, "rx:vertices");
+    }
+}
+
 void RXMeshStatic::add_vertex_coordinates(
     std::vector<std::vector<float>>& vertices,
     std::string                      mesh_name)

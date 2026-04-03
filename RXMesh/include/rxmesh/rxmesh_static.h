@@ -85,6 +85,9 @@ class RXMeshStatic : public RXMesh
     void add_vertex_coordinates(std::vector<std::vector<float>>& vertices,
                                 std::string mesh_name = "");
 
+    // Fast: flat float array [num_verts * 3], no vector-of-vectors
+    void add_vertex_coordinates_flat(const float* coords, uint32_t num_verts);
+
     virtual ~RXMeshStatic() = default;
 
 #if USE_POLYSCOPE
