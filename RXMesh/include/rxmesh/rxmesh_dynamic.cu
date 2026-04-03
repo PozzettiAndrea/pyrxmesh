@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <numeric>
 
 #include <cooperative_groups.h>
@@ -3214,7 +3215,20 @@ void RXMeshDynamic::update_launch_box(
 
     launch_box.smem_bytes_dyn += user_shmem(vertex_cap, edge_cap, face_cap);
 
-    launch_box.smem_bytes_dyn = 80 * 1024;
+    // Override shared memory with fixed value if RXMESH_SMEM_OVERRIDE_KB
+    // is set. Default: use the calculated value (better occupancy).
+    // Set RXMESH_SMEM_OVERRIDE_KB=80 to restore the old hardcoded behavior.
+    {
+        static int override_kb = -1;
+        if (override_kb < 0) {
+            const char* env = std::getenv("RXMESH_SMEM_OVERRIDE_KB");
+            override_kb = env ? std::atoi(env) : 0;
+            if (override_kb > 0)
+                fprintf(stderr, "[SM_MEMORY] override: %dKB (from RXMESH_SMEM_OVERRIDE_KB)\n", override_kb);
+        }
+        if (override_kb > 0)
+            launch_box.smem_bytes_dyn = override_kb * 1024;
+    }
     if (with_vertex_valence) {
         if (get_input_max_valence() > 256) {
             RXMESH_ERROR(
