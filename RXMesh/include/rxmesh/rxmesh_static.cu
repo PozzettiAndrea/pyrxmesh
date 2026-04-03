@@ -54,6 +54,24 @@ RXMeshStatic::RXMeshStatic(std::vector<std::vector<uint32_t>>& fv,
     m_attr_container = std::make_shared<AttributeContainer>();
 }
 
+RXMeshStatic::RXMeshStatic(const uint32_t*   flat_fv,
+                           uint32_t          num_faces,
+                           const std::string patcher_file,
+                           const uint32_t    patch_size,
+                           const float       capacity_factor,
+                           const float       patch_alloc_factor,
+                           const float       lp_hashtable_load_factor)
+    : RXMesh(patch_size), m_input_vertex_coordinates(nullptr)
+{
+    m_num_regions = 1;
+    this->init_flat(flat_fv, num_faces,
+                    patcher_file,
+                    capacity_factor,
+                    patch_alloc_factor,
+                    lp_hashtable_load_factor);
+    m_attr_container = std::make_shared<AttributeContainer>();
+}
+
 RXMeshStatic::RXMeshStatic(const std::vector<std::string> files_path,
                            const uint32_t                 patch_size)
     : RXMesh(patch_size)

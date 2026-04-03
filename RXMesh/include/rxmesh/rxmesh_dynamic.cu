@@ -2210,6 +2210,22 @@ RXMeshDynamic::RXMeshDynamic(std::vector<std::vector<uint32_t>>& fv,
 {
 }
 
+RXMeshDynamic::RXMeshDynamic(const uint32_t*   flat_fv,
+                             uint32_t          num_faces,
+                             const std::string patcher_file,
+                             const uint32_t    patch_size,
+                             const float       capacity_factor,
+                             const float       patch_alloc_factor,
+                             const float       lp_hashtable_load_factor)
+    : RXMeshStatic(flat_fv, num_faces,
+                   patcher_file,
+                   patch_size,
+                   capacity_factor,
+                   patch_alloc_factor,
+                   lp_hashtable_load_factor)
+{
+}
+
 void RXMeshDynamic::save(std::string filename)
 {
     /*if (m_patcher->m_num_patches != get_num_patches()) {

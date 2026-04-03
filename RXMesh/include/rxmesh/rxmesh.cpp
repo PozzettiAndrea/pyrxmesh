@@ -62,6 +62,25 @@ RXMesh::RXMesh(uint32_t patch_size)
 {
 }
 
+void RXMesh::init_flat(const uint32_t* flat_fv, uint32_t num_faces,
+                       const std::string patcher_file,
+                       const float capacity_factor,
+                       const float patch_alloc_factor,
+                       const float lp_hashtable_load_factor)
+{
+    // Set flat faces BEFORE init — everything downstream uses m_flat_faces
+    m_flat_faces.assign(flat_fv, flat_fv + num_faces * 3);
+
+    // Build minimal fv stub (init checks fv.empty() and build() signature needs it)
+    // The actual data comes from m_flat_faces — fv is just for function signatures.
+    std::vector<std::vector<uint32_t>> fv(num_faces);
+    for (uint32_t f = 0; f < num_faces; ++f)
+        fv[f] = {flat_fv[f*3], flat_fv[f*3+1], flat_fv[f*3+2]};
+
+    init(fv, patcher_file, capacity_factor, patch_alloc_factor,
+         lp_hashtable_load_factor);
+}
+
 void RXMesh::init(const std::vector<std::vector<uint32_t>>& fv,
                   const std::string                         patcher_file,
                   const float                               capacity_factor,
@@ -491,7 +510,7 @@ void RXMesh::build(const std::vector<std::vector<uint32_t>>& fv,
         // CPU fallback
 #pragma omp parallel for
         for (int p = 0; p < static_cast<int>(get_num_patches()); ++p) {
-            build_single_patch_ltog(fv, ev, p,
+            build_single_patch_ltog(p,
                                     edges_by_patch[p], verts_by_patch[p]);
         }
     }
@@ -971,7 +990,9 @@ void RXMesh::build_supporting_structures(
     std::vector<uint32_t>&                    ff_offset,
     std::vector<uint32_t>&                    ff_values)
 {
-    m_num_faces = static_cast<uint32_t>(fv.size());
+    m_num_faces = m_flat_faces.empty()
+        ? static_cast<uint32_t>(fv.size())
+        : static_cast<uint32_t>(m_flat_faces.size() / 3);
 
     // Build flat face array for GPU (skip if m_flat_faces already provided)
     if (m_flat_faces.empty()) {
@@ -1307,8 +1328,8 @@ void RXMesh::calc_input_statistics(const std::vector<std::vector<uint32_t>>& fv,
     for (uint32_t f = 0; f < m_num_faces; ++f) {
         uint32_t ff_count = 0;
         for (uint32_t v = 0; v < 3; ++v) {
-            uint32_t v0 = fv[f][v];
-            uint32_t v1 = fv[f][(v + 1) % 3];
+            uint32_t v0 = m_flat_faces[f * 3 + v];
+            uint32_t v1 = m_flat_faces[f * 3 + ((v + 1) % 3)];
             uint32_t edge_num = get_edge_id(v0, v1);
             uint32_t ef_sz = (m_ef_f1[edge_num] == UINT32_MAX) ? 1 : 2;
             ff_count += ef_sz - 1;
@@ -1337,8 +1358,6 @@ void RXMesh::calc_max_elements()
 }
 
 void RXMesh::build_single_patch_ltog(
-    const std::vector<std::vector<uint32_t>>& fv,
-    const std::vector<std::vector<uint32_t>>& ev,
     const uint32_t                            patch_id,
     const std::vector<uint32_t>&              patch_edges,
     const std::vector<uint32_t>&              patch_verts)
@@ -1373,8 +1392,8 @@ void RXMesh::build_single_patch_ltog(
         m_h_patches_ltog_f[patch_id][local_face_id] = global_face_id;
 
         for (uint32_t v = 0; v < 3; ++v) {
-            uint32_t v0 = fv[global_face_id][v];
-            uint32_t v1 = fv[global_face_id][(v + 1) % 3];
+            uint32_t v0 = m_flat_faces[global_face_id * 3 + v];
+            uint32_t v1 = m_flat_faces[global_face_id * 3 + ((v + 1) % 3)];
 
             uint32_t edge_id = get_edge_id(v0, v1);
 
@@ -1405,7 +1424,7 @@ void RXMesh::build_single_patch_ltog(
         if (added_edges.insert(e).second) {
             m_h_patches_ltog_e[patch_id].push_back(e);
             for (uint32_t i = 0; i < 2; ++i) {
-                uint32_t v = ev[e][i];
+                uint32_t v = m_ev_flat[e * 2 + i];
                 if (added_verts.insert(v).second) {
                     m_h_patches_ltog_v[patch_id].push_back(v);
                 }

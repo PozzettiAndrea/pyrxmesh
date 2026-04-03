@@ -460,6 +460,12 @@ class RXMesh
               const float patch_alloc_factor                            = 5.0,
               const float lp_hashtable_load_factor                      = 0.5);
 
+    void init_flat(const uint32_t* flat_fv, uint32_t num_faces,
+                   const std::string patcher_file             = "",
+                   const float       capacity_factor          = 1.8,
+                   const float       patch_alloc_factor       = 5.0,
+                   const float       lp_hashtable_load_factor = 0.5);
+
     /**
      * @brief build different supporting data structure used to build RXMesh
      *
@@ -541,8 +547,6 @@ class RXMesh
                const std::string                         patcher_file);
 
     void build_single_patch_ltog(
-        const std::vector<std::vector<uint32_t>>& fv,
-        const std::vector<std::vector<uint32_t>>& ev,
         const uint32_t                            patch_id,
         const std::vector<uint32_t>&              patch_edges,
         const std::vector<uint32_t>&              patch_verts);

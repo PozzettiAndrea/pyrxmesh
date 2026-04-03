@@ -61,6 +61,13 @@ class RXMeshStatic : public RXMesh
                           const float patch_alloc_factor                 = 1.0,
                           const float lp_hashtable_load_factor           = 0.8);
 
+    explicit RXMeshStatic(const uint32_t* flat_fv, uint32_t num_faces,
+                          const std::string patcher_file             = "",
+                          const uint32_t    patch_size               = 512,
+                          const float       capacity_factor          = 1.0,
+                          const float       patch_alloc_factor       = 1.0,
+                          const float       lp_hashtable_load_factor = 0.8);
+
     /**
      * @brief Constructor using path to multiple meshes
      */

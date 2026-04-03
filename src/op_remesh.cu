@@ -170,7 +170,10 @@ MeshResult pipeline_remesh(
                 num_vertices, num_faces, relative_len);
 
     auto tp = clk::now();
-    auto fv = flat_faces_to_fv(faces, num_faces);
+    // Cast int* → uint32_t* (no heap allocs, no vector-of-vectors)
+    std::vector<uint32_t> flat_faces_u32(num_faces * 3);
+    for (int i = 0; i < num_faces * 3; ++i)
+        flat_faces_u32[i] = static_cast<uint32_t>(faces[i]);
     auto vv = flat_verts_to_vv(vertices, num_vertices);
     double t_prep = ms_since(tp);
 
@@ -180,7 +183,7 @@ MeshResult pipeline_remesh(
     Arg.num_smooth_iters = smooth_iterations;
 
     tp = clk::now();
-    RXMeshDynamic rx(fv, "", 512, 2.0f, 2);
+    RXMeshDynamic rx(flat_faces_u32.data(), num_faces, "", 512, 2.0f, 2);
     rx.add_vertex_coordinates(vv);
     double t_build = ms_since(tp);
 

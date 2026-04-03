@@ -635,6 +635,13 @@ class RXMeshDynamic : public RXMeshStatic
                            const float       patch_alloc_factor       = 5.0,
                            const float       lp_hashtable_load_factor = 0.5);
 
+    explicit RXMeshDynamic(const uint32_t* flat_fv, uint32_t num_faces,
+                           const std::string patcher_file             = "",
+                           const uint32_t    patch_size               = 256,
+                           const float       capacity_factor          = 3.5,
+                           const float       patch_alloc_factor       = 5.0,
+                           const float       lp_hashtable_load_factor = 0.5);
+
     /**
      * @brief save/seralize the patcher info to a file
      * @param filename
