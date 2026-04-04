@@ -5,6 +5,10 @@
 #include <chrono>
 #include <cstdio>
 
+#include <thrust/transform.h>
+#include <thrust/device_ptr.h>
+#include <thrust/execution_policy.h>
+
 #include "rxmesh/util/log.h"
 #include "rxmesh/util/macros.h"
 #include "rxmesh/util/util.h"
@@ -169,14 +173,54 @@ MeshResult pipeline_remesh(
         fprintf(stderr, "[pyrxmesh] remesh: input %d verts, %d faces, relative_len=%.2f\n",
                 num_vertices, num_faces, relative_len);
 
+    std::vector<uint32_t> prep_faces_u32;
+    std::vector<float>    prep_verts_f32;
+
     auto tp = clk::now();
-    // Cast int* → uint32_t* and double* → float* (flat, no heap allocs)
-    std::vector<uint32_t> flat_faces_u32(num_faces * 3);
-    for (int i = 0; i < num_faces * 3; ++i)
-        flat_faces_u32[i] = static_cast<uint32_t>(faces[i]);
-    std::vector<float> flat_verts_f32(num_vertices * 3);
-    for (int i = 0; i < num_vertices * 3; ++i)
-        flat_verts_f32[i] = static_cast<float>(vertices[i]);
+    // GPU cast: int→uint32 and double→float on device
+    {
+        // Upload raw data to GPU
+        int* d_faces_int;
+        double* d_verts_dbl;
+        uint32_t* d_faces_u32;
+        float* d_verts_f32;
+        size_t faces_bytes = num_faces * 3 * sizeof(int);
+        size_t verts_bytes = num_vertices * 3 * sizeof(double);
+
+        CUDA_ERROR(cudaMalloc(&d_faces_int, faces_bytes));
+        CUDA_ERROR(cudaMalloc(&d_verts_dbl, verts_bytes));
+        CUDA_ERROR(cudaMalloc(&d_faces_u32, num_faces * 3 * sizeof(uint32_t)));
+        CUDA_ERROR(cudaMalloc(&d_verts_f32, num_vertices * 3 * sizeof(float)));
+
+        CUDA_ERROR(cudaMemcpy(d_faces_int, faces, faces_bytes, cudaMemcpyHostToDevice));
+        CUDA_ERROR(cudaMemcpy(d_verts_dbl, vertices, verts_bytes, cudaMemcpyHostToDevice));
+
+        // Cast kernels via thrust::transform
+        thrust::transform(thrust::device,
+            thrust::device_pointer_cast(d_faces_int),
+            thrust::device_pointer_cast(d_faces_int) + num_faces * 3,
+            thrust::device_pointer_cast(d_faces_u32),
+            [] __device__ (int x) -> uint32_t { return static_cast<uint32_t>(x); });
+
+        thrust::transform(thrust::device,
+            thrust::device_pointer_cast(d_verts_dbl),
+            thrust::device_pointer_cast(d_verts_dbl) + num_vertices * 3,
+            thrust::device_pointer_cast(d_verts_f32),
+            [] __device__ (double x) -> float { return static_cast<float>(x); });
+
+        CUDA_ERROR(cudaFree(d_faces_int));
+        CUDA_ERROR(cudaFree(d_verts_dbl));
+
+        // Download casted results
+        prep_faces_u32.resize(num_faces * 3);
+        prep_verts_f32.resize(num_vertices * 3);
+        CUDA_ERROR(cudaMemcpy(prep_faces_u32.data(), d_faces_u32,
+                              num_faces * 3 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        CUDA_ERROR(cudaMemcpy(prep_verts_f32.data(), d_verts_f32,
+                              num_vertices * 3 * sizeof(float), cudaMemcpyDeviceToHost));
+        CUDA_ERROR(cudaFree(d_faces_u32));
+        CUDA_ERROR(cudaFree(d_verts_f32));
+    }
     double t_prep = ms_since(tp);
 
     Arg.obj_file_name = "pyrxmesh_remesh";
@@ -185,8 +229,8 @@ MeshResult pipeline_remesh(
     Arg.num_smooth_iters = smooth_iterations;
 
     tp = clk::now();
-    RXMeshDynamic rx(flat_faces_u32.data(), num_faces, "", 512, 2.0f, 2);
-    rx.add_vertex_coordinates_flat(flat_verts_f32.data(), num_vertices);
+    RXMeshDynamic rx(prep_faces_u32.data(), num_faces, "", 512, 2.0f, 1.5f);
+    rx.add_vertex_coordinates_flat(prep_verts_f32.data(), num_vertices);
     double t_build = ms_since(tp);
 
     if (!rx.is_edge_manifold())

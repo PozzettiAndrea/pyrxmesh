@@ -15,6 +15,13 @@
 #include <thrust/sort.h>
 #include <thrust/unique.h>
 #include <thrust/execution_policy.h>
+#include <thrust/binary_search.h>
+#include <thrust/partition.h>
+#include <thrust/sequence.h>
+#include <thrust/transform.h>
+#include <thrust/tabulate.h>
+#include <thrust/for_each.h>
+#include <thrust/iterator/counting_iterator.h>
 
 #include <chrono>
 #include <cstdio>
@@ -996,128 +1003,264 @@ ThrustLtogResult gpu_thrust_build_ltog(
     fprintf(stderr, "[thrust_ltog] step3 unique: %.0fms (edges=%u, verts=%u)\n",
             ms_since(tp), num_unique_edges, num_unique_verts);
 
-    // ── Step 4: download and segment into per-patch arrays ───────────────
+    // ── Step 4: segment on device into per-patch ltog arrays ────────────
+    // Stay on device: extract element IDs from packed uint64, compute offsets.
     tp = clk::now();
-    std::vector<uint64_t> h_edges(num_unique_edges);
-    std::vector<uint64_t> h_verts(num_unique_verts);
-    std::vector<uint32_t> h_face_patch(total_patch_faces);
-    std::vector<uint32_t> h_face_fid(total_patch_faces);
 
-    CUDA_ERROR(cudaMemcpy(h_edges.data(), d_unique_edges,
-                          num_unique_edges * sizeof(uint64_t), cudaMemcpyDeviceToHost));
-    CUDA_ERROR(cudaMemcpy(h_verts.data(), d_unique_verts,
-                          num_unique_verts * sizeof(uint64_t), cudaMemcpyDeviceToHost));
-    CUDA_ERROR(cudaMemcpy(h_face_patch.data(), d_face_pairs_patch,
-                          total_patch_faces * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-    CUDA_ERROR(cudaMemcpy(h_face_fid.data(), d_face_pairs_fid,
-                          total_patch_faces * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    // 4a: Extract element IDs (lower 32 bits) on device
+    uint32_t* d_ltog_e_raw;
+    uint32_t* d_ltog_v_raw;
+    CUDA_ERROR(cudaMalloc(&d_ltog_e_raw, num_unique_edges * sizeof(uint32_t)));
+    CUDA_ERROR(cudaMalloc(&d_ltog_v_raw, num_unique_verts * sizeof(uint32_t)));
+
+    // Extract edge IDs (lower 32 bits of packed uint64)
+    thrust::transform(thrust::device,
+        thrust::device_pointer_cast(d_unique_edges),
+        thrust::device_pointer_cast(d_unique_edges) + num_unique_edges,
+        thrust::device_pointer_cast(d_ltog_e_raw),
+        [] __device__ (uint64_t v) -> uint32_t { return v & 0xFFFFFFFFu; });
+
+    // Extract vertex IDs
+    thrust::transform(thrust::device,
+        thrust::device_pointer_cast(d_unique_verts),
+        thrust::device_pointer_cast(d_unique_verts) + num_unique_verts,
+        thrust::device_pointer_cast(d_ltog_v_raw),
+        [] __device__ (uint64_t v) -> uint32_t { return v & 0xFFFFFFFFu; });
+
+    // 4b: Compute per-patch offsets using lower_bound on patch IDs
+    // For edges: extract patch from upper 32 bits, find boundaries
+    uint32_t* d_edge_patches_sorted;  // patch ID for each unique edge
+    uint32_t* d_vert_patches_sorted;
+    CUDA_ERROR(cudaMalloc(&d_edge_patches_sorted, num_unique_edges * sizeof(uint32_t)));
+    CUDA_ERROR(cudaMalloc(&d_vert_patches_sorted, num_unique_verts * sizeof(uint32_t)));
+
+    thrust::transform(thrust::device,
+        thrust::device_pointer_cast(d_unique_edges),
+        thrust::device_pointer_cast(d_unique_edges) + num_unique_edges,
+        thrust::device_pointer_cast(d_edge_patches_sorted),
+        [] __device__ (uint64_t v) -> uint32_t { return v >> 32; });
+
+    thrust::transform(thrust::device,
+        thrust::device_pointer_cast(d_unique_verts),
+        thrust::device_pointer_cast(d_unique_verts) + num_unique_verts,
+        thrust::device_pointer_cast(d_vert_patches_sorted),
+        [] __device__ (uint64_t v) -> uint32_t { return v >> 32; });
 
     CUDA_ERROR(cudaFree(d_unique_edges));
     CUDA_ERROR(cudaFree(d_unique_verts));
+
+    // Compute offsets: lower_bound for each patch boundary [0..P]
+    // Generate search values [0, 1, 2, ..., P]
+    uint32_t* d_search_vals;
+    CUDA_ERROR(cudaMalloc(&d_search_vals, (num_patches + 1) * sizeof(uint32_t)));
+    thrust::sequence(thrust::device,
+        thrust::device_pointer_cast(d_search_vals),
+        thrust::device_pointer_cast(d_search_vals) + num_patches + 1);
+
+    uint32_t* d_e_offset;
+    uint32_t* d_v_offset;
+    uint32_t* d_f_offset;
+    CUDA_ERROR(cudaMalloc(&d_e_offset, (num_patches + 1) * sizeof(uint32_t)));
+    CUDA_ERROR(cudaMalloc(&d_v_offset, (num_patches + 1) * sizeof(uint32_t)));
+    CUDA_ERROR(cudaMalloc(&d_f_offset, (num_patches + 1) * sizeof(uint32_t)));
+
+    thrust::lower_bound(thrust::device,
+        thrust::device_pointer_cast(d_edge_patches_sorted),
+        thrust::device_pointer_cast(d_edge_patches_sorted) + num_unique_edges,
+        thrust::device_pointer_cast(d_search_vals),
+        thrust::device_pointer_cast(d_search_vals) + num_patches + 1,
+        thrust::device_pointer_cast(d_e_offset));
+
+    thrust::lower_bound(thrust::device,
+        thrust::device_pointer_cast(d_vert_patches_sorted),
+        thrust::device_pointer_cast(d_vert_patches_sorted) + num_unique_verts,
+        thrust::device_pointer_cast(d_search_vals),
+        thrust::device_pointer_cast(d_search_vals) + num_patches + 1,
+        thrust::device_pointer_cast(d_v_offset));
+
+    // Face offsets: faces are in d_face_pairs_patch (sorted), d_face_pairs_fid
+    thrust::lower_bound(thrust::device,
+        thrust::device_pointer_cast(d_face_pairs_patch),
+        thrust::device_pointer_cast(d_face_pairs_patch) + total_patch_faces,
+        thrust::device_pointer_cast(d_search_vals),
+        thrust::device_pointer_cast(d_search_vals) + num_patches + 1,
+        thrust::device_pointer_cast(d_f_offset));
+
+    CUDA_ERROR(cudaFree(d_edge_patches_sorted));
+    CUDA_ERROR(cudaFree(d_vert_patches_sorted));
+    CUDA_ERROR(cudaFree(d_search_vals));
+
+    // d_face_pairs_fid IS the face ltog (already extracted IDs, sorted by patch)
+    uint32_t* d_ltog_f_raw = d_face_pairs_fid;  // reuse directly
     CUDA_ERROR(cudaFree(d_face_pairs_patch));
-    CUDA_ERROR(cudaFree(d_face_pairs_fid));
+    // Don't free d_face_pairs_fid — it's now d_ltog_f_raw
 
-    // Segment by patch
+    fprintf(stderr, "[thrust_ltog] step4 segment: %.0fms\n", ms_since(tp));
+
+    // ── Step 5: GPU owned-first partition (single kernel) ─────────────────
+    // One block per patch. Each block partitions its F/E/V segments so owned
+    // elements come first, preserving order within each group.
+    tp = clk::now();
+
+    // Allocate temp buffers for out-of-place partition
+    uint32_t* d_ltog_f_tmp;
+    uint32_t* d_ltog_e_tmp;
+    uint32_t* d_ltog_v_tmp;
+    uint16_t* d_owned_f;
+    uint16_t* d_owned_e;
+    uint16_t* d_owned_v;
+    CUDA_ERROR(cudaMalloc(&d_ltog_f_tmp, total_patch_faces * sizeof(uint32_t)));
+    CUDA_ERROR(cudaMalloc(&d_ltog_e_tmp, num_unique_edges * sizeof(uint32_t)));
+    CUDA_ERROR(cudaMalloc(&d_ltog_v_tmp, num_unique_verts * sizeof(uint32_t)));
+    CUDA_ERROR(cudaMalloc(&d_owned_f, num_patches * sizeof(uint16_t)));
+    CUDA_ERROR(cudaMalloc(&d_owned_e, num_patches * sizeof(uint16_t)));
+    CUDA_ERROR(cudaMalloc(&d_owned_v, num_patches * sizeof(uint16_t)));
+
+    // Lambda kernel via thrust::for_each to partition each patch
+    // Each "thread" handles one patch — this is a host-side loop equivalent
+    // but using a single GPU kernel launch.
+    thrust::for_each(thrust::device,
+        thrust::make_counting_iterator(0u),
+        thrust::make_counting_iterator(num_patches),
+        [d_ltog_f_raw, d_ltog_f_tmp, d_f_offset, d_face_patch, d_owned_f,
+         d_ltog_e_raw, d_ltog_e_tmp, d_e_offset, d_edge_patch, d_owned_e,
+         d_ltog_v_raw, d_ltog_v_tmp, d_v_offset, d_vertex_patch, d_owned_v
+        ] __device__ (uint32_t p) {
+            // Faces: two-pass — count owned, then write owned-first
+            uint32_t fs = d_f_offset[p], fe = d_f_offset[p + 1];
+            uint16_t nowned_f = 0;
+            for (uint32_t i = fs; i < fe; ++i)
+                if (d_face_patch[d_ltog_f_raw[i]] == p) nowned_f++;
+            d_owned_f[p] = nowned_f;
+            uint32_t wi = fs, wj = fs + nowned_f;
+            for (uint32_t i = fs; i < fe; ++i) {
+                if (d_face_patch[d_ltog_f_raw[i]] == p)
+                    d_ltog_f_tmp[wi++] = d_ltog_f_raw[i];
+                else
+                    d_ltog_f_tmp[wj++] = d_ltog_f_raw[i];
+            }
+
+            // Edges
+            uint32_t es = d_e_offset[p], ee = d_e_offset[p + 1];
+            uint16_t nowned_e = 0;
+            for (uint32_t i = es; i < ee; ++i)
+                if (d_edge_patch[d_ltog_e_raw[i]] == p) nowned_e++;
+            d_owned_e[p] = nowned_e;
+            wi = es; wj = es + nowned_e;
+            for (uint32_t i = es; i < ee; ++i) {
+                if (d_edge_patch[d_ltog_e_raw[i]] == p)
+                    d_ltog_e_tmp[wi++] = d_ltog_e_raw[i];
+                else
+                    d_ltog_e_tmp[wj++] = d_ltog_e_raw[i];
+            }
+
+            // Vertices
+            uint32_t vs = d_v_offset[p], ve = d_v_offset[p + 1];
+            uint16_t nowned_v = 0;
+            for (uint32_t i = vs; i < ve; ++i)
+                if (d_vertex_patch[d_ltog_v_raw[i]] == p) nowned_v++;
+            d_owned_v[p] = nowned_v;
+            wi = vs; wj = vs + nowned_v;
+            for (uint32_t i = vs; i < ve; ++i) {
+                if (d_vertex_patch[d_ltog_v_raw[i]] == p)
+                    d_ltog_v_tmp[wi++] = d_ltog_v_raw[i];
+                else
+                    d_ltog_v_tmp[wj++] = d_ltog_v_raw[i];
+            }
+        });
+    CUDA_ERROR(cudaDeviceSynchronize());
+
+    // Swap: tmp becomes the real ltog, free originals
+    CUDA_ERROR(cudaFree(d_ltog_f_raw));
+    CUDA_ERROR(cudaFree(d_ltog_e_raw));
+    CUDA_ERROR(cudaFree(d_ltog_v_raw));
+    d_ltog_f_raw = d_ltog_f_tmp;
+    d_ltog_e_raw = d_ltog_e_tmp;
+    d_ltog_v_raw = d_ltog_v_tmp;
+
+    // Download owned counts
+    std::vector<uint16_t> h_num_owned_f(num_patches);
+    std::vector<uint16_t> h_num_owned_e(num_patches);
+    std::vector<uint16_t> h_num_owned_v(num_patches);
+    CUDA_ERROR(cudaMemcpy(h_num_owned_f.data(), d_owned_f, num_patches*sizeof(uint16_t), cudaMemcpyDeviceToHost));
+    CUDA_ERROR(cudaMemcpy(h_num_owned_e.data(), d_owned_e, num_patches*sizeof(uint16_t), cudaMemcpyDeviceToHost));
+    CUDA_ERROR(cudaMemcpy(h_num_owned_v.data(), d_owned_v, num_patches*sizeof(uint16_t), cudaMemcpyDeviceToHost));
+    CUDA_ERROR(cudaFree(d_owned_f));
+    CUDA_ERROR(cudaFree(d_owned_e));
+    CUDA_ERROR(cudaFree(d_owned_v));
+
+    // Download offsets (tiny)
+    std::vector<uint32_t> h_f_off(num_patches + 1);
+    std::vector<uint32_t> h_e_off(num_patches + 1);
+    std::vector<uint32_t> h_v_off(num_patches + 1);
+    CUDA_ERROR(cudaMemcpy(h_f_off.data(), d_f_offset, (num_patches+1)*sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    CUDA_ERROR(cudaMemcpy(h_e_off.data(), d_e_offset, (num_patches+1)*sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    CUDA_ERROR(cudaMemcpy(h_v_off.data(), d_v_offset, (num_patches+1)*sizeof(uint32_t), cudaMemcpyDeviceToHost));
+
+    fprintf(stderr, "[thrust_ltog] step5 partition: %.0fms\n", ms_since(tp));
+
+    // ── Step 6: download to host + retain on device ──────────────────────
+    tp = clk::now();
     ThrustLtogResult result;
-    result.f_offset.resize(num_patches + 1, 0);
-    result.e_offset.resize(num_patches + 1, 0);
-    result.v_offset.resize(num_patches + 1, 0);
-    result.num_owned_f.resize(num_patches, 0);
-    result.num_owned_e.resize(num_patches, 0);
-    result.num_owned_v.resize(num_patches, 0);
+    result.f_offset = std::move(h_f_off);
+    result.e_offset = std::move(h_e_off);
+    result.v_offset = std::move(h_v_off);
+    result.num_owned_f = std::move(h_num_owned_f);
+    result.num_owned_e = std::move(h_num_owned_e);
+    result.num_owned_v = std::move(h_num_owned_v);
 
-    // Faces: h_face_patch is sorted by patch, h_face_fid has face IDs
-    result.ltog_f.reserve(total_patch_faces);
-    {
-        uint32_t cur_patch = 0;
-        result.f_offset[0] = 0;
-        for (uint32_t i = 0; i < total_patch_faces; ++i) {
-            while (cur_patch < h_face_patch[i]) {
-                cur_patch++;
-                result.f_offset[cur_patch] = result.ltog_f.size();
-            }
-            result.ltog_f.push_back(h_face_fid[i]);
-        }
-        for (uint32_t p = cur_patch + 1; p <= num_patches; ++p)
-            result.f_offset[p] = result.ltog_f.size();
-    }
+    // Download ltog arrays
+    uint32_t total_f = total_patch_faces;
+    result.ltog_f.resize(total_f);
+    result.ltog_e.resize(num_unique_edges);
+    result.ltog_v.resize(num_unique_verts);
+    CUDA_ERROR(cudaMemcpy(result.ltog_f.data(), d_ltog_f_raw,
+                          total_f * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    CUDA_ERROR(cudaMemcpy(result.ltog_e.data(), d_ltog_e_raw,
+                          num_unique_edges * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    CUDA_ERROR(cudaMemcpy(result.ltog_v.data(), d_ltog_v_raw,
+                          num_unique_verts * sizeof(uint32_t), cudaMemcpyDeviceToHost));
 
-    // Edges: h_edges[i] = (patch<<32 | edge_id), sorted
-    result.ltog_e.reserve(num_unique_edges);
-    {
-        uint32_t cur_patch = 0;
-        result.e_offset[0] = 0;
-        for (uint32_t i = 0; i < num_unique_edges; ++i) {
-            uint32_t p = h_edges[i] >> 32;
-            uint32_t eid = h_edges[i] & 0xFFFFFFFFu;
-            while (cur_patch < p) {
-                cur_patch++;
-                result.e_offset[cur_patch] = result.ltog_e.size();
-            }
-            result.ltog_e.push_back(eid);
-        }
-        for (uint32_t p = cur_patch + 1; p <= num_patches; ++p)
-            result.e_offset[p] = result.ltog_e.size();
-    }
+    // Upload num_elements and num_owned to device for K2
+    uint16_t* d_nef; uint16_t* d_nee; uint16_t* d_nev;
+    uint16_t* d_nof; uint16_t* d_noe; uint16_t* d_nov;
+    CUDA_ERROR(cudaMalloc(&d_nef, num_patches * sizeof(uint16_t)));
+    CUDA_ERROR(cudaMalloc(&d_nee, num_patches * sizeof(uint16_t)));
+    CUDA_ERROR(cudaMalloc(&d_nev, num_patches * sizeof(uint16_t)));
+    CUDA_ERROR(cudaMalloc(&d_nof, num_patches * sizeof(uint16_t)));
+    CUDA_ERROR(cudaMalloc(&d_noe, num_patches * sizeof(uint16_t)));
+    CUDA_ERROR(cudaMalloc(&d_nov, num_patches * sizeof(uint16_t)));
 
-    // Vertices: h_verts[i] = (patch<<32 | vertex_id), sorted
-    result.ltog_v.reserve(num_unique_verts);
-    {
-        uint32_t cur_patch = 0;
-        result.v_offset[0] = 0;
-        for (uint32_t i = 0; i < num_unique_verts; ++i) {
-            uint32_t p = h_verts[i] >> 32;
-            uint32_t vid = h_verts[i] & 0xFFFFFFFFu;
-            while (cur_patch < p) {
-                cur_patch++;
-                result.v_offset[cur_patch] = result.ltog_v.size();
-            }
-            result.ltog_v.push_back(vid);
-        }
-        for (uint32_t p = cur_patch + 1; p <= num_patches; ++p)
-            result.v_offset[p] = result.ltog_v.size();
-    }
-
-    // ── Step 5: compute owned counts (partition owned-first) ─────────────
-    // For each patch, partition elements: owned first (element_patch == p), then not-owned.
-    // Both sections must remain sorted.
-    // Download edge_patch and vertex_patch for ownership check
-    std::vector<uint32_t> h_edge_patch(num_edges);
-    std::vector<uint32_t> h_vertex_patch(num_vertices);
-    CUDA_ERROR(cudaMemcpy(h_edge_patch.data(), d_edge_patch,
-                          num_edges * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-    CUDA_ERROR(cudaMemcpy(h_vertex_patch.data(), d_vertex_patch,
-                          num_vertices * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-
-    auto& fp = h_face_patch;  // already have this but need face_patch per face
-    std::vector<uint32_t> h_face_patch_global(num_faces);
-    CUDA_ERROR(cudaMemcpy(h_face_patch_global.data(), d_face_patch,
-                          num_faces * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-
+    // Compute num_elements from offsets
+    std::vector<uint16_t> h_nef(num_patches), h_nee(num_patches), h_nev(num_patches);
     for (uint32_t p = 0; p < num_patches; ++p) {
-        // Faces: stable_partition (owned first)
-        uint32_t fs = result.f_offset[p], fe = result.f_offset[p + 1];
-        auto fmid = std::stable_partition(
-            result.ltog_f.begin() + fs, result.ltog_f.begin() + fe,
-            [&](uint32_t fid) { return h_face_patch_global[fid] == p; });
-        result.num_owned_f[p] = fmid - (result.ltog_f.begin() + fs);
-
-        // Edges
-        uint32_t es = result.e_offset[p], ee = result.e_offset[p + 1];
-        auto emid = std::stable_partition(
-            result.ltog_e.begin() + es, result.ltog_e.begin() + ee,
-            [&](uint32_t eid) { return h_edge_patch[eid] == p; });
-        result.num_owned_e[p] = emid - (result.ltog_e.begin() + es);
-
-        // Vertices
-        uint32_t vs = result.v_offset[p], ve = result.v_offset[p + 1];
-        auto vmid = std::stable_partition(
-            result.ltog_v.begin() + vs, result.ltog_v.begin() + ve,
-            [&](uint32_t vid) { return h_vertex_patch[vid] == p; });
-        result.num_owned_v[p] = vmid - (result.ltog_v.begin() + vs);
+        h_nef[p] = static_cast<uint16_t>(result.f_offset[p+1] - result.f_offset[p]);
+        h_nee[p] = static_cast<uint16_t>(result.e_offset[p+1] - result.e_offset[p]);
+        h_nev[p] = static_cast<uint16_t>(result.v_offset[p+1] - result.v_offset[p]);
     }
+    CUDA_ERROR(cudaMemcpy(d_nef, h_nef.data(), num_patches*sizeof(uint16_t), cudaMemcpyHostToDevice));
+    CUDA_ERROR(cudaMemcpy(d_nee, h_nee.data(), num_patches*sizeof(uint16_t), cudaMemcpyHostToDevice));
+    CUDA_ERROR(cudaMemcpy(d_nev, h_nev.data(), num_patches*sizeof(uint16_t), cudaMemcpyHostToDevice));
+    CUDA_ERROR(cudaMemcpy(d_nof, result.num_owned_f.data(), num_patches*sizeof(uint16_t), cudaMemcpyHostToDevice));
+    CUDA_ERROR(cudaMemcpy(d_noe, result.num_owned_e.data(), num_patches*sizeof(uint16_t), cudaMemcpyHostToDevice));
+    CUDA_ERROR(cudaMemcpy(d_nov, result.num_owned_v.data(), num_patches*sizeof(uint16_t), cudaMemcpyHostToDevice));
 
-    fprintf(stderr, "[thrust_ltog] step4+5 segment+partition: %.0fms\n", ms_since(tp));
+    // Retain device pointers
+    result.d_ltog_f = d_ltog_f_raw;
+    result.d_ltog_e = d_ltog_e_raw;
+    result.d_ltog_v = d_ltog_v_raw;
+    result.d_f_offset = d_f_offset;
+    result.d_e_offset = d_e_offset;
+    result.d_v_offset = d_v_offset;
+    result.d_num_elements_f = d_nef;
+    result.d_num_elements_e = d_nee;
+    result.d_num_elements_v = d_nev;
+    result.d_num_owned_f = d_nof;
+    result.d_num_owned_e = d_noe;
+    result.d_num_owned_v = d_nov;
+    result.device_arrays_valid = true;
+
+    fprintf(stderr, "[thrust_ltog] step6 download+retain: %.0fms\n", ms_since(tp));
     fprintf(stderr, "[thrust_ltog] TOTAL: %.0fms (F=%zu E=%zu V=%zu)\n",
             ms_since(t_total), result.ltog_f.size(), result.ltog_e.size(),
             result.ltog_v.size());
@@ -1273,6 +1416,332 @@ K1K2Result gpu_run_k1k2(
     CUDA_ERROR(cudaFree(d_ev_local)); CUDA_ERROR(cudaFree(d_fe_local));
 
     return r;
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Launch K2 using retained device arrays from Approach A
+// ═══════════════════════════════════════════════════════════════════════════
+
+K1K2Result gpu_launch_k2(
+    ThrustLtogResult& thr,
+    const uint32_t* d_fv,
+    const uint64_t* d_edge_key,
+    const uint32_t* d_ev_global,
+    uint32_t num_edges_global,
+    const uint32_t* d_patches_val,
+    const uint32_t* d_patches_offset,
+    const uint32_t* d_ribbon_val,
+    const uint32_t* d_ribbon_offset,
+    const uint32_t* d_face_patch,
+    const uint32_t* d_edge_patch,
+    const uint32_t* d_vertex_patch,
+    uint32_t num_patches,
+    uint32_t edge_capacity,
+    uint32_t face_capacity)
+{
+    using clk = std::chrono::high_resolution_clock;
+    auto ms_since = [](auto t0) {
+        return std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+    };
+    auto t0 = clk::now();
+
+    uint32_t ev_stride = edge_capacity * 2;
+    uint32_t fe_stride = face_capacity * 3;
+
+    // Allocate K2 output
+    uint16_t *d_ev_local, *d_fe_local;
+    CUDA_ERROR(cudaMalloc(&d_ev_local, num_patches * ev_stride * sizeof(uint16_t)));
+    CUDA_ERROR(cudaMalloc(&d_fe_local, num_patches * fe_stride * sizeof(uint16_t)));
+    CUDA_ERROR(cudaMemset(d_ev_local, 0xFF, num_patches * ev_stride * sizeof(uint16_t)));
+    CUDA_ERROR(cudaMemset(d_fe_local, 0xFF, num_patches * fe_stride * sizeof(uint16_t)));
+
+    // Launch K2
+    k2_build_topology<<<num_patches, 256>>>(
+        d_fv, d_edge_key, d_ev_global, num_edges_global,
+        d_patches_val, d_patches_offset,
+        d_ribbon_val, d_ribbon_offset,
+        d_face_patch, d_edge_patch, d_vertex_patch,
+        thr.d_ltog_f, thr.d_f_offset,
+        thr.d_ltog_e, thr.d_e_offset,
+        thr.d_ltog_v, thr.d_v_offset,
+        thr.d_num_elements_f, thr.d_num_owned_f,
+        thr.d_num_elements_e, thr.d_num_owned_e,
+        thr.d_num_elements_v, thr.d_num_owned_v,
+        num_patches,
+        d_ev_local, d_fe_local, ev_stride, fe_stride);
+    CUDA_ERROR(cudaDeviceSynchronize());
+    fprintf(stderr, "[gpu_k2] kernel: %.1fms\n", ms_since(t0));
+
+    // Retain K2 device arrays (D2D copy in build_device, no host round-trip)
+    K1K2Result r;
+    r.ev_stride = ev_stride;
+    r.fe_stride = fe_stride;
+    r.d_ev_local = d_ev_local;
+    r.d_fe_local = d_fe_local;
+    fprintf(stderr, "[gpu_k2] TOTAL: %.1fms (device arrays retained)\n", ms_since(t0));
+
+    // Don't free Approach A device arrays — retained for GPU build_device
+    // Caller is responsible for calling thr.free_device() after build_device.
+
+    return r;
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GPU build_device: bitmasks + stash + hash tables entirely on GPU
+// ═══════════════════════════════════════════════════════════════════════════
+
+// One thread per patch: build all 3 hash tables (V/E/F)
+__global__ static void k3_build_hashtables(
+    const uint32_t* d_ltog_v, const uint32_t* d_ltog_e, const uint32_t* d_ltog_f,
+    const uint32_t* d_v_off, const uint32_t* d_e_off, const uint32_t* d_f_off,
+    const uint16_t* d_nev, const uint16_t* d_nee, const uint16_t* d_nef,
+    const uint16_t* d_nov, const uint16_t* d_noe, const uint16_t* d_nof,
+    const uint32_t* d_vertex_patch, const uint32_t* d_edge_patch,
+    const uint32_t* d_face_patch,
+    const uint8_t* d_stash_bulk, size_t stash_bytes_per,
+    uint8_t* d_ht_v_bulk, uint8_t* d_ht_e_bulk, uint8_t* d_ht_f_bulk,
+    size_t ht_v_bytes, size_t ht_e_bytes, size_t ht_f_bytes,
+    uint8_t* d_ht_stash_v_bulk, uint8_t* d_ht_stash_e_bulk,
+    uint8_t* d_ht_stash_f_bulk, size_t ht_stash_bytes,
+    LPHashTable ht_v, LPHashTable ht_e, LPHashTable ht_f,
+    uint32_t num_patches)
+{
+    uint32_t p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= num_patches) return;
+
+    const uint32_t* stash = (const uint32_t*)(d_stash_bulk + p * stash_bytes_per);
+    constexpr uint8_t STASH_SZ = PatchStash::stash_size;
+
+    // Find patch index in stash
+    auto find_stash_idx = [&](uint32_t owner) -> uint8_t {
+        for (uint8_t i = 0; i < STASH_SZ; ++i)
+            if (stash[i] == owner) return i;
+        return 0xFF;
+    };
+
+    // Binary search in sorted array [arr, arr+count) for val
+    auto bin_search = [](const uint32_t* arr, uint16_t count,
+                         uint32_t val) -> uint16_t {
+        uint16_t lo = 0, hi = count;
+        while (lo < hi) {
+            uint16_t mid = (lo + hi) / 2;
+            if (arr[mid] < val) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo;
+    };
+
+    // Inline cuckoo insert — avoids LPHashTable member pointer issues
+    auto do_insert = [](LPPair pair, LPPair* table, uint16_t cap,
+                        LPPair* ht_stash, uint16_t max_chains,
+                        const LPHashTable::HashT& h0, const LPHashTable::HashT& h1,
+                        const LPHashTable::HashT& h2, const LPHashTable::HashT& h3) {
+        auto bucket_id = h0(pair.key()) % cap;
+        uint16_t ctr = 0;
+        do {
+            uint32_t tmp = pair.m_pair;
+            pair.m_pair = atomicExch(&table[bucket_id].m_pair, tmp);
+            if (pair.is_sentinel() || pair.key() == ((tmp >> (32 - LPPair::LIDNumBits))))
+                return;
+            auto b0 = h0(pair.key()) % cap;
+            auto b1 = h1(pair.key()) % cap;
+            auto b2 = h2(pair.key()) % cap;
+            auto b3 = h3(pair.key()) % cap;
+            auto nb = b0;
+            if (bucket_id == b2) nb = b3;
+            else if (bucket_id == b1) nb = b2;
+            else if (bucket_id == b0) nb = b1;
+            bucket_id = nb;
+            ctr++;
+        } while (ctr < max_chains);
+        // Stash overflow
+        for (uint8_t i = 0; i < LPHashTable::stash_size; ++i) {
+            LPPair sentinel;
+            uint32_t old = atomicCAS(&ht_stash[i].m_pair, sentinel.m_pair, pair.m_pair);
+            if (old == sentinel.m_pair) return;
+        }
+    };
+
+    // Build one HT type
+    auto build_ht = [&](const uint32_t* d_ltog, const uint32_t* d_off,
+                         const uint16_t* d_ne, const uint16_t* d_no,
+                         const uint32_t* d_elem_patch,
+                         uint8_t* ht_bulk, size_t ht_bytes,
+                         uint8_t* ht_st_bulk, size_t ht_st_bytes,
+                         const LPHashTable& ht_tmpl) {
+        LPPair* table = (LPPair*)(ht_bulk + p * ht_bytes);
+        LPPair* ht_st = (LPPair*)(ht_st_bulk + p * ht_st_bytes);
+
+        uint32_t base = d_off[p];
+        uint16_t num_elem = d_ne[p], num_owned = d_no[p];
+
+        for (uint16_t i = num_owned; i < num_elem; ++i) {
+            uint32_t global_id = d_ltog[base + i];
+            uint32_t owner = d_elem_patch[global_id];
+            uint32_t owner_base = d_off[owner];
+            uint16_t owner_owned = d_no[owner];
+            uint16_t lid_in_owner = bin_search(
+                d_ltog + owner_base, owner_owned, global_id);
+            uint8_t stash_idx = find_stash_idx(owner);
+            LPPair pair(i, lid_in_owner, stash_idx);
+            // Use the existing LPHashTable::insert which is __host__ __device__
+            LPHashTable ht_copy = ht_tmpl;
+            ht_copy.m_table = table;
+            ht_copy.m_stash = ht_st;
+            ht_copy.insert(pair, (volatile LPPair*)table, (volatile LPPair*)ht_st);
+        }
+    };
+
+    // Build V/E/F hash tables
+    build_ht(d_ltog_v, d_v_off, d_nev, d_nov, d_vertex_patch,
+             d_ht_v_bulk, ht_v_bytes, d_ht_stash_v_bulk, ht_stash_bytes, ht_v);
+    build_ht(d_ltog_e, d_e_off, d_nee, d_noe, d_edge_patch,
+             d_ht_e_bulk, ht_e_bytes, d_ht_stash_e_bulk, ht_stash_bytes, ht_e);
+    build_ht(d_ltog_f, d_f_off, d_nef, d_nof, d_face_patch,
+             d_ht_f_bulk, ht_f_bytes, d_ht_stash_f_bulk, ht_stash_bytes, ht_f);
+}
+
+
+void gpu_build_device_data(
+    const ThrustLtogResult& thr,
+    const uint32_t* d_face_patch,
+    const uint32_t* d_edge_patch,
+    const uint32_t* d_vertex_patch,
+    uint32_t num_patches,
+    uint16_t v_cap, uint16_t e_cap, uint16_t f_cap,
+    // Bulk device arrays to fill (already allocated, zeroed/0xFF'd as needed)
+    uint8_t* d_mask_av_bulk, uint8_t* d_mask_ae_bulk, uint8_t* d_mask_af_bulk,
+    uint8_t* d_mask_ov_bulk, uint8_t* d_mask_oe_bulk, uint8_t* d_mask_of_bulk,
+    size_t mask_v_bytes, size_t mask_e_bytes, size_t mask_f_bytes,
+    uint8_t* d_counts_bulk, size_t counts_bytes,
+    uint8_t* d_stash_bulk, size_t stash_bytes_per,
+    uint8_t* d_ht_v_bulk, uint8_t* d_ht_e_bulk, uint8_t* d_ht_f_bulk,
+    size_t ht_v_bytes, size_t ht_e_bytes, size_t ht_f_bytes,
+    uint8_t* d_ht_stash_v_bulk, uint8_t* d_ht_stash_e_bulk,
+    uint8_t* d_ht_stash_f_bulk, size_t ht_stash_bytes,
+    // Hash table params (uniform across patches)
+    LPHashTable ht_template_v, LPHashTable ht_template_e, LPHashTable ht_template_f)
+{
+    using clk = std::chrono::high_resolution_clock;
+    auto ms_since = [](auto t0) {
+        return std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+    };
+    auto t0 = clk::now();
+
+    // ── K3a: Bitmasks + Counts ───────────────────────────────────────────
+    thrust::for_each(thrust::device,
+        thrust::make_counting_iterator(0u),
+        thrust::make_counting_iterator(num_patches),
+        [d_mask_av_bulk, d_mask_ae_bulk, d_mask_af_bulk,
+         d_mask_ov_bulk, d_mask_oe_bulk, d_mask_of_bulk,
+         mask_v_bytes, mask_e_bytes, mask_f_bytes,
+         d_counts_bulk, counts_bytes,
+         v_cap, e_cap, f_cap,
+         d_ne = thr.d_num_elements_f, d_nee = thr.d_num_elements_e,
+         d_nev = thr.d_num_elements_v,
+         d_nof = thr.d_num_owned_f, d_noe = thr.d_num_owned_e,
+         d_nov = thr.d_num_owned_v
+        ] __device__ (uint32_t p) {
+            uint16_t nf = d_ne[p], ne = d_nee[p], nv = d_nev[p];
+            uint16_t of = d_nof[p], oe = d_noe[p], ov = d_nov[p];
+
+            // Counts
+            uint16_t* counts = (uint16_t*)(d_counts_bulk + p * counts_bytes);
+            counts[0] = nf; counts[1] = ne; counts[2] = nv;
+
+            // Helper: set bits [0..n) in mask, clear [n..cap)
+            auto fill_mask = [](uint8_t* buf, uint16_t n) {
+                uint32_t* mask = (uint32_t*)buf;
+                // Set complete words
+                uint16_t full_words = n / 32;
+                for (uint16_t w = 0; w < full_words; ++w)
+                    mask[w] = 0xFFFFFFFFu;
+                // Partial word
+                uint16_t remaining = n % 32;
+                if (remaining > 0)
+                    mask[full_words] = (1u << remaining) - 1u;
+                // Rest already zeroed by cudaMemset
+            };
+
+            fill_mask(d_mask_av_bulk + p * mask_v_bytes, nv);
+            fill_mask(d_mask_ae_bulk + p * mask_e_bytes, ne);
+            fill_mask(d_mask_af_bulk + p * mask_f_bytes, nf);
+            fill_mask(d_mask_ov_bulk + p * mask_v_bytes, ov);
+            fill_mask(d_mask_oe_bulk + p * mask_e_bytes, oe);
+            fill_mask(d_mask_of_bulk + p * mask_f_bytes, of);
+        });
+    CUDA_ERROR(cudaDeviceSynchronize());
+    fprintf(stderr, "[gpu_bd] bitmasks+counts: %.1fms\n", ms_since(t0));
+
+    // ── K3b: Patch stash ─────────────────────────────────────────────────
+    auto tp = clk::now();
+    constexpr uint8_t STASH_SIZE = PatchStash::stash_size;  // 64
+
+    thrust::for_each(thrust::device,
+        thrust::make_counting_iterator(0u),
+        thrust::make_counting_iterator(num_patches),
+        [d_ltog_f = thr.d_ltog_f, d_ltog_e = thr.d_ltog_e, d_ltog_v = thr.d_ltog_v,
+         d_f_off = thr.d_f_offset, d_e_off = thr.d_e_offset, d_v_off = thr.d_v_offset,
+         d_nof = thr.d_num_owned_f, d_noe = thr.d_num_owned_e, d_nov = thr.d_num_owned_v,
+         d_ne = thr.d_num_elements_f, d_nee = thr.d_num_elements_e,
+         d_nev = thr.d_num_elements_v,
+         d_face_patch, d_edge_patch, d_vertex_patch,
+         d_stash_bulk, stash_bytes_per, STASH_SIZE
+        ] __device__ (uint32_t p) {
+            uint32_t* stash = (uint32_t*)(d_stash_bulk + p * stash_bytes_per);
+            // stash pre-initialized to 0xFF (INVALID32) via cudaMemset
+            uint8_t stash_count = 0;
+
+            // Helper: insert unique owner patch into stash
+            auto stash_insert = [&](uint32_t owner) {
+                // Check if already present
+                for (uint8_t i = 0; i < stash_count; ++i)
+                    if (stash[i] == owner) return;
+                if (stash_count < STASH_SIZE)
+                    stash[stash_count++] = owner;
+            };
+
+            // Faces: not-owned are [owned_f..num_elements_f)
+            uint32_t fs = d_f_off[p];
+            uint16_t nf = d_ne[p], of = d_nof[p];
+            for (uint16_t i = of; i < nf; ++i)
+                stash_insert(d_face_patch[d_ltog_f[fs + i]]);
+
+            // Edges
+            uint32_t es = d_e_off[p];
+            uint16_t ne = d_nee[p], oe = d_noe[p];
+            for (uint16_t i = oe; i < ne; ++i)
+                stash_insert(d_edge_patch[d_ltog_e[es + i]]);
+
+            // Vertices
+            uint32_t vs = d_v_off[p];
+            uint16_t nv = d_nev[p], ov = d_nov[p];
+            for (uint16_t i = ov; i < nv; ++i)
+                stash_insert(d_vertex_patch[d_ltog_v[vs + i]]);
+        });
+    CUDA_ERROR(cudaDeviceSynchronize());
+    fprintf(stderr, "[gpu_bd] stash: %.1fms\n", ms_since(tp));
+
+    // ── K3c: Hash tables (proper __global__ kernel) ────────────────────
+    tp = clk::now();
+    k3_build_hashtables<<<(num_patches+255)/256, 256>>>(
+        thr.d_ltog_v, thr.d_ltog_e, thr.d_ltog_f,
+        thr.d_v_offset, thr.d_e_offset, thr.d_f_offset,
+        thr.d_num_elements_v, thr.d_num_elements_e, thr.d_num_elements_f,
+        thr.d_num_owned_v, thr.d_num_owned_e, thr.d_num_owned_f,
+        d_vertex_patch, d_edge_patch, d_face_patch,
+        d_stash_bulk, stash_bytes_per,
+        d_ht_v_bulk, d_ht_e_bulk, d_ht_f_bulk,
+        ht_v_bytes, ht_e_bytes, ht_f_bytes,
+        d_ht_stash_v_bulk, d_ht_stash_e_bulk, d_ht_stash_f_bulk,
+        ht_stash_bytes,
+        ht_template_v, ht_template_e, ht_template_f,
+        num_patches);
+    CUDA_ERROR(cudaDeviceSynchronize());
+    fprintf(stderr, "[gpu_bd] hashtables: %.1fms\n", ms_since(tp));
+    fprintf(stderr, "[gpu_bd] TOTAL: %.1fms\n", ms_since(t0));
 }
 
 

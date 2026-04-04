@@ -623,6 +623,12 @@ class RXMesh
     std::vector<uint32_t> m_gpu_edge_patch;    // [num_edges] in GPU edge ID space
     std::vector<uint32_t> m_gpu_vertex_patch;  // [num_vertices]
 
+    // Retained device arrays for GPU build_device (freed after use)
+    ThrustLtogResult m_retained_thr;           // ltog + offsets + counts on device
+    uint32_t* m_d_face_patch_bd = nullptr;
+    uint32_t* m_d_edge_patch_bd = nullptr;
+    uint32_t* m_d_vertex_patch_bd = nullptr;
+
     // Should be updated with update_host
     uint32_t m_num_edges, m_num_faces, m_num_vertices;
 
