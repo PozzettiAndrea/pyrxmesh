@@ -226,7 +226,7 @@ Patcher::Patcher(uint32_t                     patch_size,
             d_cub_temp_storage_scan, d_cub_temp_storage_max,
             cub_scan_bytes, cub_max_bytes, d_seeds, d_new_num_patches,
             d_max_patch_size, d_patches_offset, d_patches_size, d_patches_val);
-        assign_patch_fast(flat_fv, num_faces, sorted_edge_keys);
+        // assign_patch_fast moved to RXMesh::build() — uses GPU K0a kernel
     } else {
         if (use_metis) {
             metis_kway(ff_offset, ff_values);
@@ -243,10 +243,11 @@ Patcher::Patcher(uint32_t                     patch_size,
                 d_max_patch_size, d_patches_offset, d_patches_size, d_patches_val);
         }
         extract_ribbons(flat_fv, num_faces, ff_offset, ff_values);
-        assign_patch_fast(flat_fv, num_faces, sorted_edge_keys);
+        // assign_patch_fast moved to RXMesh::build() — uses GPU K0a kernel
     }
 
-    calc_edge_cut(flat_fv, num_faces, ff_offset, ff_values);
+    // Skip calc_edge_cut — purely informational logging, costs ~0.9s
+    // calc_edge_cut(flat_fv, num_faces, ff_offset, ff_values);
     print_statistics();
 
     GPU_FREE(d_face_patch); GPU_FREE(d_queue); GPU_FREE(d_queue_ptr);

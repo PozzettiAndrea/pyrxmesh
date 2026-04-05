@@ -165,10 +165,12 @@ void RXMeshStatic::add_vertex_coordinates_flat(
     const float* coords, uint32_t num_verts)
 {
     if (m_input_vertex_coordinates == nullptr) {
-        // Use the flat vector overload of add_vertex_attribute
-        std::vector<float> flat_coords(coords, coords + num_verts * 3);
+        // Build vector-of-vectors for the multi-component overload
+        std::vector<std::vector<float>> verts(num_verts);
+        for (uint32_t i = 0; i < num_verts; ++i)
+            verts[i] = {coords[i*3], coords[i*3+1], coords[i*3+2]};
         m_input_vertex_coordinates =
-            this->add_vertex_attribute<float>(flat_coords, "rx:vertices");
+            this->add_vertex_attribute<float>(verts, "rx:vertices");
     }
 }
 

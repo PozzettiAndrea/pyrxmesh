@@ -47,7 +47,6 @@ struct PatchLock
      */
     __host__ void free();
 
-   private:
     static constexpr uint32_t FREE        = 0;
     static constexpr uint32_t LOCKED      = INVALID32;
     static constexpr int      MAX_ATTEMPT = 10;

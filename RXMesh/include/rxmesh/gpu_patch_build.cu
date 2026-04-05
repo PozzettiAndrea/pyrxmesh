@@ -1584,9 +1584,13 @@ __global__ static void k3_build_hashtables(
             uint16_t owner_owned = d_no[owner];
             uint16_t lid_in_owner = bin_search(
                 d_ltog + owner_base, owner_owned, global_id);
+            // Verify the binary search found an exact match
+            if (lid_in_owner >= owner_owned ||
+                d_ltog[owner_base + lid_in_owner] != global_id)
+                continue;  // skip — element not in owner's owned segment
             uint8_t stash_idx = find_stash_idx(owner);
+            if (stash_idx == 0xFF) continue;  // owner not in stash
             LPPair pair(i, lid_in_owner, stash_idx);
-            // Use the existing LPHashTable::insert which is __host__ __device__
             LPHashTable ht_copy = ht_tmpl;
             ht_copy.m_table = table;
             ht_copy.m_stash = ht_st;

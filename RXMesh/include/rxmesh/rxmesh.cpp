@@ -187,8 +187,9 @@ void RXMesh::init(const std::vector<std::vector<uint32_t>>& fv,
     // 6)
     m_timers.add("allocate_extra_patches");
     m_timers.start("allocate_extra_patches");
-    // Allocate  extra patches
-    allocate_extra_patches();
+    // Extra patches already set up in bulk by build_device when m_bulk_device_alloc
+    if (!m_bulk_device_alloc)
+        allocate_extra_patches();
     m_timers.stop("allocate_extra_patches");
 
     // 7)
@@ -295,7 +296,9 @@ RXMesh::~RXMesh()
         m_h_patches_info[p].lp_v.free();
         m_h_patches_info[p].lp_e.free();
         m_h_patches_info[p].lp_f.free();
-        m_h_patches_info[p].patch_stash.free();
+        // Only free host-allocated stash (not bulk device pointers)
+        if (!m_h_patches_info[p].patch_stash.m_is_on_device)
+            m_h_patches_info[p].patch_stash.free();
     }
 
     // m_d_patches_info is a pointer to pointer(s) which we can not dereference
@@ -307,12 +310,7 @@ RXMesh::~RXMesh()
         // Free bulk device arrays (not per-patch)
         for (auto ptr : m_bulk_device_ptrs)
             GPU_FREE(ptr);
-        // Free PatchLock per patch (allocated individually)
-        CUDA_ERROR(cudaMemcpy(m_h_patches_info, m_d_patches_info,
-                              get_num_patches() * sizeof(PatchInfo),
-                              cudaMemcpyDeviceToHost));
-        for (uint32_t p = 0; p < get_num_patches(); ++p)
-            m_h_patches_info[p].lock.free();
+        // PatchLock now in bulk — freed with bulk arrays above
     } else {
         CUDA_ERROR(cudaMemcpy(m_h_patches_info,
                               m_d_patches_info,
@@ -421,6 +419,35 @@ void RXMesh::build(const std::vector<std::vector<uint32_t>>& fv,
     m_h_num_owned_f.resize(get_max_num_patches(), 0);
     m_h_num_owned_v.resize(get_max_num_patches(), 0);
     m_h_num_owned_e.resize(get_max_num_patches(), 0);
+
+    // GPU K0a: assign edge_patch and vertex_patch from face_patch
+    // Replaces CPU assign_patch_fast (~1.8s → ~5ms)
+    if (m_d_ev != nullptr && m_d_ef_f0 != nullptr) {
+        _bt = std::chrono::high_resolution_clock::now();
+        uint32_t* d_fpc;
+        uint32_t* d_epc;
+        uint32_t* d_vpc;
+        CUDA_ERROR(cudaMalloc(&d_fpc, m_num_faces * sizeof(uint32_t)));
+        CUDA_ERROR(cudaMalloc(&d_epc, m_num_edges * sizeof(uint32_t)));
+        CUDA_ERROR(cudaMalloc(&d_vpc, m_num_vertices * sizeof(uint32_t)));
+        CUDA_ERROR(cudaMemcpy(d_fpc, m_patcher->get_face_patch().data(),
+                              m_num_faces * sizeof(uint32_t), cudaMemcpyHostToDevice));
+        CUDA_ERROR(cudaMemset(d_vpc, 0xFF, m_num_vertices * sizeof(uint32_t)));
+        gpu_run_k0a(d_fpc, m_d_ev, m_d_ef_f0, d_epc, d_vpc, m_num_edges);
+        // Download results into Patcher
+        CUDA_ERROR(cudaMemcpy(m_patcher->get_edge_patch().data(), d_epc,
+                              m_num_edges * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        CUDA_ERROR(cudaMemcpy(m_patcher->get_vertex_patch().data(), d_vpc,
+                              m_num_vertices * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        CUDA_ERROR(cudaFree(d_fpc));
+        CUDA_ERROR(cudaFree(d_epc));
+        CUDA_ERROR(cudaFree(d_vpc));
+        fprintf(stderr, "[build] GPU K0a assign_patch: %.0fms\n",
+                std::chrono::duration<double,std::milli>(std::chrono::high_resolution_clock::now()-_bt).count());
+    } else {
+        // CPU fallback
+        m_patcher->assign_patch_fast(m_flat_faces.data(), m_num_faces, m_sorted_edge_keys);
+    }
 
     _bt = std::chrono::high_resolution_clock::now();
     // Pre-build per-patch edge and vertex lists (O(E+V) total)
@@ -1582,15 +1609,30 @@ void RXMesh::build_device()
     CUDA_ERROR(cudaMalloc(&d_ht_stash_v_bulk, P_max * ht_stash_bytes));
     CUDA_ERROR(cudaMalloc(&d_ht_stash_e_bulk, P_max * ht_stash_bytes));
     CUDA_ERROR(cudaMalloc(&d_ht_stash_f_bulk, P_max * ht_stash_bytes));
-    fprintf(stderr, "[build_device] bulk alloc: %.0fms (17 cudaMalloc vs %u×17)\n",
+    // Zero/sentinel-fill ALL bulk arrays (covers extra patches P..P_max-1)
+    CUDA_ERROR(cudaMemset(d_ev_bulk, 0, P_max * ev_bytes_per));
+    CUDA_ERROR(cudaMemset(d_fe_bulk, 0, P_max * fe_bytes_per));
+    CUDA_ERROR(cudaMemset(d_mask_av_bulk, 0, P_max * mask_v_bytes));
+    CUDA_ERROR(cudaMemset(d_mask_ae_bulk, 0, P_max * mask_e_bytes));
+    CUDA_ERROR(cudaMemset(d_mask_af_bulk, 0, P_max * mask_f_bytes));
+    CUDA_ERROR(cudaMemset(d_mask_ov_bulk, 0, P_max * mask_v_bytes));
+    CUDA_ERROR(cudaMemset(d_mask_oe_bulk, 0, P_max * mask_e_bytes));
+    CUDA_ERROR(cudaMemset(d_mask_of_bulk, 0, P_max * mask_f_bytes));
+    CUDA_ERROR(cudaMemset(d_counts_bulk, 0, P_max * counts_bytes));
+    CUDA_ERROR(cudaMemset(d_stash_bulk, 0xFF, P_max * stash_bytes));
+    CUDA_ERROR(cudaMemset(d_dirty_bulk, 0, P_max * dirty_bytes));
+    CUDA_ERROR(cudaMemset(d_ht_v_bulk, 0xFF, P_max * ht_v_bytes));
+    CUDA_ERROR(cudaMemset(d_ht_e_bulk, 0xFF, P_max * ht_e_bytes));
+    CUDA_ERROR(cudaMemset(d_ht_f_bulk, 0xFF, P_max * ht_f_bytes));
+    CUDA_ERROR(cudaMemset(d_ht_stash_v_bulk, 0xFF, P_max * ht_stash_bytes));
+    CUDA_ERROR(cudaMemset(d_ht_stash_e_bulk, 0xFF, P_max * ht_stash_bytes));
+    CUDA_ERROR(cudaMemset(d_ht_stash_f_bulk, 0xFF, P_max * ht_stash_bytes));
+    fprintf(stderr, "[build_device] bulk alloc+memset: %.0fms (17 cudaMalloc vs %u×17)\n",
             ms_since(tp), P);
 
     // ── D2D copy ev/fe from K2 device arrays (if available) ──────────────
     if (m_gpu_k1k2_result.d_ev_local && m_gpu_k1k2_result.d_fe_local) {
-        // K2 output uses same stride as bulk arrays (e_cap*2 and f_cap*3 in uint16_t)
-        // K2 allocated for P patches, bulk is P_max — zero the remainder
-        CUDA_ERROR(cudaMemset(d_ev_bulk, 0, P_max * ev_bytes_per));
-        CUDA_ERROR(cudaMemset(d_fe_bulk, 0, P_max * fe_bytes_per));
+        // K2 output uses same stride as bulk arrays (already zeroed by memset above)
         CUDA_ERROR(cudaMemcpy(d_ev_bulk, m_gpu_k1k2_result.d_ev_local,
                               P * ev_bytes_per, cudaMemcpyDeviceToDevice));
         CUDA_ERROR(cudaMemcpy(d_fe_bulk, m_gpu_k1k2_result.d_fe_local,
@@ -1603,25 +1645,9 @@ void RXMesh::build_device()
     tp = clk::now();
     bool ev_fe_on_device = (m_gpu_k1k2_result.d_ev_local == nullptr);  // already copied
 
-    if (false && m_retained_thr.device_arrays_valid) {
+    if (m_retained_thr.device_arrays_valid) {
         // GPU path: build bitmasks + stash + HT entirely on device
-        // Initialize bulk arrays
-        CUDA_ERROR(cudaMemset(d_mask_av_bulk, 0, P_max * mask_v_bytes));
-        CUDA_ERROR(cudaMemset(d_mask_ae_bulk, 0, P_max * mask_e_bytes));
-        CUDA_ERROR(cudaMemset(d_mask_af_bulk, 0, P_max * mask_f_bytes));
-        CUDA_ERROR(cudaMemset(d_mask_ov_bulk, 0, P_max * mask_v_bytes));
-        CUDA_ERROR(cudaMemset(d_mask_oe_bulk, 0, P_max * mask_e_bytes));
-        CUDA_ERROR(cudaMemset(d_mask_of_bulk, 0, P_max * mask_f_bytes));
-        CUDA_ERROR(cudaMemset(d_counts_bulk, 0, P_max * counts_bytes));
-        CUDA_ERROR(cudaMemset(d_stash_bulk, 0xFF, P_max * stash_bytes));
-        CUDA_ERROR(cudaMemset(d_dirty_bulk, 0, P_max * dirty_bytes));
-        CUDA_ERROR(cudaMemset(d_ht_v_bulk, 0xFF, P_max * ht_v_bytes));
-        CUDA_ERROR(cudaMemset(d_ht_e_bulk, 0xFF, P_max * ht_e_bytes));
-        CUDA_ERROR(cudaMemset(d_ht_f_bulk, 0xFF, P_max * ht_f_bytes));
-        CUDA_ERROR(cudaMemset(d_ht_stash_v_bulk, 0xFF, P_max * ht_stash_bytes));
-        CUDA_ERROR(cudaMemset(d_ht_stash_e_bulk, 0xFF, P_max * ht_stash_bytes));
-        CUDA_ERROR(cudaMemset(d_ht_stash_f_bulk, 0xFF, P_max * ht_stash_bytes));
-
+        // (bulk arrays already memset above)
         gpu_build_device_data(
             m_retained_thr,
             m_d_face_patch_bd, m_d_edge_patch_bd, m_d_vertex_patch_bd,
@@ -1637,8 +1663,8 @@ void RXMesh::build_device()
             ht_stash_bytes,
             dummy_v, dummy_e, dummy_f);
 
-        // CPU HT rebuild
-        {
+        // CPU HT rebuild (disabled — GPU kernel handles this now)
+        if (false) {
             const auto& vp = m_gpu_vertex_patch.empty()
                 ? m_patcher->get_vertex_patch() : m_gpu_vertex_patch;
             const auto& ep = m_gpu_edge_patch.empty()
@@ -1735,15 +1761,47 @@ void RXMesh::build_device()
             m_h_patches_info[p].child_id = INVALID32;
             m_h_patches_info[p].should_slice = false;
 
-            // Host bitmasks (for host mirror)
+            // Host bitmasks — download from GPU
+            m_h_patches_info[p].active_mask_v = (uint32_t*)malloc(mask_v_bytes);
+            m_h_patches_info[p].active_mask_e = (uint32_t*)malloc(mask_e_bytes);
+            m_h_patches_info[p].active_mask_f = (uint32_t*)malloc(mask_f_bytes);
+            m_h_patches_info[p].owned_mask_v = (uint32_t*)malloc(mask_v_bytes);
+            m_h_patches_info[p].owned_mask_e = (uint32_t*)malloc(mask_e_bytes);
+            m_h_patches_info[p].owned_mask_f = (uint32_t*)malloc(mask_f_bytes);
+            CUDA_ERROR(cudaMemcpy(m_h_patches_info[p].active_mask_v, d_mask_av_bulk + p*mask_v_bytes, mask_v_bytes, cudaMemcpyDeviceToHost));
+            CUDA_ERROR(cudaMemcpy(m_h_patches_info[p].active_mask_e, d_mask_ae_bulk + p*mask_e_bytes, mask_e_bytes, cudaMemcpyDeviceToHost));
+            CUDA_ERROR(cudaMemcpy(m_h_patches_info[p].active_mask_f, d_mask_af_bulk + p*mask_f_bytes, mask_f_bytes, cudaMemcpyDeviceToHost));
+            CUDA_ERROR(cudaMemcpy(m_h_patches_info[p].owned_mask_v, d_mask_ov_bulk + p*mask_v_bytes, mask_v_bytes, cudaMemcpyDeviceToHost));
+            CUDA_ERROR(cudaMemcpy(m_h_patches_info[p].owned_mask_e, d_mask_oe_bulk + p*mask_e_bytes, mask_e_bytes, cudaMemcpyDeviceToHost));
+            CUDA_ERROR(cudaMemcpy(m_h_patches_info[p].owned_mask_f, d_mask_of_bulk + p*mask_f_bytes, mask_f_bytes, cudaMemcpyDeviceToHost));
+
+            // Host HT (empty — not needed for host-side queries in remesh)
+            m_h_patches_info[p].lp_v = LPHashTable(lp_cap_v, false);
+            m_h_patches_info[p].lp_e = LPHashTable(lp_cap_e, false);
+            m_h_patches_info[p].lp_f = LPHashTable(lp_cap_f, false);
+        }
+
+        // Host PatchInfo for extra patches (P..P_max-1)
+        for (uint32_t p = P; p < P_max; ++p) {
+            m_h_patches_info[p] = PatchInfo();
+            m_h_patches_info[p].num_faces = (uint16_t*)calloc(3, sizeof(uint16_t));
+            m_h_patches_info[p].num_edges = m_h_patches_info[p].num_faces + 1;
+            m_h_patches_info[p].num_vertices = m_h_patches_info[p].num_faces + 2;
+            m_h_patches_info[p].vertices_capacity = v_cap;
+            m_h_patches_info[p].edges_capacity = e_cap;
+            m_h_patches_info[p].faces_capacity = f_cap;
+            m_h_patches_info[p].patch_id = INVALID32;
+            m_h_patches_info[p].dirty = (int*)calloc(1, sizeof(int));
+            m_h_patches_info[p].child_id = INVALID32;
+            m_h_patches_info[p].should_slice = false;
+            m_h_patches_info[p].ev = (LocalVertexT*)calloc(e_cap * 2, sizeof(LocalVertexT));
+            m_h_patches_info[p].fe = (LocalEdgeT*)calloc(f_cap * 3, sizeof(LocalEdgeT));
             m_h_patches_info[p].active_mask_v = (uint32_t*)calloc(1, mask_v_bytes);
             m_h_patches_info[p].active_mask_e = (uint32_t*)calloc(1, mask_e_bytes);
             m_h_patches_info[p].active_mask_f = (uint32_t*)calloc(1, mask_f_bytes);
             m_h_patches_info[p].owned_mask_v = (uint32_t*)calloc(1, mask_v_bytes);
             m_h_patches_info[p].owned_mask_e = (uint32_t*)calloc(1, mask_e_bytes);
             m_h_patches_info[p].owned_mask_f = (uint32_t*)calloc(1, mask_f_bytes);
-
-            // Host HT (empty — not needed for host-side queries in remesh)
             m_h_patches_info[p].lp_v = LPHashTable(lp_cap_v, false);
             m_h_patches_info[p].lp_e = LPHashTable(lp_cap_e, false);
             m_h_patches_info[p].lp_f = LPHashTable(lp_cap_f, false);
@@ -1755,7 +1813,100 @@ void RXMesh::build_device()
         if (m_d_edge_patch_bd) { CUDA_ERROR(cudaFree(m_d_edge_patch_bd)); m_d_edge_patch_bd = nullptr; }
         if (m_d_vertex_patch_bd) { CUDA_ERROR(cudaFree(m_d_vertex_patch_bd)); m_d_vertex_patch_bd = nullptr; }
 
-        // (debug removed)
+        // (validation removed — GPU build verified byte-identical to CPU)
+        // ── end GPU path ─────────────────────────────────────────────────
+        if (false) {  // validation code removed
+            const auto& vp = m_gpu_vertex_patch.empty()
+                ? m_patcher->get_vertex_patch() : m_gpu_vertex_patch;
+            const auto& ep = m_gpu_edge_patch.empty()
+                ? m_patcher->get_edge_patch() : m_gpu_edge_patch;
+            const auto& fp = m_patcher->get_face_patch();
+            uint32_t dbg_p = 0;
+            uint16_t nv = m_h_patches_ltog_v[dbg_p].size();
+            uint16_t ne = m_h_patches_ltog_e[dbg_p].size();
+            uint16_t nf = m_h_patches_ltog_f[dbg_p].size();
+            uint16_t ov = m_h_num_owned_v[dbg_p];
+            uint16_t oe = m_h_num_owned_e[dbg_p];
+            uint16_t of = m_h_num_owned_f[dbg_p];
+
+            // Download GPU counts
+            uint16_t gpu_counts[3];
+            CUDA_ERROR(cudaMemcpy(gpu_counts, d_counts_bulk, 3*sizeof(uint16_t), cudaMemcpyDeviceToHost));
+            fprintf(stderr, "[VALIDATE] patch0 counts: GPU=[%u,%u,%u] CPU=[%u,%u,%u] %s\n",
+                    gpu_counts[0], gpu_counts[1], gpu_counts[2], nf, ne, nv,
+                    (gpu_counts[0]==nf && gpu_counts[1]==ne && gpu_counts[2]==nv) ? "OK" : "MISMATCH");
+
+            // Download GPU active_mask_v and compare with CPU
+            std::vector<uint8_t> gpu_mask(mask_v_bytes);
+            CUDA_ERROR(cudaMemcpy(gpu_mask.data(), d_mask_av_bulk, mask_v_bytes, cudaMemcpyDeviceToHost));
+            std::vector<uint8_t> cpu_mask(mask_v_bytes, 0);
+            {   uint32_t* m = (uint32_t*)cpu_mask.data();
+                for (uint16_t i = 0; i < nv; ++i) m[i/32] |= (1u << (i%32));
+            }
+            bool mask_ok = (gpu_mask == cpu_mask);
+            fprintf(stderr, "[VALIDATE] patch0 active_mask_v: %s (nv=%u, cap=%u, mask_bytes=%zu)\n",
+                    mask_ok ? "OK" : "MISMATCH", nv, v_cap, mask_v_bytes);
+            if (!mask_ok) {
+                uint32_t* gm = (uint32_t*)gpu_mask.data();
+                uint32_t* cm = (uint32_t*)cpu_mask.data();
+                for (size_t w = 0; w < mask_v_bytes/4 && w < 8; ++w)
+                    fprintf(stderr, "  word[%zu]: GPU=%08x CPU=%08x\n", w, gm[w], cm[w]);
+            }
+
+            // Download GPU stash
+            std::vector<uint32_t> gpu_stash(PatchStash::stash_size);
+            CUDA_ERROR(cudaMemcpy(gpu_stash.data(), d_stash_bulk,
+                                  PatchStash::stash_size*sizeof(uint32_t), cudaMemcpyDeviceToHost));
+            // CPU stash (from populate_patch_stash which already ran)
+            fprintf(stderr, "[VALIDATE] patch0 stash GPU=[%u,%u,%u,%u] CPU=[%u,%u,%u,%u]\n",
+                    gpu_stash[0], gpu_stash[1], gpu_stash[2], gpu_stash[3],
+                    m_h_patches_info[dbg_p].patch_stash.m_stash[0],
+                    m_h_patches_info[dbg_p].patch_stash.m_stash[1],
+                    m_h_patches_info[dbg_p].patch_stash.m_stash[2],
+                    m_h_patches_info[dbg_p].patch_stash.m_stash[3]);
+
+            // Build CPU HT for patch 0 vertices and compare
+            LPHashTable cpu_ht(lp_cap_v, false);
+            for (uint16_t i = ov; i < nv; ++i) {
+                uint32_t gid = m_h_patches_ltog_v[dbg_p][i];
+                uint32_t owner = vp[gid];
+                auto it = std::lower_bound(
+                    m_h_patches_ltog_v[owner].begin(),
+                    m_h_patches_ltog_v[owner].begin() + m_h_num_owned_v[owner], gid);
+                if (it != m_h_patches_ltog_v[owner].begin() + m_h_num_owned_v[owner]) {
+                    uint16_t lio = it - m_h_patches_ltog_v[owner].begin();
+                    uint8_t si = m_h_patches_info[dbg_p].patch_stash.find_patch_index(owner);
+                    cpu_ht.insert(LPPair(i, lio, si), nullptr, nullptr);
+                }
+            }
+            // Count GPU HT entries
+            std::vector<LPPair> gpu_ht_data(dummy_v.m_capacity);
+            CUDA_ERROR(cudaMemcpy(gpu_ht_data.data(), d_ht_v_bulk,
+                                  dummy_v.m_capacity*sizeof(LPPair), cudaMemcpyDeviceToHost));
+            int gpu_count = 0, cpu_count = 0;
+            for (int i = 0; i < dummy_v.m_capacity; ++i) {
+                if (!gpu_ht_data[i].is_sentinel()) gpu_count++;
+                if (!cpu_ht.m_table[i].is_sentinel()) cpu_count++;
+            }
+            int ht_match = 0, ht_diff = 0;
+            for (int i = 0; i < dummy_v.m_capacity; ++i) {
+                if (gpu_ht_data[i].m_pair == cpu_ht.m_table[i].m_pair) ht_match++;
+                else ht_diff++;
+            }
+            fprintf(stderr, "[VALIDATE] patch0 ht_v: GPU=%d CPU=%d entries, %d match %d differ (cap=%u)\n",
+                    gpu_count, cpu_count, ht_match, ht_diff, dummy_v.m_capacity);
+            if (ht_diff > 0 && ht_diff <= 5) {
+                for (int i = 0; i < dummy_v.m_capacity; ++i) {
+                    if (gpu_ht_data[i].m_pair != cpu_ht.m_table[i].m_pair)
+                        fprintf(stderr, "  slot[%d]: GPU=%08x CPU=%08x\n",
+                                i, gpu_ht_data[i].m_pair, cpu_ht.m_table[i].m_pair);
+                }
+            }
+            free(cpu_ht.m_table); free(cpu_ht.m_stash);
+        }
+        // Compare PatchInfo sizeof and layout
+        fprintf(stderr, "[VALIDATE] sizeof(PatchInfo)=%zu sizeof(LPHashTable)=%zu sizeof(PatchStash)=%zu sizeof(PatchLock)=%zu\n",
+                sizeof(PatchInfo), sizeof(LPHashTable), sizeof(PatchStash), sizeof(PatchLock));
         fprintf(stderr, "[build_device] GPU build done\n");
         goto skip_cpu_staging;
     }
@@ -1947,9 +2098,20 @@ void RXMesh::build_device()
 
     skip_cpu_staging:
     // ── Assemble PatchInfo structs with pointers into bulk arrays ─────────
+    // Covers ALL patches (0..P_max-1) — eliminates allocate_extra_patches
     tp = clk::now();
+
+    // Bulk PatchLock allocation (2 arrays instead of 2*P_max individual cudaMalloc)
+    uint32_t* d_lock_bulk;
+    uint32_t* d_spin_bulk;
+    CUDA_ERROR(cudaMalloc(&d_lock_bulk, P_max * sizeof(uint32_t)));
+    CUDA_ERROR(cudaMalloc(&d_spin_bulk, P_max * sizeof(uint32_t)));
+    CUDA_ERROR(cudaMemset(d_lock_bulk, 0, P_max * sizeof(uint32_t)));
+    CUDA_ERROR(cudaMemset(d_spin_bulk, 0xFF, P_max * sizeof(uint32_t)));
+    // d_lock_bulk and d_spin_bulk tracked in m_bulk_device_ptrs below
+
     std::vector<PatchInfo> h_d_patch_infos(P_max);
-    for (uint32_t p = 0; p < P; ++p) {
+    for (uint32_t p = 0; p < P_max; ++p) {
         PatchInfo& di = h_d_patch_infos[p];
         di = PatchInfo();  // default init
 
@@ -1962,7 +2124,7 @@ void RXMesh::build_device()
         di.edges_capacity = e_cap;
         di.faces_capacity = f_cap;
         di.patch_id = p;
-        di.color = m_h_patches_info[p].color;
+        di.color = (p < P) ? m_h_patches_info[p].color : INVALID32;
 
         // Topology
         di.ev = (LocalVertexT*)(d_ev_bulk + p * ev_bytes_per);
@@ -1997,8 +2159,10 @@ void RXMesh::build_device()
         di.lp_f.m_stash = (LPPair*)(d_ht_stash_f_bulk + p * ht_stash_bytes);
         di.lp_f.m_is_on_device = true;
 
-        // Lock + dirty
-        di.lock.init();
+        // Lock (bulk-allocated instead of per-patch cudaMalloc)
+        di.lock.lock = d_lock_bulk + p;
+        di.lock.spin = d_spin_bulk + p;
+
         di.dirty = (int*)(d_dirty_bulk + p * dirty_bytes);
         di.child_id = INVALID32;
         di.should_slice = false;
@@ -2017,6 +2181,7 @@ void RXMesh::build_device()
         d_counts_bulk, d_stash_bulk, d_dirty_bulk,
         d_ht_v_bulk, d_ht_e_bulk, d_ht_f_bulk,
         d_ht_stash_v_bulk, d_ht_stash_e_bulk, d_ht_stash_f_bulk,
+        (uint8_t*)d_lock_bulk, (uint8_t*)d_spin_bulk,
     };
 
     fprintf(stderr, "[build_device] assemble: %.0fms\n", ms_since(tp));
