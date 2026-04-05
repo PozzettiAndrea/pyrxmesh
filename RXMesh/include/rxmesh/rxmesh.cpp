@@ -462,24 +462,7 @@ void RXMesh::build(const std::vector<std::vector<uint32_t>>& fv,
         m_patcher->assign_patch_fast(m_flat_faces.data(), m_num_faces, m_sorted_edge_keys);
     }
 
-    _bt = std::chrono::high_resolution_clock::now();
-    // Pre-build per-patch edge and vertex lists (O(E+V) total)
-    // so each patch only iterates its own elements, not all 10M+.
-    std::vector<std::vector<uint32_t>> edges_by_patch(get_num_patches());
-    std::vector<std::vector<uint32_t>> verts_by_patch(get_num_patches());
-    for (uint32_t e = 0; e < m_num_edges; ++e) {
-        uint32_t pid = m_patcher->get_edge_patch_id(e);
-        if (pid < get_num_patches())
-            edges_by_patch[pid].push_back(e);
-    }
-    for (uint32_t v = 0; v < m_num_vertices; ++v) {
-        uint32_t pid = m_patcher->get_vertex_patch_id(v);
-        if (pid < get_num_patches())
-            verts_by_patch[pid].push_back(v);
-    }
-
-    fprintf(stderr, "[build] edge/vert_by_patch: %.0fms\n",
-            std::chrono::duration<double,std::milli>(std::chrono::high_resolution_clock::now()-_bt).count());
+    // edge/vert_by_patch removed — only used by CPU fallback ltog (Approach A replaces it)
 
     // Approach A + K2: build ltog on GPU, retain device arrays for K2 topology
     // Device pointers for patcher data — kept alive for K2
@@ -548,11 +531,20 @@ void RXMesh::build(const std::vector<std::vector<uint32_t>>& fv,
 
         // Keep all other device arrays alive for K2 (freed after K2 launch below)
     } else {
-        // CPU fallback
+        // CPU fallback (only when GPU topology unavailable)
+        std::vector<std::vector<uint32_t>> edges_by_patch(get_num_patches());
+        std::vector<std::vector<uint32_t>> verts_by_patch(get_num_patches());
+        for (uint32_t e = 0; e < m_num_edges; ++e) {
+            uint32_t pid = m_patcher->get_edge_patch_id(e);
+            if (pid < get_num_patches()) edges_by_patch[pid].push_back(e);
+        }
+        for (uint32_t v = 0; v < m_num_vertices; ++v) {
+            uint32_t pid = m_patcher->get_vertex_patch_id(v);
+            if (pid < get_num_patches()) verts_by_patch[pid].push_back(v);
+        }
 #pragma omp parallel for
         for (int p = 0; p < static_cast<int>(get_num_patches()); ++p) {
-            build_single_patch_ltog(p,
-                                    edges_by_patch[p], verts_by_patch[p]);
+            build_single_patch_ltog(p, edges_by_patch[p], verts_by_patch[p]);
         }
     }
 
@@ -1774,19 +1766,7 @@ void RXMesh::build_device()
             m_h_patches_info[p].child_id = INVALID32;
             m_h_patches_info[p].should_slice = false;
 
-            // Host bitmasks — download from GPU
-            m_h_patches_info[p].active_mask_v = (uint32_t*)malloc(mask_v_bytes);
-            m_h_patches_info[p].active_mask_e = (uint32_t*)malloc(mask_e_bytes);
-            m_h_patches_info[p].active_mask_f = (uint32_t*)malloc(mask_f_bytes);
-            m_h_patches_info[p].owned_mask_v = (uint32_t*)malloc(mask_v_bytes);
-            m_h_patches_info[p].owned_mask_e = (uint32_t*)malloc(mask_e_bytes);
-            m_h_patches_info[p].owned_mask_f = (uint32_t*)malloc(mask_f_bytes);
-            CUDA_ERROR(cudaMemcpy(m_h_patches_info[p].active_mask_v, d_mask_av_bulk + p*mask_v_bytes, mask_v_bytes, cudaMemcpyDeviceToHost));
-            CUDA_ERROR(cudaMemcpy(m_h_patches_info[p].active_mask_e, d_mask_ae_bulk + p*mask_e_bytes, mask_e_bytes, cudaMemcpyDeviceToHost));
-            CUDA_ERROR(cudaMemcpy(m_h_patches_info[p].active_mask_f, d_mask_af_bulk + p*mask_f_bytes, mask_f_bytes, cudaMemcpyDeviceToHost));
-            CUDA_ERROR(cudaMemcpy(m_h_patches_info[p].owned_mask_v, d_mask_ov_bulk + p*mask_v_bytes, mask_v_bytes, cudaMemcpyDeviceToHost));
-            CUDA_ERROR(cudaMemcpy(m_h_patches_info[p].owned_mask_e, d_mask_oe_bulk + p*mask_e_bytes, mask_e_bytes, cudaMemcpyDeviceToHost));
-            CUDA_ERROR(cudaMemcpy(m_h_patches_info[p].owned_mask_f, d_mask_of_bulk + p*mask_f_bytes, mask_f_bytes, cudaMemcpyDeviceToHost));
+            // Host bitmasks — pointers set from bulk download below
 
             // Host HT (empty — not needed for host-side queries in remesh)
             m_h_patches_info[p].lp_v = LPHashTable(lp_cap_v, false);
@@ -1818,6 +1798,41 @@ void RXMesh::build_device()
             m_h_patches_info[p].lp_v = LPHashTable(lp_cap_v, false);
             m_h_patches_info[p].lp_e = LPHashTable(lp_cap_e, false);
             m_h_patches_info[p].lp_f = LPHashTable(lp_cap_f, false);
+        }
+
+        // Bulk download masks to host (6 cudaMemcpy instead of 6*P)
+        {
+            auto _mbt = std::chrono::high_resolution_clock::now();
+            uint8_t* h_av = (uint8_t*)malloc(P * mask_v_bytes);
+            uint8_t* h_ae = (uint8_t*)malloc(P * mask_e_bytes);
+            uint8_t* h_af = (uint8_t*)malloc(P * mask_f_bytes);
+            uint8_t* h_ov = (uint8_t*)malloc(P * mask_v_bytes);
+            uint8_t* h_oe = (uint8_t*)malloc(P * mask_e_bytes);
+            uint8_t* h_of = (uint8_t*)malloc(P * mask_f_bytes);
+            CUDA_ERROR(cudaMemcpy(h_av, d_mask_av_bulk, P*mask_v_bytes, cudaMemcpyDeviceToHost));
+            CUDA_ERROR(cudaMemcpy(h_ae, d_mask_ae_bulk, P*mask_e_bytes, cudaMemcpyDeviceToHost));
+            CUDA_ERROR(cudaMemcpy(h_af, d_mask_af_bulk, P*mask_f_bytes, cudaMemcpyDeviceToHost));
+            CUDA_ERROR(cudaMemcpy(h_ov, d_mask_ov_bulk, P*mask_v_bytes, cudaMemcpyDeviceToHost));
+            CUDA_ERROR(cudaMemcpy(h_oe, d_mask_oe_bulk, P*mask_e_bytes, cudaMemcpyDeviceToHost));
+            CUDA_ERROR(cudaMemcpy(h_of, d_mask_of_bulk, P*mask_f_bytes, cudaMemcpyDeviceToHost));
+            for (uint32_t p = 0; p < P; ++p) {
+                m_h_patches_info[p].active_mask_v = (uint32_t*)malloc(mask_v_bytes);
+                m_h_patches_info[p].active_mask_e = (uint32_t*)malloc(mask_e_bytes);
+                m_h_patches_info[p].active_mask_f = (uint32_t*)malloc(mask_f_bytes);
+                m_h_patches_info[p].owned_mask_v = (uint32_t*)malloc(mask_v_bytes);
+                m_h_patches_info[p].owned_mask_e = (uint32_t*)malloc(mask_e_bytes);
+                m_h_patches_info[p].owned_mask_f = (uint32_t*)malloc(mask_f_bytes);
+                memcpy(m_h_patches_info[p].active_mask_v, h_av + p*mask_v_bytes, mask_v_bytes);
+                memcpy(m_h_patches_info[p].active_mask_e, h_ae + p*mask_e_bytes, mask_e_bytes);
+                memcpy(m_h_patches_info[p].active_mask_f, h_af + p*mask_f_bytes, mask_f_bytes);
+                memcpy(m_h_patches_info[p].owned_mask_v, h_ov + p*mask_v_bytes, mask_v_bytes);
+                memcpy(m_h_patches_info[p].owned_mask_e, h_oe + p*mask_e_bytes, mask_e_bytes);
+                memcpy(m_h_patches_info[p].owned_mask_f, h_of + p*mask_f_bytes, mask_f_bytes);
+            }
+            free(h_av); free(h_ae); free(h_af);
+            free(h_ov); free(h_oe); free(h_of);
+            fprintf(stderr, "[build_device] bulk mask download: %.0fms\n",
+                    std::chrono::duration<double,std::milli>(std::chrono::high_resolution_clock::now()-_mbt).count());
         }
 
         // Free retained device arrays
