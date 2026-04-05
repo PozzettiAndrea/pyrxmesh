@@ -1863,6 +1863,48 @@ __global__ static void k3_build_hashtables(
 }
 
 
+// ═══════════════════════════════════════════════════════════════════════════
+// GPU create_handles: one thread per patch, write handles for owned elements
+// ═══════════════════════════════════════════════════════════════════════════
+
+void gpu_create_handles(
+    const uint32_t* d_vertex_prefix,
+    const uint32_t* d_edge_prefix,
+    const uint32_t* d_face_prefix,
+    const uint16_t* d_num_owned_v,
+    const uint16_t* d_num_owned_e,
+    const uint16_t* d_num_owned_f,
+    uint32_t num_patches,
+    void* d_v_handles,
+    void* d_e_handles,
+    void* d_f_handles)
+{
+    // Handle is uint64_t = (patch_id << 32) | local_id
+    thrust::for_each(thrust::device,
+        thrust::make_counting_iterator(0u),
+        thrust::make_counting_iterator(num_patches),
+        [d_vertex_prefix, d_edge_prefix, d_face_prefix,
+         d_num_owned_v, d_num_owned_e, d_num_owned_f,
+         d_vh = (uint64_t*)d_v_handles,
+         d_eh = (uint64_t*)d_e_handles,
+         d_fh = (uint64_t*)d_f_handles
+        ] __device__ (uint32_t p) {
+            uint32_t vb = d_vertex_prefix[p];
+            for (uint16_t v = 0; v < d_num_owned_v[p]; ++v)
+                d_vh[vb + v] = (uint64_t(p) << 32) | uint64_t(v);
+
+            uint32_t eb = d_edge_prefix[p];
+            for (uint16_t e = 0; e < d_num_owned_e[p]; ++e)
+                d_eh[eb + e] = (uint64_t(p) << 32) | uint64_t(e);
+
+            uint32_t fb = d_face_prefix[p];
+            for (uint16_t f = 0; f < d_num_owned_f[p]; ++f)
+                d_fh[fb + f] = (uint64_t(p) << 32) | uint64_t(f);
+        });
+    CUDA_ERROR(cudaDeviceSynchronize());
+}
+
+
 void gpu_build_stash(
     const ThrustLtogResult& thr,
     const uint32_t* d_face_patch,

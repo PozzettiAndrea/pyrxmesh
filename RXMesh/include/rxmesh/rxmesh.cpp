@@ -749,32 +749,37 @@ void RXMesh::create_handles()
     CUDA_ERROR(
         cudaMalloc((void**)&m_d_f_handles, sizeof(FaceHandle) * m_num_faces));
 
-    // Fast handle creation using owned counts + prefix sums (no bitmask reads)
-    // For a fresh mesh: owned elements are [0..num_owned), none deleted.
-    for (uint32_t p = 0; p < get_num_patches(); ++p) {
-        uint32_t v_base = m_h_vertex_prefix[p];
-        for (uint16_t v = 0; v < m_h_num_owned_v[p]; ++v)
-            m_h_v_handles[v_base + v] = VertexHandle(p, LocalVertexT(v));
+    // GPU handle creation: build on device, download to host
+    {
+        // Upload owned counts
+        uint16_t* d_nov; uint16_t* d_noe; uint16_t* d_nof;
+        uint32_t P = get_num_patches();
+        CUDA_ERROR(cudaMalloc(&d_nov, P * sizeof(uint16_t)));
+        CUDA_ERROR(cudaMalloc(&d_noe, P * sizeof(uint16_t)));
+        CUDA_ERROR(cudaMalloc(&d_nof, P * sizeof(uint16_t)));
+        CUDA_ERROR(cudaMemcpy(d_nov, m_h_num_owned_v.data(), P*sizeof(uint16_t), cudaMemcpyHostToDevice));
+        CUDA_ERROR(cudaMemcpy(d_noe, m_h_num_owned_e.data(), P*sizeof(uint16_t), cudaMemcpyHostToDevice));
+        CUDA_ERROR(cudaMemcpy(d_nof, m_h_num_owned_f.data(), P*sizeof(uint16_t), cudaMemcpyHostToDevice));
 
-        uint32_t e_base = m_h_edge_prefix[p];
-        for (uint16_t e = 0; e < m_h_num_owned_e[p]; ++e)
-            m_h_e_handles[e_base + e] = EdgeHandle(p, LocalEdgeT(e));
+        gpu_create_handles(m_d_vertex_prefix, m_d_edge_prefix, m_d_face_prefix,
+                           d_nov, d_noe, d_nof, P,
+                           m_d_v_handles, m_d_e_handles, m_d_f_handles);
 
-        uint32_t f_base = m_h_face_prefix[p];
-        for (uint16_t f = 0; f < m_h_num_owned_f[p]; ++f)
-            m_h_f_handles[f_base + f] = FaceHandle(p, LocalFaceT(f));
+        CUDA_ERROR(cudaFree(d_nov));
+        CUDA_ERROR(cudaFree(d_noe));
+        CUDA_ERROR(cudaFree(d_nof));
     }
 
-    // Upload to device
-    CUDA_ERROR(cudaMemcpy(m_d_v_handles, m_h_v_handles,
+    // Download to host (for host-side iteration APIs)
+    CUDA_ERROR(cudaMemcpy(m_h_v_handles, m_d_v_handles,
                           sizeof(VertexHandle) * m_num_vertices,
-                          cudaMemcpyHostToDevice));
-    CUDA_ERROR(cudaMemcpy(m_d_e_handles, m_h_e_handles,
+                          cudaMemcpyDeviceToHost));
+    CUDA_ERROR(cudaMemcpy(m_h_e_handles, m_d_e_handles,
                           sizeof(EdgeHandle) * m_num_edges,
-                          cudaMemcpyHostToDevice));
-    CUDA_ERROR(cudaMemcpy(m_d_f_handles, m_h_f_handles,
+                          cudaMemcpyDeviceToHost));
+    CUDA_ERROR(cudaMemcpy(m_h_f_handles, m_d_f_handles,
                           sizeof(FaceHandle) * m_num_faces,
-                          cudaMemcpyHostToDevice));
+                          cudaMemcpyDeviceToHost));
 }
 // ── GPU sort-scan topology construction ──────────────────────────────────
 // Builds edge/adjacency data on GPU using thrust sort + scan,

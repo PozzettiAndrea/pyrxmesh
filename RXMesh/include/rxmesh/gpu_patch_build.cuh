@@ -156,6 +156,19 @@ struct ThrustLtogResult {
     }
 };
 
+// GPU create_handles: build handle arrays directly on device
+void gpu_create_handles(
+    const uint32_t* d_vertex_prefix,  // [P+1]
+    const uint32_t* d_edge_prefix,
+    const uint32_t* d_face_prefix,
+    const uint16_t* d_num_owned_v,    // [P] (in ThrustLtogResult or uploaded)
+    const uint16_t* d_num_owned_e,
+    const uint16_t* d_num_owned_f,
+    uint32_t num_patches,
+    void* d_v_handles,  // VertexHandle*
+    void* d_e_handles,  // EdgeHandle*
+    void* d_f_handles); // FaceHandle*
+
 // GPU stash-only build (for populate_patch_stash before coloring)
 void gpu_build_stash(
     const ThrustLtogResult& thr,
