@@ -147,7 +147,7 @@ void RXMesh::init(const std::vector<std::vector<uint32_t>>& fv,
     build(fv, patcher_file);
     m_timers.stop("build");
 
-    // 2)
+    // 2) populate_patch_stash
     fprintf(stderr, "[init] populate_patch_stash...\n");
     m_timers.add("populate_patch_stash");
     m_timers.start("populate_patch_stash");
@@ -155,7 +155,7 @@ void RXMesh::init(const std::vector<std::vector<uint32_t>>& fv,
     m_timers.stop("populate_patch_stash");
     fprintf(stderr, "[init] populate_patch_stash done\n");
 
-    // 3)
+    // 3) coloring
     fprintf(stderr, "[init] coloring...\n");
     m_timers.add("coloring");
     m_timers.start("coloring");
@@ -164,7 +164,7 @@ void RXMesh::init(const std::vector<std::vector<uint32_t>>& fv,
     RXMESH_INFO("Num colors = {}", m_num_colors);
     fprintf(stderr, "[init] coloring done\n");
 
-    // 4)
+    // 4) build_device
     fprintf(stderr, "[init] build_device...\n");
     m_timers.add("build_device");
     m_timers.start("build_device");
@@ -707,7 +707,7 @@ void RXMesh::build(const std::vector<std::vector<uint32_t>>& fv,
 
 void RXMesh::create_handles()
 {
-    // allocate host and device memory
+    // Allocate host + device memory
     m_h_v_handles =
         (VertexHandle*)malloc(sizeof(VertexHandle) * m_num_vertices);
     m_h_e_handles = (EdgeHandle*)malloc(sizeof(EdgeHandle) * m_num_edges);
@@ -720,56 +720,30 @@ void RXMesh::create_handles()
     CUDA_ERROR(
         cudaMalloc((void**)&m_d_f_handles, sizeof(FaceHandle) * m_num_faces));
 
-    // populate m_h_v_handles, m_h_e_handles, m_h_f_handles
+    // Fast handle creation using owned counts + prefix sums (no bitmask reads)
+    // For a fresh mesh: owned elements are [0..num_owned), none deleted.
+    for (uint32_t p = 0; p < get_num_patches(); ++p) {
+        uint32_t v_base = m_h_vertex_prefix[p];
+        for (uint16_t v = 0; v < m_h_num_owned_v[p]; ++v)
+            m_h_v_handles[v_base + v] = VertexHandle(p, LocalVertexT(v));
 
-    int v_id(0), e_id(0), f_id(0);
-    for (int p = 0; p < get_num_patches(); ++p) {
-        int num_vertices = *(m_h_patches_info[p].num_vertices);
-        int num_edges    = *(m_h_patches_info[p].num_edges);
-        int num_faces    = *(m_h_patches_info[p].num_faces);
+        uint32_t e_base = m_h_edge_prefix[p];
+        for (uint16_t e = 0; e < m_h_num_owned_e[p]; ++e)
+            m_h_e_handles[e_base + e] = EdgeHandle(p, LocalEdgeT(e));
 
-
-        for (int v = 0; v < num_vertices; ++v) {
-            LocalVertexT vl(v);
-            if (m_h_patches_info[p].is_owned(vl) &&
-                !m_h_patches_info[p].is_deleted(vl)) {
-                m_h_v_handles[v_id] = VertexHandle(p, vl);
-                ++v_id;
-            }
-        }
-
-        for (int e = 0; e < num_edges; ++e) {
-            LocalEdgeT el(e);
-            if (m_h_patches_info[p].is_owned(el) &&
-                !m_h_patches_info[p].is_deleted(el)) {
-                m_h_e_handles[e_id] = EdgeHandle(p, el);
-                ++e_id;
-            }
-        }
-
-        for (int f = 0; f < num_faces; ++f) {
-            LocalFaceT fl(f);
-            if (m_h_patches_info[p].is_owned(fl) &&
-                !m_h_patches_info[p].is_deleted(fl)) {
-                m_h_f_handles[f_id] = FaceHandle(p, fl);
-                ++f_id;
-            }
-        }
+        uint32_t f_base = m_h_face_prefix[p];
+        for (uint16_t f = 0; f < m_h_num_owned_f[p]; ++f)
+            m_h_f_handles[f_base + f] = FaceHandle(p, LocalFaceT(f));
     }
 
-    // move handles to device
-    CUDA_ERROR(cudaMemcpy(m_d_v_handles,
-                          m_h_v_handles,
+    // Upload to device
+    CUDA_ERROR(cudaMemcpy(m_d_v_handles, m_h_v_handles,
                           sizeof(VertexHandle) * m_num_vertices,
                           cudaMemcpyHostToDevice));
-
-    CUDA_ERROR(cudaMemcpy(m_d_e_handles,
-                          m_h_e_handles,
+    CUDA_ERROR(cudaMemcpy(m_d_e_handles, m_h_e_handles,
                           sizeof(EdgeHandle) * m_num_edges,
                           cudaMemcpyHostToDevice));
-
-    CUDA_ERROR(cudaMemcpy(m_d_f_handles,
-                          m_h_f_handles,
+    CUDA_ERROR(cudaMemcpy(m_d_f_handles, m_h_f_handles,
                           sizeof(FaceHandle) * m_num_faces,
                           cudaMemcpyHostToDevice));
 }
@@ -1802,7 +1776,6 @@ void RXMesh::build_device()
 
         // Bulk download masks to host (6 cudaMemcpy instead of 6*P)
         {
-            auto _mbt = std::chrono::high_resolution_clock::now();
             uint8_t* h_av = (uint8_t*)malloc(P * mask_v_bytes);
             uint8_t* h_ae = (uint8_t*)malloc(P * mask_e_bytes);
             uint8_t* h_af = (uint8_t*)malloc(P * mask_f_bytes);
@@ -1831,8 +1804,6 @@ void RXMesh::build_device()
             }
             free(h_av); free(h_ae); free(h_af);
             free(h_ov); free(h_oe); free(h_of);
-            fprintf(stderr, "[build_device] bulk mask download: %.0fms\n",
-                    std::chrono::duration<double,std::milli>(std::chrono::high_resolution_clock::now()-_mbt).count());
         }
 
         // Free retained device arrays
