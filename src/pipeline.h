@@ -178,7 +178,8 @@ MeshResult pipeline_remesh(
     double relative_len,
     int iterations,
     int smooth_iterations,
-    bool verbose = false);
+    bool verbose = false,
+    float capacity_factor = 2.0f);
 
 // Shortest-edge-collapse decimation (batch histogram method).
 // target_ratio: fraction of vertices to keep.

@@ -166,13 +166,15 @@ static nb::tuple py_qslim(
 static nb::tuple py_remesh(
     const NDArray<const double, 2> vertices,
     const NDArray<const int, 2> faces,
-    double relative_len, int iterations, int smooth_iterations, bool verbose)
+    double relative_len, int iterations, int smooth_iterations, bool verbose,
+    float capacity_factor)
 {
     validate_mesh(vertices, faces);
     return mesh_result_to_tuple(pipeline_remesh(
         vertices.data(), static_cast<int>(vertices.shape(0)),
         faces.data(), static_cast<int>(faces.shape(0)),
-        relative_len, iterations, smooth_iterations, verbose));
+        relative_len, iterations, smooth_iterations, verbose,
+        capacity_factor));
 }
 
 static nb::tuple py_sec(
@@ -685,7 +687,8 @@ NB_MODULE(_pyrxmesh, m) {
         nb::arg("vertices"), nb::arg("faces"),
         nb::arg("relative_len") = 1.0,
         nb::arg("iterations") = 3, nb::arg("smooth_iterations") = 5,
-        nb::arg("verbose") = false);
+        nb::arg("verbose") = false,
+        nb::arg("capacity_factor") = 2.0f);
 
     m.def("sec", &py_sec,
         "Shortest-edge-collapse decimation.",

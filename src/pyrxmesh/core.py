@@ -226,6 +226,7 @@ def remesh(
     iterations: int = 3,
     smooth_iterations: int = 5,
     verbose: bool = False,
+    capacity_factor: float = 2.0,
 ) -> tuple[NDArray[np.float64], NDArray[np.int32]]:
     """Isotropic remeshing (split/collapse/flip/smooth).
 
@@ -233,9 +234,13 @@ def remesh(
     ----------
     relative_len : float
         Target edge length as ratio of input average edge length.
+    capacity_factor : float
+        GPU shared memory capacity factor. Lower = more GPU occupancy but
+        more patch slicing. 2.0 = default (1 block/SM), 1.5 = 2 blocks/SM.
     """
     v, f = _validate_mesh(vertices, faces)
-    return _remesh(v, f, relative_len, iterations, smooth_iterations, verbose)
+    return _remesh(v, f, relative_len, iterations, smooth_iterations, verbose,
+                   capacity_factor)
 
 
 def sec(

@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 
 #include <thrust/transform.h>
 #include <thrust/device_ptr.h>
@@ -163,7 +164,8 @@ MeshResult pipeline_remesh(
     double relative_len,
     int iterations,
     int smooth_iterations,
-    bool verbose)
+    bool verbose,
+    float capacity_factor)
 {
     using clk = std::chrono::high_resolution_clock;
     auto ms_since = [](auto t0) {
@@ -229,10 +231,16 @@ MeshResult pipeline_remesh(
     Arg.num_iter = static_cast<uint32_t>(iterations);
     Arg.num_smooth_iters = smooth_iterations;
 
+    // capacity_factor: controls shared memory per block → GPU occupancy
+    // 2.0 = ~47KB/block, 1 block/SM, 16.7% occupancy (default)
+    // 1.5 = ~33KB/block, 2 blocks/SM, 33.3% occupancy (faster but more slicing)
     tp = clk::now();
-    RXMeshDynamic rx(prep_faces_u32.data(), num_faces, "", 512, 2.0f, 1.5f);
+    RXMeshDynamic rx(prep_faces_u32.data(), num_faces, "", 512, capacity_factor, 1.5f);
     rx.add_vertex_coordinates_flat(prep_verts_f32.data(), num_vertices);
     double t_build = ms_since(tp);
+    if (verbose)
+        fprintf(stderr, "[pyrxmesh] capacity_factor=%.1f, patches=%u\n",
+                capacity_factor, rx.get_num_patches());
 
     if (!rx.is_edge_manifold())
         throw std::runtime_error("Remesh requires an edge-manifold mesh");
