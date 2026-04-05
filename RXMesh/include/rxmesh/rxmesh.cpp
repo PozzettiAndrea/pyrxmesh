@@ -2612,65 +2612,25 @@ void RXMesh::allocate_extra_patches()
 
 void RXMesh::patch_graph_coloring()
 {
-    std::vector<uint32_t> ids(m_num_patches);
-    fill_with_random_numbers(ids.data(), ids.size());
+    constexpr uint32_t SS = PatchStash::stash_size;
 
-    m_num_colors = 0;
+    // Upload flat stash array to device
+    std::vector<uint32_t> h_flat_stash(m_num_patches * SS, INVALID32);
+    for (uint32_t p = 0; p < m_num_patches; ++p)
+        memcpy(h_flat_stash.data() + p * SS,
+               m_h_patches_info[p].patch_stash.m_stash, SS * sizeof(uint32_t));
 
-    // init all colors
-    for (uint32_t p_id : ids) {
-        m_h_patches_info[p_id].color = INVALID32;
-    }
+    uint32_t* d_stash;
+    CUDA_ERROR(cudaMalloc(&d_stash, m_num_patches * SS * sizeof(uint32_t)));
+    CUDA_ERROR(cudaMemcpy(d_stash, h_flat_stash.data(),
+                          m_num_patches * SS * sizeof(uint32_t), cudaMemcpyHostToDevice));
 
-    // assign colors
-    for (uint32_t p_id : ids) {
-        PatchInfo&         patch = m_h_patches_info[p_id];
-        std::set<uint32_t> neighbours_color;
+    std::vector<uint32_t> h_colors(m_num_patches);
+    gpu_patch_coloring(d_stash, m_num_patches, SS, h_colors.data(), m_num_colors);
 
-        // One Ring
-        // put neighbour colors in a set
-        // for (uint32_t i = 0; i < patch.patch_stash.stash_size; ++i) {
-        //    uint32_t n = patch.patch_stash.get_patch(i);
-        //    if (n != INVALID32) {
-        //        uint32_t c = m_h_patches_info[n].color;
-        //        if (c != INVALID32) {
-        //            neighbours_color.insert(c);
-        //        }
-        //    }
-        //}
+    for (uint32_t p = 0; p < m_num_patches; ++p)
+        m_h_patches_info[p].color = h_colors[p];
 
-        // Two Ring
-        for (uint32_t i = 0; i < patch.patch_stash.stash_size; ++i) {
-            uint32_t n = patch.patch_stash.get_patch(i);
-            if (n != INVALID32) {
-                uint32_t c = m_h_patches_info[n].color;
-                if (c != INVALID32) {
-                    neighbours_color.insert(c);
-                }
-
-
-                for (uint32_t j = 0; j < patch.patch_stash.stash_size; ++j) {
-                    uint32_t nn = m_h_patches_info[n].patch_stash.get_patch(j);
-                    if (nn != INVALID32 && nn != patch.patch_id) {
-                        uint32_t cc = m_h_patches_info[nn].color;
-                        if (cc != INVALID32) {
-                            neighbours_color.insert(cc);
-                        }
-                    }
-                }
-            }
-        }
-
-        // find the min color id that is not in the list/set
-        for (uint32_t i = 0; i < m_num_patches; ++i) {
-            if (neighbours_color.find(i) == neighbours_color.end()) {
-                patch.color  = i;
-                m_num_colors = std::max(m_num_colors, patch.color);
-                break;
-            }
-        }
-    }
-
-    m_num_colors++;
+    CUDA_ERROR(cudaFree(d_stash));
 }
 }  // namespace rxmesh

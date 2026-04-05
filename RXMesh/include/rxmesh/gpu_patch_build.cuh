@@ -156,6 +156,14 @@ struct ThrustLtogResult {
     }
 };
 
+// GPU two-ring graph coloring via Jones-Plassmann
+void gpu_patch_coloring(
+    const uint32_t* d_stash,   // [P * stash_size] flat neighbor IDs
+    uint32_t num_patches,
+    uint32_t stash_size,
+    uint32_t* h_colors,        // [P] output on host
+    uint32_t& num_colors);
+
 // GPU create_handles: build handle arrays directly on device
 void gpu_create_handles(
     const uint32_t* d_vertex_prefix,  // [P+1]

@@ -25,6 +25,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <random>
 
 namespace rxmesh {
 
@@ -1902,6 +1903,108 @@ void gpu_create_handles(
                 d_fh[fb + f] = (uint64_t(p) << 32) | uint64_t(f);
         });
     CUDA_ERROR(cudaDeviceSynchronize());
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GPU two-ring graph coloring via Jones-Plassmann
+// ═══════════════════════════════════════════════════════════════════════════
+
+void gpu_patch_coloring(
+    const uint32_t* d_stash,   // [P * stash_size] flat neighbor IDs
+    uint32_t num_patches,
+    uint32_t stash_size,
+    uint32_t* h_colors,        // [P] output on host
+    uint32_t& num_colors)
+{
+    // Upload random priorities
+    std::vector<uint32_t> h_prio(num_patches);
+    {
+        std::mt19937 rng(42);
+        for (auto& p : h_prio) p = rng();
+    }
+    uint32_t* d_prio;
+    uint32_t* d_colors;
+    CUDA_ERROR(cudaMalloc(&d_prio, num_patches * sizeof(uint32_t)));
+    CUDA_ERROR(cudaMalloc(&d_colors, num_patches * sizeof(uint32_t)));
+    CUDA_ERROR(cudaMemcpy(d_prio, h_prio.data(), num_patches*sizeof(uint32_t), cudaMemcpyHostToDevice));
+    CUDA_ERROR(cudaMemset(d_colors, 0xFF, num_patches * sizeof(uint32_t)));  // INVALID32
+
+    uint32_t* d_remaining;  // count of uncolored
+    CUDA_ERROR(cudaMalloc(&d_remaining, sizeof(uint32_t)));
+
+    uint32_t ss = stash_size;
+    for (int round = 0; round < 200; ++round) {  // max 200 rounds
+        CUDA_ERROR(cudaMemset(d_remaining, 0, sizeof(uint32_t)));
+
+        thrust::for_each(thrust::device,
+            thrust::make_counting_iterator(0u),
+            thrust::make_counting_iterator(num_patches),
+            [d_stash, d_prio, d_colors, d_remaining, ss, num_patches
+            ] __device__ (uint32_t p) {
+                if (d_colors[p] != INVALID32) return;  // already colored
+
+                // Check if p has highest priority among uncolored 2-ring neighbors
+                uint32_t my_prio = d_prio[p];
+                const uint32_t* my_stash = d_stash + p * ss;
+
+                // Two-ring: check neighbors and neighbors-of-neighbors
+                for (uint32_t i = 0; i < ss; ++i) {
+                    uint32_t n = my_stash[i];
+                    if (n == INVALID32 || n >= num_patches) break;
+                    if (d_colors[n] == INVALID32 && d_prio[n] > my_prio)
+                        { atomicAdd(d_remaining, 1); return; }
+                    // Two-ring
+                    const uint32_t* n_stash = d_stash + n * ss;
+                    for (uint32_t j = 0; j < ss; ++j) {
+                        uint32_t nn = n_stash[j];
+                        if (nn == INVALID32 || nn >= num_patches) break;
+                        if (nn != p && d_colors[nn] == INVALID32 && d_prio[nn] > my_prio)
+                            { atomicAdd(d_remaining, 1); return; }
+                    }
+                }
+
+                // p is a local maximum — assign smallest unused color
+                // Collect 2-ring neighbor colors in a bitmask (max ~64 colors)
+                uint64_t used = 0;
+                for (uint32_t i = 0; i < ss; ++i) {
+                    uint32_t n = my_stash[i];
+                    if (n == INVALID32 || n >= num_patches) break;
+                    uint32_t c = d_colors[n];
+                    if (c != INVALID32 && c < 64) used |= (1ULL << c);
+                    const uint32_t* n_stash = d_stash + n * ss;
+                    for (uint32_t j = 0; j < ss; ++j) {
+                        uint32_t nn = n_stash[j];
+                        if (nn == INVALID32 || nn >= num_patches) break;
+                        if (nn != p) {
+                            uint32_t cc = d_colors[nn];
+                            if (cc != INVALID32 && cc < 64) used |= (1ULL << cc);
+                        }
+                    }
+                }
+                // Find first zero bit
+                for (uint32_t c = 0; c < 64; ++c) {
+                    if (!(used & (1ULL << c))) { d_colors[p] = c; return; }
+                }
+                d_colors[p] = 64;  // fallback
+            });
+        CUDA_ERROR(cudaDeviceSynchronize());
+
+        uint32_t h_rem;
+        CUDA_ERROR(cudaMemcpy(&h_rem, d_remaining, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        if (h_rem == 0) break;
+    }
+
+    // Download colors
+    CUDA_ERROR(cudaMemcpy(h_colors, d_colors, num_patches*sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    num_colors = 0;
+    for (uint32_t p = 0; p < num_patches; ++p)
+        num_colors = std::max(num_colors, h_colors[p]);
+    num_colors++;
+
+    CUDA_ERROR(cudaFree(d_prio));
+    CUDA_ERROR(cudaFree(d_colors));
+    CUDA_ERROR(cudaFree(d_remaining));
 }
 
 
