@@ -1863,6 +1863,48 @@ __global__ static void k3_build_hashtables(
 }
 
 
+void gpu_build_stash(
+    const ThrustLtogResult& thr,
+    const uint32_t* d_face_patch,
+    const uint32_t* d_edge_patch,
+    const uint32_t* d_vertex_patch,
+    uint32_t num_patches,
+    uint8_t* d_stash_bulk,
+    size_t stash_bytes_per)
+{
+    constexpr uint8_t STASH_SIZE = PatchStash::stash_size;
+    thrust::for_each(thrust::device,
+        thrust::make_counting_iterator(0u),
+        thrust::make_counting_iterator(num_patches),
+        [d_ltog_f = thr.d_ltog_f, d_ltog_e = thr.d_ltog_e, d_ltog_v = thr.d_ltog_v,
+         d_f_off = thr.d_f_offset, d_e_off = thr.d_e_offset, d_v_off = thr.d_v_offset,
+         d_nof = thr.d_num_owned_f, d_noe = thr.d_num_owned_e, d_nov = thr.d_num_owned_v,
+         d_ne = thr.d_num_elements_f, d_nee = thr.d_num_elements_e,
+         d_nev = thr.d_num_elements_v,
+         d_face_patch, d_edge_patch, d_vertex_patch,
+         d_stash_bulk, stash_bytes_per, STASH_SIZE
+        ] __device__ (uint32_t p) {
+            uint32_t* stash = (uint32_t*)(d_stash_bulk + p * stash_bytes_per);
+            uint8_t cnt = 0;
+            auto ins = [&](uint32_t owner) {
+                for (uint8_t i = 0; i < cnt; ++i)
+                    if (stash[i] == owner) return;
+                if (cnt < STASH_SIZE) stash[cnt++] = owner;
+            };
+            uint32_t fs = d_f_off[p];
+            for (uint16_t i = d_nof[p]; i < d_ne[p]; ++i)
+                ins(d_face_patch[d_ltog_f[fs + i]]);
+            uint32_t es = d_e_off[p];
+            for (uint16_t i = d_noe[p]; i < d_nee[p]; ++i)
+                ins(d_edge_patch[d_ltog_e[es + i]]);
+            uint32_t vs = d_v_off[p];
+            for (uint16_t i = d_nov[p]; i < d_nev[p]; ++i)
+                ins(d_vertex_patch[d_ltog_v[vs + i]]);
+        });
+    CUDA_ERROR(cudaDeviceSynchronize());
+}
+
+
 void gpu_build_device_data(
     const ThrustLtogResult& thr,
     const uint32_t* d_face_patch,

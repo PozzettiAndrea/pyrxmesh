@@ -147,13 +147,42 @@ void RXMesh::init(const std::vector<std::vector<uint32_t>>& fv,
     build(fv, patcher_file);
     m_timers.stop("build");
 
-    // 2) populate_patch_stash
-    fprintf(stderr, "[init] populate_patch_stash...\n");
+    // 2) populate_patch_stash — GPU if device arrays available, CPU otherwise
     m_timers.add("populate_patch_stash");
     m_timers.start("populate_patch_stash");
-    populate_patch_stash();
+    if (m_retained_thr.device_arrays_valid && m_d_face_patch_bd &&
+        m_d_edge_patch_bd && m_d_vertex_patch_bd) {
+        // GPU stash using retained device arrays
+        fprintf(stderr, "[init] GPU populate_patch_stash...\n");
+        size_t stash_bytes = PatchStash::stash_size * sizeof(uint32_t);
+        uint8_t* d_stash_tmp;
+        CUDA_ERROR(cudaMalloc(&d_stash_tmp, get_num_patches() * stash_bytes));
+        CUDA_ERROR(cudaMemset(d_stash_tmp, 0xFF, get_num_patches() * stash_bytes));
+
+        gpu_build_stash(m_retained_thr,
+                        m_d_face_patch_bd, m_d_edge_patch_bd, m_d_vertex_patch_bd,
+                        get_num_patches(), d_stash_tmp, stash_bytes);
+
+        // Download to host PatchInfo
+        std::vector<uint8_t> h_stash(get_num_patches() * stash_bytes);
+        CUDA_ERROR(cudaMemcpy(h_stash.data(), d_stash_tmp,
+                              get_num_patches() * stash_bytes, cudaMemcpyDeviceToHost));
+        for (uint32_t p = 0; p < get_num_patches(); ++p) {
+            m_h_patches_info[p].patch_stash = PatchStash(false);
+            memcpy(m_h_patches_info[p].patch_stash.m_stash,
+                   h_stash.data() + p * stash_bytes, stash_bytes);
+        }
+        for (uint32_t p = get_num_patches(); p < get_max_num_patches(); ++p)
+            m_h_patches_info[p].patch_stash = PatchStash(false);
+
+        CUDA_ERROR(cudaFree(d_stash_tmp));
+        fprintf(stderr, "[init] GPU populate_patch_stash done\n");
+    } else {
+        fprintf(stderr, "[init] populate_patch_stash...\n");
+        populate_patch_stash();
+        fprintf(stderr, "[init] populate_patch_stash done\n");
+    }
     m_timers.stop("populate_patch_stash");
-    fprintf(stderr, "[init] populate_patch_stash done\n");
 
     // 3) coloring
     fprintf(stderr, "[init] coloring...\n");

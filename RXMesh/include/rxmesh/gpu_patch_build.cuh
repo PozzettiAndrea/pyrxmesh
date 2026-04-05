@@ -156,6 +156,16 @@ struct ThrustLtogResult {
     }
 };
 
+// GPU stash-only build (for populate_patch_stash before coloring)
+void gpu_build_stash(
+    const ThrustLtogResult& thr,
+    const uint32_t* d_face_patch,
+    const uint32_t* d_edge_patch,
+    const uint32_t* d_vertex_patch,
+    uint32_t num_patches,
+    uint8_t* d_stash_bulk,
+    size_t stash_bytes_per);
+
 // GPU ribbon extraction — vertex-centric via thrust sort.
 // Replaces CPU Patcher::extract_ribbons (~1s → ~25ms).
 void gpu_extract_ribbons(
