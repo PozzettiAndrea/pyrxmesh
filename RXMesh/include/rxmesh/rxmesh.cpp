@@ -420,8 +420,7 @@ void RXMesh::build(const std::vector<std::vector<uint32_t>>& fv,
     m_h_num_owned_v.resize(get_max_num_patches(), 0);
     m_h_num_owned_e.resize(get_max_num_patches(), 0);
 
-    // GPU K0a: assign edge_patch and vertex_patch from face_patch
-    // Replaces CPU assign_patch_fast (~1.8s → ~5ms)
+    // GPU K0a: assign edge/vertex patch + GPU ribbon extraction
     if (m_d_ev != nullptr && m_d_ef_f0 != nullptr) {
         _bt = std::chrono::high_resolution_clock::now();
         uint32_t* d_fpc;
@@ -434,15 +433,29 @@ void RXMesh::build(const std::vector<std::vector<uint32_t>>& fv,
                               m_num_faces * sizeof(uint32_t), cudaMemcpyHostToDevice));
         CUDA_ERROR(cudaMemset(d_vpc, 0xFF, m_num_vertices * sizeof(uint32_t)));
         gpu_run_k0a(d_fpc, m_d_ev, m_d_ef_f0, d_epc, d_vpc, m_num_edges);
-        // Download results into Patcher
         CUDA_ERROR(cudaMemcpy(m_patcher->get_edge_patch().data(), d_epc,
                               m_num_edges * sizeof(uint32_t), cudaMemcpyDeviceToHost));
         CUDA_ERROR(cudaMemcpy(m_patcher->get_vertex_patch().data(), d_vpc,
                               m_num_vertices * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-        CUDA_ERROR(cudaFree(d_fpc));
         CUDA_ERROR(cudaFree(d_epc));
         CUDA_ERROR(cudaFree(d_vpc));
         fprintf(stderr, "[build] GPU K0a assign_patch: %.0fms\n",
+                std::chrono::duration<double,std::milli>(std::chrono::high_resolution_clock::now()-_bt).count());
+
+        // GPU ribbon extraction (d_fpc still alive, m_d_fv retained from topo)
+        _bt = std::chrono::high_resolution_clock::now();
+        uint32_t* d_rv_gpu = nullptr;
+        uint32_t* d_ro_gpu = nullptr;
+        gpu_extract_ribbons(d_fpc, m_d_fv, m_num_faces, m_num_vertices,
+                            get_num_patches(),
+                            &d_rv_gpu, &d_ro_gpu,
+                            m_patcher->get_external_ribbon_val(),
+                            m_patcher->get_external_ribbon_offset());
+        CUDA_ERROR(cudaFree(d_fpc));
+        // d_rv_gpu/d_ro_gpu freed later (or used by Approach A)
+        CUDA_ERROR(cudaFree(d_rv_gpu));
+        CUDA_ERROR(cudaFree(d_ro_gpu));
+        fprintf(stderr, "[build] GPU extract_ribbons: %.0fms\n",
                 std::chrono::duration<double,std::milli>(std::chrono::high_resolution_clock::now()-_bt).count());
     } else {
         // CPU fallback

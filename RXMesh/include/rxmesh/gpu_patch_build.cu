@@ -1492,6 +1492,261 @@ K1K2Result gpu_launch_k2(
 // GPU build_device: bitmasks + stash + hash tables entirely on GPU
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════════════════════════════════
+// GPU ribbon extraction — vertex-centric via thrust sort
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Kernel: for each multi-patch vertex, emit (patch, face) ribbon pairs
+__global__ static void emit_ribbon_pairs_kernel(
+    const uint32_t* d_vertex_offset,  // [V+1] into sorted arrays
+    const uint32_t* d_sorted_face,    // [3F] face IDs sorted by vertex
+    const uint32_t* d_sorted_patch,   // [3F] patch IDs sorted by vertex
+    uint64_t*       d_out_pairs,      // [max_pairs] output: (patch<<32)|face
+    uint32_t*       d_out_count,      // atomic counter
+    uint32_t        V)
+{
+    uint32_t v = blockIdx.x * blockDim.x + threadIdx.x;
+    if (v >= V) return;
+
+    uint32_t begin = d_vertex_offset[v];
+    uint32_t end   = d_vertex_offset[v + 1];
+    if (begin == end) return;
+
+    // Quick check: all same patch? → no ribbon pairs
+    uint32_t p0 = d_sorted_patch[begin];
+    bool multi = false;
+    for (uint32_t i = begin + 1; i < end; ++i)
+        if (d_sorted_patch[i] != p0) { multi = true; break; }
+    if (!multi) return;
+
+    // Collect distinct patches (vertex degree typically 5-7, max ~16)
+    uint32_t patches[16];
+    uint32_t np = 0;
+    for (uint32_t i = begin; i < end; ++i) {
+        uint32_t p = d_sorted_patch[i];
+        bool found = false;
+        for (uint32_t j = 0; j < np; ++j)
+            if (patches[j] == p) { found = true; break; }
+        if (!found && np < 16) patches[np++] = p;
+    }
+
+    // For each (face, patch) at this vertex, emit ribbon pairs
+    for (uint32_t i = begin; i < end; ++i) {
+        uint32_t f = d_sorted_face[i];
+        uint32_t p = d_sorted_patch[i];
+        for (uint32_t j = 0; j < np; ++j) {
+            if (patches[j] != p) {
+                uint32_t idx = atomicAdd(d_out_count, 1);
+                d_out_pairs[idx] = (uint64_t(patches[j]) << 32) | uint64_t(f);
+            }
+        }
+    }
+}
+
+void gpu_extract_ribbons(
+    const uint32_t* d_face_patch,  // [F]
+    const uint32_t* d_fv,          // [F*3]
+    uint32_t num_faces,
+    uint32_t num_vertices,
+    uint32_t num_patches,
+    // Output (caller must cudaFree)
+    uint32_t** out_d_ribbon_val,
+    uint32_t** out_d_ribbon_offset,
+    // Also populate host vectors for legacy code
+    std::vector<uint32_t>& h_ribbon_val,
+    std::vector<uint32_t>& h_ribbon_offset)
+{
+    using clk = std::chrono::high_resolution_clock;
+    auto ms_since = [](auto t0) {
+        return std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+    };
+    auto t0 = clk::now();
+    uint32_t N = num_faces * 3;
+
+    // ── Step 1: emit (vertex, face, patch) as sort keys ──────────────────
+    // Pack as (vertex_id) for sorting key, (face_id, patch_id) as values
+    uint32_t* d_vkeys;   // vertex IDs [3F]
+    uint32_t* d_fvals;   // face IDs [3F]
+    uint32_t* d_pvals;   // patch IDs [3F]
+    CUDA_ERROR(cudaMalloc(&d_vkeys, N * sizeof(uint32_t)));
+    CUDA_ERROR(cudaMalloc(&d_fvals, N * sizeof(uint32_t)));
+    CUDA_ERROR(cudaMalloc(&d_pvals, N * sizeof(uint32_t)));
+
+    // Tabulate: for index i, vertex = d_fv[i], face = i/3, patch = d_face_patch[i/3]
+    thrust::for_each(thrust::device,
+        thrust::make_counting_iterator(0u),
+        thrust::make_counting_iterator(N),
+        [d_vkeys, d_fvals, d_pvals, d_fv, d_face_patch] __device__ (uint32_t i) {
+            uint32_t f = i / 3;
+            d_vkeys[i] = d_fv[i];
+            d_fvals[i] = f;
+            d_pvals[i] = d_face_patch[f];
+        });
+    fprintf(stderr, "[gpu_ribbons] step1 emit: %.0fms\n", ms_since(t0));
+
+    // ── Step 2: sort by vertex ───────────────────────────────────────────
+    auto tp = clk::now();
+    // Sort all three arrays by vertex key using zip iterator
+    // Simplest: pack (face, patch) into uint64, sort_by_key with vertex as key
+    uint64_t* d_fp_packed;
+    CUDA_ERROR(cudaMalloc(&d_fp_packed, N * sizeof(uint64_t)));
+    thrust::for_each(thrust::device,
+        thrust::make_counting_iterator(0u),
+        thrust::make_counting_iterator(N),
+        [d_fp_packed, d_fvals, d_pvals] __device__ (uint32_t i) {
+            d_fp_packed[i] = (uint64_t(d_pvals[i]) << 32) | uint64_t(d_fvals[i]);
+        });
+    CUDA_ERROR(cudaFree(d_fvals));
+    CUDA_ERROR(cudaFree(d_pvals));
+
+    thrust::sort_by_key(thrust::device,
+        thrust::device_pointer_cast(d_vkeys),
+        thrust::device_pointer_cast(d_vkeys) + N,
+        thrust::device_pointer_cast(d_fp_packed));
+    fprintf(stderr, "[gpu_ribbons] step2 sort: %.0fms\n", ms_since(tp));
+
+    // ── Step 3: vertex offsets ───────────────────────────────────────────
+    tp = clk::now();
+    uint32_t* d_vertex_offset;
+    CUDA_ERROR(cudaMalloc(&d_vertex_offset, (num_vertices + 1) * sizeof(uint32_t)));
+
+    // Generate search values [0, 1, 2, ..., V]
+    uint32_t* d_search;
+    CUDA_ERROR(cudaMalloc(&d_search, (num_vertices + 1) * sizeof(uint32_t)));
+    thrust::sequence(thrust::device,
+        thrust::device_pointer_cast(d_search),
+        thrust::device_pointer_cast(d_search) + num_vertices + 1);
+
+    thrust::upper_bound(thrust::device,
+        thrust::device_pointer_cast(d_vkeys),
+        thrust::device_pointer_cast(d_vkeys) + N,
+        thrust::device_pointer_cast(d_search),
+        thrust::device_pointer_cast(d_search) + num_vertices + 1,
+        thrust::device_pointer_cast(d_vertex_offset));
+
+    // Shift: vertex_offset should be [0, upper_bound(0), upper_bound(1), ...]
+    // Actually upper_bound gives us the END of each vertex's range.
+    // We need: offset[v] = lower_bound(v), offset[V] = N
+    // Simpler: use lower_bound for [0..V]
+    thrust::lower_bound(thrust::device,
+        thrust::device_pointer_cast(d_vkeys),
+        thrust::device_pointer_cast(d_vkeys) + N,
+        thrust::device_pointer_cast(d_search),
+        thrust::device_pointer_cast(d_search) + num_vertices + 1,
+        thrust::device_pointer_cast(d_vertex_offset));
+
+    CUDA_ERROR(cudaFree(d_search));
+    CUDA_ERROR(cudaFree(d_vkeys));
+
+    // Unpack face and patch from d_fp_packed
+    uint32_t* d_sorted_face;
+    uint32_t* d_sorted_patch;
+    CUDA_ERROR(cudaMalloc(&d_sorted_face, N * sizeof(uint32_t)));
+    CUDA_ERROR(cudaMalloc(&d_sorted_patch, N * sizeof(uint32_t)));
+    thrust::for_each(thrust::device,
+        thrust::make_counting_iterator(0u),
+        thrust::make_counting_iterator(N),
+        [d_sorted_face, d_sorted_patch, d_fp_packed] __device__ (uint32_t i) {
+            d_sorted_face[i] = d_fp_packed[i] & 0xFFFFFFFFu;
+            d_sorted_patch[i] = d_fp_packed[i] >> 32;
+        });
+    CUDA_ERROR(cudaFree(d_fp_packed));
+    fprintf(stderr, "[gpu_ribbons] step3 offsets: %.0fms\n", ms_since(tp));
+
+    // ── Step 4: emit ribbon pairs ────────────────────────────────────────
+    tp = clk::now();
+    // Over-allocate: max 3F pairs (in practice ~5-10% of that)
+    uint64_t* d_ribbon_pairs;
+    uint32_t* d_pair_count;
+    CUDA_ERROR(cudaMalloc(&d_ribbon_pairs, N * sizeof(uint64_t)));
+    CUDA_ERROR(cudaMalloc(&d_pair_count, sizeof(uint32_t)));
+    CUDA_ERROR(cudaMemset(d_pair_count, 0, sizeof(uint32_t)));
+
+    int grid = (num_vertices + 255) / 256;
+    emit_ribbon_pairs_kernel<<<grid, 256>>>(
+        d_vertex_offset, d_sorted_face, d_sorted_patch,
+        d_ribbon_pairs, d_pair_count, num_vertices);
+    CUDA_ERROR(cudaDeviceSynchronize());
+
+    uint32_t h_pair_count;
+    CUDA_ERROR(cudaMemcpy(&h_pair_count, d_pair_count, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+
+    CUDA_ERROR(cudaFree(d_vertex_offset));
+    CUDA_ERROR(cudaFree(d_sorted_face));
+    CUDA_ERROR(cudaFree(d_sorted_patch));
+    CUDA_ERROR(cudaFree(d_pair_count));
+    fprintf(stderr, "[gpu_ribbons] step4 emit: %.0fms (%u pairs)\n", ms_since(tp), h_pair_count);
+
+    // ── Step 5: sort + unique → deduplicated (patch, face) pairs ─────────
+    tp = clk::now();
+    thrust::sort(thrust::device,
+        thrust::device_pointer_cast(d_ribbon_pairs),
+        thrust::device_pointer_cast(d_ribbon_pairs) + h_pair_count);
+
+    uint64_t* d_unique_pairs;
+    CUDA_ERROR(cudaMalloc(&d_unique_pairs, h_pair_count * sizeof(uint64_t)));
+    auto unique_end = thrust::unique_copy(thrust::device,
+        thrust::device_pointer_cast(d_ribbon_pairs),
+        thrust::device_pointer_cast(d_ribbon_pairs) + h_pair_count,
+        thrust::device_pointer_cast(d_unique_pairs));
+    uint32_t num_unique = unique_end - thrust::device_pointer_cast(d_unique_pairs);
+    CUDA_ERROR(cudaFree(d_ribbon_pairs));
+    fprintf(stderr, "[gpu_ribbons] step5 sort+unique: %.0fms (%u unique)\n", ms_since(tp), num_unique);
+
+    // ── Step 6: build CSR (ribbon_offset, ribbon_val) ────────────────────
+    tp = clk::now();
+    // Extract patch IDs from unique pairs
+    uint32_t* d_ribbon_patches;
+    uint32_t* d_ribbon_faces;
+    CUDA_ERROR(cudaMalloc(&d_ribbon_patches, num_unique * sizeof(uint32_t)));
+    CUDA_ERROR(cudaMalloc(&d_ribbon_faces, num_unique * sizeof(uint32_t)));
+    thrust::for_each(thrust::device,
+        thrust::make_counting_iterator(0u),
+        thrust::make_counting_iterator(num_unique),
+        [d_ribbon_patches, d_ribbon_faces, d_unique_pairs] __device__ (uint32_t i) {
+            d_ribbon_patches[i] = d_unique_pairs[i] >> 32;
+            d_ribbon_faces[i] = d_unique_pairs[i] & 0xFFFFFFFFu;
+        });
+    CUDA_ERROR(cudaFree(d_unique_pairs));
+
+    // CSR offsets via lower_bound
+    uint32_t* d_rib_offset;
+    CUDA_ERROR(cudaMalloc(&d_rib_offset, (num_patches + 1) * sizeof(uint32_t)));
+    uint32_t* d_patch_search;
+    CUDA_ERROR(cudaMalloc(&d_patch_search, (num_patches + 1) * sizeof(uint32_t)));
+    thrust::sequence(thrust::device,
+        thrust::device_pointer_cast(d_patch_search),
+        thrust::device_pointer_cast(d_patch_search) + num_patches + 1);
+    thrust::lower_bound(thrust::device,
+        thrust::device_pointer_cast(d_ribbon_patches),
+        thrust::device_pointer_cast(d_ribbon_patches) + num_unique,
+        thrust::device_pointer_cast(d_patch_search),
+        thrust::device_pointer_cast(d_patch_search) + num_patches + 1,
+        thrust::device_pointer_cast(d_rib_offset));
+    CUDA_ERROR(cudaFree(d_patch_search));
+    CUDA_ERROR(cudaFree(d_ribbon_patches));
+
+    fprintf(stderr, "[gpu_ribbons] step6 CSR: %.0fms\n", ms_since(tp));
+    fprintf(stderr, "[gpu_ribbons] TOTAL: %.0fms (%u ribbon faces)\n", ms_since(t0), num_unique);
+
+    // Output device arrays
+    *out_d_ribbon_val = d_ribbon_faces;
+    *out_d_ribbon_offset = d_rib_offset;
+
+    // Download to host for legacy Patcher interface
+    h_ribbon_val.resize(num_unique);
+    h_ribbon_offset.resize(num_patches);  // cumulative format for Patcher
+    CUDA_ERROR(cudaMemcpy(h_ribbon_val.data(), d_ribbon_faces,
+                          num_unique * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    // Download prefix offsets and convert to cumulative format
+    std::vector<uint32_t> pfx(num_patches + 1);
+    CUDA_ERROR(cudaMemcpy(pfx.data(), d_rib_offset,
+                          (num_patches + 1) * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    for (uint32_t p = 0; p < num_patches; ++p)
+        h_ribbon_offset[p] = pfx[p + 1];  // cumulative end offset
+}
+
+
 // One thread per patch: build all 3 hash tables (V/E/F)
 __global__ static void k3_build_hashtables(
     const uint32_t* d_ltog_v, const uint32_t* d_ltog_e, const uint32_t* d_ltog_f,

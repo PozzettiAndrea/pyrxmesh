@@ -156,6 +156,19 @@ struct ThrustLtogResult {
     }
 };
 
+// GPU ribbon extraction — vertex-centric via thrust sort.
+// Replaces CPU Patcher::extract_ribbons (~1s → ~25ms).
+void gpu_extract_ribbons(
+    const uint32_t* d_face_patch,
+    const uint32_t* d_fv,
+    uint32_t num_faces,
+    uint32_t num_vertices,
+    uint32_t num_patches,
+    uint32_t** out_d_ribbon_val,
+    uint32_t** out_d_ribbon_offset,
+    std::vector<uint32_t>& h_ribbon_val,
+    std::vector<uint32_t>& h_ribbon_offset);
+
 // Build bitmasks + stash + hash tables entirely on GPU.
 // Fills pre-allocated bulk device arrays directly — no host round-trip.
 void gpu_build_device_data(

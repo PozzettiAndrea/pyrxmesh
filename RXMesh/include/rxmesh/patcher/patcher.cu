@@ -242,8 +242,8 @@ Patcher::Patcher(uint32_t                     patch_size,
                 cub_scan_bytes, cub_max_bytes, d_seeds, d_new_num_patches,
                 d_max_patch_size, d_patches_offset, d_patches_size, d_patches_val);
         }
-        extract_ribbons(flat_fv, num_faces, ff_offset, ff_values);
-        // assign_patch_fast moved to RXMesh::build() — uses GPU K0a kernel
+        // extract_ribbons + assign_patch_fast moved to RXMesh::build()
+        // — uses GPU gpu_extract_ribbons + GPU K0a kernel
     }
 
     // Skip calc_edge_cut — purely informational logging, costs ~0.9s
