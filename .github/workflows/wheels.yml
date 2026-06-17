@@ -1,0 +1,63 @@
+name: Build wheels
+
+# Builds pyrxmesh CUDA wheels for multiple CUDA versions via cibuildwheel.
+# CUDA toolkit (nvcc) is installed into the manylinux container in BEFORE_ALL;
+# the build is GPU-free (compile-only). CMAKE_CUDA_ARCHITECTURES is set
+# explicitly because the project defaults to `native`, which has no GPU in CI.
+
+on:
+  workflow_dispatch:
+    inputs:
+      python_builds:
+        description: "cibuildwheel CIBW_BUILD pattern"
+        default: "cp312-*"
+      arches:
+        description: "CMAKE_CUDA_ARCHITECTURES (semicolon list)"
+        default: "80;86;90"
+
+jobs:
+  build_wheels:
+    name: CUDA ${{ matrix.cuda }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda: ["12-6", "13-0"]   # CUDA 12.6 and 13.0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Free up disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android || true
+          df -h /
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.21
+        env:
+          CIBW_BUILD: ${{ github.event.inputs.python_builds || 'cp312-*' }}
+          CIBW_MANYLINUX_X86_64_IMAGE: quay.io/pypa/manylinux_2_28_x86_64
+          CIBW_BEFORE_ALL: >
+            dnf -y install dnf-plugins-core &&
+            dnf config-manager --add-repo
+            https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo &&
+            dnf -y install cuda-toolkit-${{ matrix.cuda }}
+          CIBW_ENVIRONMENT: >
+            PATH=/usr/local/cuda/bin:$PATH
+            CUDACXX=/usr/local/cuda/bin/nvcc
+            CMAKE_CUDA_ARCHITECTURES=${{ github.event.inputs.arches || '80;86;90' }}
+            CMAKE_BUILD_PARALLEL_LEVEL=2
+          # Bundle nothing CUDA: keep wheels slim, rely on the user's CUDA runtime.
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
+            auditwheel repair
+            --exclude 'libcudart.so.*' --exclude 'libcusolver.so.*'
+            --exclude 'libcusparse.so.*' --exclude 'libcublas.so.*'
+            --exclude 'libcublasLt.so.*' --exclude 'libnvJitLink.so.*'
+            -w {dest_dir} {wheel}
+          CIBW_TEST_SKIP: "*"   # CI runners have no GPU; import-test would need CUDA
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pyrxmesh-wheels-cuda${{ matrix.cuda }}
+          path: ./wheelhouse/*.whl
