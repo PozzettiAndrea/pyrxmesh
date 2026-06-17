@@ -41,11 +41,8 @@ jobs:
             dnf config-manager --add-repo
             https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo &&
             dnf -y install cuda-toolkit-${{ matrix.cuda }}
-          CIBW_ENVIRONMENT: >
-            PATH=/usr/local/cuda/bin:$PATH
-            CUDACXX=/usr/local/cuda/bin/nvcc
-            CMAKE_CUDA_ARCHITECTURES=${{ github.event.inputs.arches || '80;86;90' }}
-            CMAKE_BUILD_PARALLEL_LEVEL=2
+          # semicolons in the arch list must be quoted (cibuildwheel shell-parses this)
+          CIBW_ENVIRONMENT: 'PATH=/usr/local/cuda/bin:$PATH CUDACXX=/usr/local/cuda/bin/nvcc CMAKE_CUDA_ARCHITECTURES="${{ github.event.inputs.arches || ''80;86;90'' }}" CMAKE_BUILD_PARALLEL_LEVEL=2'
           # Bundle nothing CUDA: keep wheels slim, rely on the user's CUDA runtime.
           CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
             auditwheel repair
