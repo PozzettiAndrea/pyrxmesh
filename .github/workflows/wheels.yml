@@ -35,7 +35,7 @@ jobs:
         uses: pypa/cibuildwheel@v2.21
         env:
           CIBW_BUILD: ${{ github.event.inputs.python_builds || 'cp312-*' }}
-          CIBW_MANYLINUX_X86_64_IMAGE: quay.io/pypa/manylinux_2_28_x86_64
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
           CIBW_BEFORE_ALL: >
             dnf -y install dnf-plugins-core &&
             dnf config-manager --add-repo
